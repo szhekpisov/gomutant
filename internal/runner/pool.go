@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/szhekpisov/gomutant/internal/coverage"
 	"github.com/szhekpisov/gomutant/internal/mutator"
 )
 
@@ -22,16 +23,18 @@ type Pool struct {
 	tmpDir     string
 	srcCache   map[string][]byte
 	projectDir string
+	testMap    *coverage.TestMap
 }
 
 // NewPool creates a worker pool.
-func NewPool(workers int, timeout time.Duration, tmpDir string, srcCache map[string][]byte, projectDir string) *Pool {
+func NewPool(workers int, timeout time.Duration, tmpDir string, srcCache map[string][]byte, projectDir string, testMap *coverage.TestMap) *Pool {
 	return &Pool{
 		workers:    workers,
 		timeout:    timeout,
 		tmpDir:     tmpDir,
 		srcCache:   srcCache,
 		projectDir: projectDir,
+		testMap:    testMap,
 	}
 }
 
@@ -56,7 +59,7 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 
 	// Start workers.
 	for i := range p.workers {
-		w, err := NewWorker(i, p.tmpDir, p.timeout, p.srcCache, p.projectDir)
+		w, err := NewWorker(i, p.tmpDir, p.timeout, p.srcCache, p.projectDir, p.testMap)
 		if err != nil {
 			continue
 		}

@@ -1,0 +1,35 @@
+Baseline benchmark: gomutant on diffyml (5 gremlins-equivalent mutators)
+Date: 2026-04-04
+Machine: darwin/arm64
+Go: 1.26.1
+Workers: 10
+Mutants: 792 (772 tested, 20 not covered)
+Efficacy: 100%
+
+=== Without per-test coverage map ===
+Run 1: 2m39.84s wall
+Run 2: 3m51.72s wall (outlier — system load)
+Run 3: 2m37.14s wall
+Median: 2m39.84s (159.84s)
+
+=== With per-test coverage map (compile-once) ===
+Run 1: 2m39.33s wall
+Note: -run filter reduces test execution per mutant, but go test -overlay
+recompilation dominates (~1-3s per mutant regardless of test count).
+Map building adds ~30s overhead for 1193 tests across 2 packages.
+Net effect: neutral to slightly negative on small projects.
+
+=== Comparison ===
+Gremlins:  275.5s (single run, from golden report)
+Gomutant:  ~160s  (median, without test map)
+Speedup:   ~42% faster than gremlins
+
+=== Notes ===
+Per-test coverage mapping would shine on projects with:
+- Large test suites (10k+ tests)
+- Slow individual tests (>1s each)
+- When combined with mutation switching (compile-once, no recompilation per mutant)
+
+The current bottleneck is go test -overlay triggering recompilation for each mutant.
+Mutation switching (Phase 2) would eliminate this by compiling once and toggling
+mutants via environment variable at runtime.

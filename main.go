@@ -174,10 +174,22 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("pre-reading source files: %w", err)
 	}
 
-	// 7. Run mutation testing.
+	// 7. Build per-test coverage map.
+	term.Phase("Building per-test coverage map...")
+	testMap, err := coverage.BuildTestMap(ctx, projectDir, packages, cfg.CoverPkg, tmpDir, cfg.Workers)
+	if err != nil {
+		// Non-fatal: fall back to running all tests per mutant.
+		fmt.Fprintf(os.Stderr, "warning: per-test coverage map failed: %v\n", err)
+		testMap = nil
+		term.PhaseDone("skipped (will run all tests per mutant)")
+	} else {
+		term.PhaseDone("done")
+	}
+
+	// 8. Run mutation testing.
 	runStart := time.Now()
 	term2 := report.NewTerminal(os.Stdout, pendingCount, cfg.Verbose)
-	pool := runner.NewPool(cfg.Workers, testTimeout, tmpDir, srcCache, projectDir)
+	pool := runner.NewPool(cfg.Workers, testTimeout, tmpDir, srcCache, projectDir, testMap)
 	mutants = pool.Run(ctx, mutants, term2.OnResult)
 	elapsed := time.Since(runStart)
 

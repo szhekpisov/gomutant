@@ -142,19 +142,23 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 			}
 		}
 
+		// Coverage profile path: ImportPath/filename.
+		coverageFile := pkg + "/" + filepath.Base(absPath)
+
 		mutants[i] = mutator.Mutant{
-			ID:          i + 1,
-			Type:        c.Type,
-			File:        absPath,
-			RelFile:     relPath,
-			Line:        c.Pos.Line,
-			Col:         c.Pos.Column,
-			Original:    c.Original,
-			Replacement: c.Replacement,
-			StartOffset: c.StartOffset,
-			EndOffset:   c.EndOffset,
-			Status:      mutator.StatusPending,
-			Pkg:         pkg,
+			ID:           i + 1,
+			Type:         c.Type,
+			File:         absPath,
+			RelFile:      relPath,
+			Line:         c.Pos.Line,
+			Col:          c.Pos.Column,
+			Original:     c.Original,
+			Replacement:  c.Replacement,
+			StartOffset:  c.StartOffset,
+			EndOffset:    c.EndOffset,
+			CoverageFile: coverageFile,
+			Status:       mutator.StatusPending,
+			Pkg:          pkg,
 		}
 	}
 

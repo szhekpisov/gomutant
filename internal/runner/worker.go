@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/szhekpisov/gomutant/internal/coverage"
 	"github.com/szhekpisov/gomutant/internal/mutator"
 	"github.com/szhekpisov/gomutant/internal/patch"
 )
@@ -31,10 +32,11 @@ type Worker struct {
 	timeout     time.Duration
 	sourceCache map[string][]byte // Read-only, shared across workers.
 	projectDir  string            // Working directory for go test.
+	testMap     *coverage.TestMap  // Per-test coverage map (may be nil).
 }
 
 // NewWorker creates a worker with stable temp file paths.
-func NewWorker(id int, tmpDir string, timeout time.Duration, sourceCache map[string][]byte, projectDir string) (*Worker, error) {
+func NewWorker(id int, tmpDir string, timeout time.Duration, sourceCache map[string][]byte, projectDir string, testMap *coverage.TestMap) (*Worker, error) {
 	tmpSrc := filepath.Join(tmpDir, fmt.Sprintf("worker-%d.go", id))
 	overlayFile := filepath.Join(tmpDir, fmt.Sprintf("overlay-%d.json", id))
 
@@ -53,6 +55,7 @@ func NewWorker(id int, tmpDir string, timeout time.Duration, sourceCache map[str
 		timeout:     timeout,
 		sourceCache: sourceCache,
 		projectDir:  projectDir,
+		testMap:     testMap,
 	}, nil
 }
 
@@ -99,8 +102,16 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	args := []string{"test", "-count=1", "-failfast",
 		fmt.Sprintf("-timeout=%s", w.timeout),
 		fmt.Sprintf("-overlay=%s", w.overlayPath),
-		m.Pkg,
 	}
+
+	// Use per-test coverage map to run only relevant tests.
+	if w.testMap != nil {
+		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
+			args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
+		}
+	}
+
+	args = append(args, m.Pkg)
 	cmd := exec.CommandContext(testCtx, "go", args...)
 	cmd.Dir = w.projectDir
 
