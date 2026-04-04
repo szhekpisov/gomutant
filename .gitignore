@@ -1,0 +1,36 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/gomutant
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles
+*.out
+*.coverprofile
+
+# Mutation testing reports
+mutation-report.json
+
+# Dependency directories
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code
+CLAUDE.md
+.claude/
