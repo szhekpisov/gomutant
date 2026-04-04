@@ -73,6 +73,8 @@ type Mutant struct {
 	Col         int
 	Original    string
 	Replacement string
+	StartOffset int // Byte offset in source file.
+	EndOffset   int // Byte offset end (exclusive).
 	Status      MutantStatus
 	Duration    time.Duration
 	Pkg         string // Package import path for go test.

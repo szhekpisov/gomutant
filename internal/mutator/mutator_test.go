@@ -162,6 +162,7 @@ func f() int { return -42 + -1 }
 	m := findMutator(t, mutator.InvertNegatives)
 	candidates := m.Discover(fset, file, srcBytes)
 
+	// Two unary negatives: -42 and -1.
 	if len(candidates) != 2 {
 		t.Fatalf("expected 2 candidates, got %d", len(candidates))
 	}
@@ -173,6 +174,24 @@ func f() int { return -42 + -1 }
 		if c.EndOffset-c.StartOffset != 1 {
 			t.Errorf("candidate %d: byte length=%d, want 1", i, c.EndOffset-c.StartOffset)
 		}
+	}
+}
+
+func TestInvertNegativesBinary(t *testing.T) {
+	src := `package p
+func f(a, b int) int { return a - b }
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.InvertNegatives)
+	candidates := m.Discover(fset, file, srcBytes)
+
+	// Binary subtraction also produces an INVERT_NEGATIVES candidate (matches gremlins).
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+
+	if candidates[0].Original != "-" || candidates[0].Replacement != "+" {
+		t.Errorf("got %q→%q, want \"-\"→\"+\"", candidates[0].Original, candidates[0].Replacement)
 	}
 }
 
