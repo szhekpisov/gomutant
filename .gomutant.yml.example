@@ -1,0 +1,38 @@
+# gomutant configuration
+# Copy this file to .gomutant.yml in your project root.
+# All fields are optional — defaults are shown below.
+
+# Number of parallel workers (default: number of CPUs).
+workers: 10
+
+# Per-mutant timeout = baseline test duration * this coefficient (default: 10).
+timeout-coefficient: 10
+
+# Coverage package pattern passed to go test -coverpkg.
+# Useful when your tests are in a separate package from the code under test.
+# coverpkg: "./pkg/..."
+
+# JSON report output path (default: mutation-report.json).
+output: mutation-report.json
+
+# Mutator types to disable (run all except these).
+# disable:
+#   - BRANCH_IF
+#   - BRANCH_ELSE
+
+# Mutator types to run exclusively (disables all others).
+# only:
+#   - ARITHMETIC_BASE
+#   - CONDITIONALS_NEGATION
+
+# Available mutator types:
+#   ARITHMETIC_BASE        — swap +/-, */%, etc.
+#   CONDITIONALS_BOUNDARY  — swap </<=, >/>=
+#   CONDITIONALS_NEGATION  — swap ==/!=, </>=, >/<=
+#   INCREMENT_DECREMENT    — swap ++/--
+#   INVERT_NEGATIVES       — swap -/+ (unary and binary)
+#   BRANCH_IF              — empty if/else-if body
+#   BRANCH_ELSE            — empty else body
+#   BRANCH_CASE            — empty case clause body
+#   EXPRESSION_REMOVE      — replace &&/|| operand with true/false
+#   STATEMENT_REMOVE       — remove assignment/expression/increment side-effects
