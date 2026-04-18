@@ -483,6 +483,146 @@ func f() int { return 1 + 2 }
 	}
 }
 
+// --- Status String ---
+
+func TestMutantStatusString(t *testing.T) {
+	tests := []struct {
+		status mutator.MutantStatus
+		want   string
+	}{
+		{mutator.StatusPending, "PENDING"},
+		{mutator.StatusKilled, "KILLED"},
+		{mutator.StatusLived, "LIVED"},
+		{mutator.StatusNotCovered, "NOT COVERED"},
+		{mutator.StatusNotViable, "NOT VIABLE"},
+		{mutator.StatusTimedOut, "TIMED OUT"},
+		{mutator.MutantStatus(99), "UNKNOWN"},
+	}
+	for _, tc := range tests {
+		got := tc.status.String()
+		if got != tc.want {
+			t.Errorf("MutantStatus(%d).String() = %q, want %q", tc.status, got, tc.want)
+		}
+	}
+}
+
+// --- No-op mutators on empty functions ---
+
+func TestMutatorsOnEmptyFunc(t *testing.T) {
+	src := `package p
+func f() {}
+`
+	fset, file, srcBytes := parse(t, src)
+	reg := mutator.NewRegistry()
+	for _, m := range reg.Mutators() {
+		// Should not panic on minimal source.
+		_ = m.Discover(fset, file, srcBytes)
+	}
+}
+
+// TestMutatorsNonMatchingNodes exercises the early-return paths in each mutator
+// by providing AST nodes that don't match the mutator's target pattern.
+func TestMutatorsNonMatchingNodes(t *testing.T) {
+	// This source has diverse AST nodes but specifically avoids matching
+	// certain mutator patterns, exercising the "no match" branches.
+	src := `package p
+
+import "fmt"
+
+func f(x int) string {
+	// Bitwise ops — not in arithmetic swap table.
+	a := x & 0xff
+	b := x | 0x0f
+	c := x ^ 0x01
+	d := x << 2
+	e := x >> 1
+
+	// String concatenation — ADD token but not numeric.
+	s := "hello" + "world"
+
+	// Comparison with == — not in ConditionalsBoundary.
+	if a == b {
+		fmt.Println(c, d, e, s)
+	}
+
+	// For loop (not if/switch).
+	for i := 0; i < 10; i++ {
+		_ = i
+	}
+
+	// Select statement (not switch).
+	ch := make(chan int, 1)
+	ch <- 1
+	select {
+	case v := <-ch:
+		_ = v
+	}
+
+	// Type switch (case clause with no body beyond type assert).
+	var iface interface{} = 42
+	switch iface.(type) {
+	case int:
+	}
+
+	// Return statement (not AssignStmt/ExprStmt/IncDecStmt for StatementRemove).
+	return fmt.Sprintf("%d %d", a, b)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	reg := mutator.NewRegistry()
+	for _, m := range reg.Mutators() {
+		candidates := m.Discover(fset, file, srcBytes)
+		// We just want these to run without panic and exercise all branches.
+		_ = candidates
+	}
+}
+
+// --- Edge cases for branch mutators ---
+
+func TestBranchIfEmptyBody(t *testing.T) {
+	src := `package p
+func f(x int) {
+	if x > 0 {
+	}
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.BranchIf)
+	candidates := m.Discover(fset, file, srcBytes)
+	// Empty if body should be skipped.
+	if len(candidates) != 0 {
+		t.Errorf("expected 0 candidates for empty if body, got %d", len(candidates))
+	}
+}
+
+func TestBranchElseEmptyBody(t *testing.T) {
+	src := `package p
+func f(x int) {
+	if x > 0 {
+		_ = x
+	} else {
+	}
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.BranchElse)
+	candidates := m.Discover(fset, file, srcBytes)
+	// Empty else body should be skipped.
+	if len(candidates) != 0 {
+		t.Errorf("expected 0 candidates for empty else body, got %d", len(candidates))
+	}
+}
+
+// --- EnabledMutators with both only and disable ---
+
+func TestRegistryEnabledMutatorsNoFilter(t *testing.T) {
+	reg := mutator.NewRegistry()
+	all := reg.EnabledMutators(nil, nil)
+	if len(all) != 10 {
+		t.Errorf("expected 10, got %d", len(all))
+	}
+}
+
 // findMutator returns the mutator of the given type from the registry.
 func findMutator(t *testing.T, typ mutator.MutationType) mutator.Mutator {
 	t.Helper()

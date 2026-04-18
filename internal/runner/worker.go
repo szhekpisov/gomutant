@@ -134,8 +134,10 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	}
 
 	// Non-zero exit: distinguish KILLED from NOT_VIABLE.
-	combined := stdout.String() + stderr.String()
-	if compileErrorRe.MatchString(stderr.String()) && !strings.Contains(combined, "FAIL\t") {
+	// Build failures show "[build failed]" or "[setup failed]" in stdout.
+	stdoutStr := stdout.String()
+	if compileErrorRe.MatchString(stderr.String()) &&
+		(strings.Contains(stdoutStr, "[build failed]") || strings.Contains(stdoutStr, "[setup failed]")) {
 		m.Status = mutator.StatusNotViable
 		return m
 	}

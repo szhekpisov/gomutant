@@ -3,6 +3,7 @@ package coverage
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -32,9 +33,12 @@ func ParseFile(path string) (*Profile, error) {
 		return nil, fmt.Errorf("opening coverage profile: %w", err)
 	}
 	defer f.Close()
+	return parseReader(f)
+}
 
+func parseReader(r io.Reader) (*Profile, error) {
 	var blocks []Block
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "mode:") {

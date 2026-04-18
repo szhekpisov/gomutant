@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -49,8 +50,13 @@ func ResolvePackages(ctx context.Context, dir string, patterns []string) ([]Pack
 		return nil, fmt.Errorf("go list: %w\n%s", err, stderr.String())
 	}
 
+	return decodeGoListJSON(&stdout)
+}
+
+// decodeGoListJSON parses JSON output from `go list -json`.
+func decodeGoListJSON(r io.Reader) ([]Package, error) {
 	var pkgs []Package
-	dec := json.NewDecoder(&stdout)
+	dec := json.NewDecoder(r)
 	for dec.More() {
 		var p goListJSON
 		if err := dec.Decode(&p); err != nil {
@@ -66,7 +72,6 @@ func ResolvePackages(ctx context.Context, dir string, patterns []string) ([]Pack
 			TestGoFiles: p.TestGoFiles,
 		})
 	}
-
 	return pkgs, nil
 }
 
@@ -137,9 +142,6 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 			}
 		} else {
 			relPath, _ = filepath.Rel(moduleRoot, absPath)
-			if relPath == "" {
-				relPath = absPath
-			}
 		}
 
 		// Coverage profile path: ImportPath/filename.

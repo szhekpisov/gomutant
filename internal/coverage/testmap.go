@@ -13,6 +13,13 @@ import (
 	"sync"
 )
 
+// Function variables for testing.
+var (
+	resolvePackagesFunc = resolvePackages
+	listTestsFunc       = listTests
+	parseFileFunc       = ParseFile
+)
+
 // TestMap maps (file, line) positions to the test functions that cover them.
 type TestMap struct {
 	// index maps "file:line" to a set of test function names.
@@ -36,13 +43,13 @@ type compiledPkg struct {
 // with coverage. Uses parallel workers.
 func BuildTestMap(ctx context.Context, projectDir string, packages []string, coverPkg string, tmpDir string, workers int) (*TestMap, error) {
 	// 1. Enumerate all test function names.
-	tests, err := listTests(ctx, projectDir, packages)
+	tests, err := listTestsFunc(ctx, projectDir, packages)
 	if err != nil {
 		return nil, fmt.Errorf("listing tests: %w", err)
 	}
 
 	// 2. Resolve package patterns to individual packages and compile test binaries.
-	resolvedPkgs, err := resolvePackages(ctx, projectDir, packages)
+	resolvedPkgs, err := resolvePackagesFunc(ctx, projectDir, packages)
 	if err != nil {
 		return nil, fmt.Errorf("resolving packages: %w", err)
 	}
@@ -89,32 +96,13 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, cov
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for test := range work {
-				if ctx.Err() != nil {
-					return
-				}
-				cp := pkgBins[test.pkg]
-				if cp == nil {
-					continue
-				}
-				profilePath := filepath.Join(tmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
-				blocks := runCompiledTest(ctx, cp, test.name, profilePath)
-				if len(blocks) > 0 {
-					results <- testCoverage{testName: test.name, blocks: blocks}
-				}
-			}
+			processWork(ctx, work, pkgBins, tmpDir, workerID, results)
 		}(i)
 	}
 
 	// Feed work.
 	go func() {
-		for _, t := range tests {
-			select {
-			case work <- t:
-			case <-ctx.Done():
-			}
-		}
-		close(work)
+		feedWork(ctx, tests, work)
 	}()
 
 	// Close results when all workers are done.
@@ -143,6 +131,37 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, cov
 	return tm, nil
 }
 
+// processWork processes test entries from the work channel.
+func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, results chan<- testCoverage) {
+	for test := range work {
+		if ctx.Err() != nil {
+			return
+		}
+		cp := pkgBins[test.pkg]
+		if cp == nil {
+			continue
+		}
+		profilePath := filepath.Join(tmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
+		blocks := runCompiledTest(ctx, cp, test.name, profilePath)
+		if len(blocks) > 0 {
+			results <- testCoverage{testName: test.name, blocks: blocks}
+		}
+	}
+}
+
+// feedWork sends test entries to the work channel, respecting context cancellation.
+func feedWork(ctx context.Context, tests []testEntry, work chan<- testEntry) {
+	for _, t := range tests {
+		select {
+		case work <- t:
+		case <-ctx.Done():
+			close(work)
+			return
+		}
+	}
+	close(work)
+}
+
 // runCompiledTest runs a pre-compiled test binary for a single test with coverage.
 func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath string) []Block {
 	args := []string{
@@ -159,7 +178,7 @@ func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath
 		return nil
 	}
 
-	profile, err := ParseFile(profilePath)
+	profile, err := parseFileFunc(profilePath)
 	if err != nil {
 		return nil
 	}

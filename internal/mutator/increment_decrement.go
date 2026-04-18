@@ -22,8 +22,6 @@ func (i *incrementDecrement) Discover(fset *token.FileSet, file *ast.File, src [
 			replacement = token.DEC
 		case token.DEC:
 			replacement = token.INC
-		default:
-			return true
 		}
 		pos := fset.Position(inc.TokPos)
 		original := inc.Tok.String()

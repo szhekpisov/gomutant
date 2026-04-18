@@ -103,12 +103,15 @@ func Generate(mutants []mutator.Mutant, goModule string, elapsed time.Duration) 
 	return r
 }
 
+// marshalJSON is swappable for testing.
+var marshalJSON = json.Marshal
+
 // WriteJSON writes the report to a file.
 func WriteJSON(r *Report, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(r)
+	data, err := marshalJSON(r)
 	if err != nil {
 		return err
 	}

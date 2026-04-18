@@ -2,8 +2,11 @@ package discover
 
 import "os"
 
+// readFileBytesFunc is swappable for testing.
+var readFileBytesFunc = os.ReadFile
+
 func readFileBytes(path string) ([]byte, error) {
-	return os.ReadFile(path)
+	return readFileBytesFunc(path)
 }
 
 // PreReadFiles reads all source files from the given packages into memory.
