@@ -157,6 +157,10 @@ Tested on diffyml (792 mutants, 10 workers, darwin/arm64):
 
 ~42% faster with more mutations discovered.
 
+### Self-efficacy
+
+gomutant achieves **69.32%** mutation efficacy on its own test suite (664 mutants across 8 packages). Full per-package breakdown: [testdata/golden/self-efficacy.txt](testdata/golden/self-efficacy.txt).
+
 ## License
 
 [MIT](LICENSE)

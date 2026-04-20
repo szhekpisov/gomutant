@@ -1,0 +1,50 @@
+gomutant self-efficacy (v0.1.0)
+===============================
+
+Mutation testing result when gomutant is run on its own test suite.
+Measured per-package (baselines stay small) with 10 workers, darwin/arm64.
+
+Package              Total  Killed  Lived  NotCov  NotViable  TimedOut  Efficacy
+-----------------    -----  ------  -----  ------  ---------  --------  --------
+internal/patch          19      11      7       0          1         0    61.11%
+internal/config         42      41      1       0          0         0    97.62%
+internal/mutator        98      75     13       0         10         0    85.23%
+internal/report         98      58     36       0          4         0    61.70%
+internal/discover       72      38     20       0         12         2    65.52%
+internal/coverage      144      98     24       1         15         6    80.33%
+internal/runner         80      43     21       9          6         1    67.19%
+main                   111      36     55       8          2        10    39.56%
+-----------------    -----  ------  -----  ------  ---------  --------  --------
+TOTAL                  664     400    177      18         50        19    69.32%
+
+Mutations coverage: 97.29%  (646 of 664 mutants were exercised by tests)
+Test efficacy:      69.32%  (killed / (killed + lived))
+
+Method
+------
+Per-package runs, not `./...`, because the full-repo baseline (~41s) gives a
+per-mutant timeout 100x larger than most packages actually need. Per-package
+baselines are 0.3s–7s, which keeps total wall-clock under 15 minutes.
+
+Caveat: per-package coverage is narrower than `./...`. A line in internal/X
+exercised only by internal/Y's tests will count as "not covered" here but
+would be covered under `./...`. Expect the aggregate to mildly under-count
+coverage and killed mutants relative to a true full-repo run.
+
+Observations
+------------
+- main (39.56%) drags the total down. Integration tests in main_test.go
+  and integration_test.go invoke the full gomutant pipeline, so many
+  mutations (especially in output formatting and error wrapping) survive
+  because the integration tests don't assert on those signals.
+- patch (61.11%) and report (61.70%) have many lived mutants in formatting
+  and edge-case arithmetic that exhaustive unit tests don't pin down.
+- config (97.62%) is the strongest — config.Load/ApplyFlags have tight
+  table-driven tests that catch almost every mutation.
+
+Interpretation
+--------------
+100% statement coverage ≠ high mutation efficacy. Self-efficacy 69.32%
+documents a real test-quality gap — there are mutations we don't catch.
+This is a baseline for v0.1.0. Improving test strength (especially in
+main and report) would raise this number without changing production code.
