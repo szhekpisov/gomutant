@@ -178,18 +178,26 @@ func TestApplyFlagsZeroValuesNoOverride(t *testing.T) {
 func TestSplitAndTrim(t *testing.T) {
 	tests := []struct {
 		input string
-		want  int
+		want  []string
 	}{
-		{"a,b,c", 3},
-		{" a , b , c ", 3},
-		{"single", 1},
-		{"", 0},
-		{",,,", 0},
+		{"a,b,c", []string{"a", "b", "c"}},
+		{" a , b , c ", []string{"a", "b", "c"}}, // Kills STATEMENT_REMOVE on TrimSpace.
+		{"single", []string{"single"}},
+		{"  spaced  ", []string{"spaced"}}, // Explicit trimming check.
+		{"", nil},
+		{",,,", nil},
 	}
 	for _, tc := range tests {
 		got := splitAndTrim(tc.input)
-		if len(got) != tc.want {
-			t.Errorf("splitAndTrim(%q) = %v (len %d), want len %d", tc.input, got, len(got), tc.want)
+		if len(got) != len(tc.want) {
+			t.Errorf("splitAndTrim(%q) = %v (len %d), want %v (len %d)",
+				tc.input, got, len(got), tc.want, len(tc.want))
+			continue
+		}
+		for i, g := range got {
+			if g != tc.want[i] {
+				t.Errorf("splitAndTrim(%q)[%d] = %q, want %q", tc.input, i, g, tc.want[i])
+			}
 		}
 	}
 }

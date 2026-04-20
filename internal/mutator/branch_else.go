@@ -16,10 +16,9 @@ func (b *branchElse) Discover(fset *token.FileSet, file *ast.File, src []byte) [
 		if !ok {
 			return true
 		}
-		if ifStmt.Else == nil {
-			return true
-		}
-		// Skip else-if chains — only mutate plain else blocks.
+		// Skip else-if chains (Else is *ast.IfStmt) — only mutate plain else blocks.
+		// A nil Else also fails this type assertion (returns nil, false), so the
+		// separate nil check is redundant.
 		elseBlock, ok := ifStmt.Else.(*ast.BlockStmt)
 		if !ok {
 			return true
@@ -29,7 +28,7 @@ func (b *branchElse) Discover(fset *token.FileSet, file *ast.File, src []byte) [
 		}
 		pos := fset.Position(elseBlock.Lbrace)
 		startOffset := pos.Offset
-		endOffset := fset.Position(elseBlock.Rbrace).Offset + 1
+		endOffset := fset.Position(elseBlock.End()).Offset
 		original := string(src[startOffset:endOffset])
 		candidates = append(candidates, MutantCandidate{
 			Type:        BranchElse,

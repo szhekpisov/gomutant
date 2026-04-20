@@ -19,7 +19,7 @@ func PreReadFiles(pkgs []Package) (map[string][]byte, error) {
 			if _, ok := files[absPath]; ok {
 				continue
 			}
-			data, err := os.ReadFile(absPath)
+			data, err := readFileBytesFunc(absPath)
 			if err != nil {
 				return nil, err
 			}

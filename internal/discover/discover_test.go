@@ -364,6 +364,100 @@ func f() int {
 	}
 }
 
+// TestDiscoverSortTypeOrder asserts that when two mutations share the same
+// (file, line, col), they're ordered by ascending MutationType string.
+// Kills CONDITIONALS_BOUNDARY and CONDITIONALS_NEGATION mutations on the
+// final `a.Type < b.Type` comparator.
+func TestDiscoverSortTypeOrder(t *testing.T) {
+	dir := t.TempDir()
+	// `a - b` produces both ARITHMETIC_BASE and INVERT_NEGATIVES at the same
+	// byte position (the '-' token). Since "ARITHMETIC_BASE" < "INVERT_NEGATIVES"
+	// lexically, AB must come first.
+	src := `package p
+func f(a, b int) int { return a - b }
+`
+	os.WriteFile(filepath.Join(dir, "sub.go"), []byte(src), 0o644)
+
+	pkgs := []Package{
+		{Dir: dir, ImportPath: "example.com/sub", GoFiles: []string{"sub.go"}},
+	}
+
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE", "INVERT_NEGATIVES"}, nil), dir, "example.com")
+
+	if len(mutants) != 2 {
+		t.Fatalf("expected 2 mutants, got %d", len(mutants))
+	}
+	if mutants[0].Line != mutants[1].Line || mutants[0].Col != mutants[1].Col {
+		t.Fatalf("mutants should share position: (%d,%d) vs (%d,%d)",
+			mutants[0].Line, mutants[0].Col, mutants[1].Line, mutants[1].Col)
+	}
+	// Assert explicit order by MutationType string.
+	if mutants[0].Type != mutator.ArithmeticBase {
+		t.Errorf("mutants[0].Type = %v, want ARITHMETIC_BASE", mutants[0].Type)
+	}
+	if mutants[1].Type != mutator.InvertNegatives {
+		t.Errorf("mutants[1].Type = %v, want INVERT_NEGATIVES", mutants[1].Type)
+	}
+}
+
+// TestDiscoverSortSameLineNeighborCol asserts strict ordering by column
+// for same-line mutations. Kills CONDITIONALS_BOUNDARY on the column
+// comparator.
+func TestDiscoverSortSameLineNeighborCol(t *testing.T) {
+	dir := t.TempDir()
+	// Two arithmetic ops on the same line at different columns.
+	src := `package p
+func f() int { return 1 + 2 * 3 }
+`
+	os.WriteFile(filepath.Join(dir, "line.go"), []byte(src), 0o644)
+	pkgs := []Package{{Dir: dir, ImportPath: "example.com/line", GoFiles: []string{"line.go"}}}
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), dir, "example.com")
+
+	// Expect 2 mutants: one for '+' and one for '*'.
+	if len(mutants) != 2 {
+		t.Fatalf("expected 2 mutants, got %d", len(mutants))
+	}
+	if mutants[0].Line != mutants[1].Line {
+		t.Fatalf("expected same line, got %d and %d", mutants[0].Line, mutants[1].Line)
+	}
+	if mutants[0].Col >= mutants[1].Col {
+		t.Errorf("expected col ascending: mutants[0].Col=%d, mutants[1].Col=%d",
+			mutants[0].Col, mutants[1].Col)
+	}
+	if mutants[0].Original != "+" || mutants[1].Original != "*" {
+		t.Errorf("expected + then *, got %q then %q", mutants[0].Original, mutants[1].Original)
+	}
+}
+
+// TestDiscoverSortMultiFile asserts strict ordering by filename across
+// multiple files. Kills CONDITIONALS_BOUNDARY/NEGATION on filename comparator.
+func TestDiscoverSortMultiFile(t *testing.T) {
+	dir := t.TempDir()
+	// Create two files where name order matters.
+	os.WriteFile(filepath.Join(dir, "b.go"), []byte("package p\nfunc F() int { return 1 + 2 }\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("package p\nfunc G() int { return 3 + 4 }\n"), 0o644)
+
+	pkgs := []Package{{Dir: dir, ImportPath: "example.com/multi", GoFiles: []string{"b.go", "a.go"}}}
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), dir, "example.com")
+
+	if len(mutants) != 2 {
+		t.Fatalf("expected 2 mutants, got %d", len(mutants))
+	}
+	// a.go must come before b.go after sort.
+	if !strings.HasSuffix(mutants[0].File, "a.go") {
+		t.Errorf("mutants[0].File=%q, expected ends with a.go", mutants[0].File)
+	}
+	if !strings.HasSuffix(mutants[1].File, "b.go") {
+		t.Errorf("mutants[1].File=%q, expected ends with b.go", mutants[1].File)
+	}
+}
+
 func TestDiscoverSamePositionDifferentType(t *testing.T) {
 	dir := t.TempDir()
 	// Binary subtraction produces both ARITHMETIC_BASE and INVERT_NEGATIVES at the same position.
@@ -442,6 +536,198 @@ func TestDiscoverRelPathEmpty(t *testing.T) {
 		if m.RelFile == "" {
 			t.Error("RelFile should not be empty")
 		}
+	}
+}
+
+// TestDiscoverSortOrder asserts the full sort order of mutants by
+// (file, line, col, type). Kills mutations on the sort comparators.
+func TestDiscoverSortOrder(t *testing.T) {
+	dir := t.TempDir()
+	pkgA := filepath.Join(dir, "a")
+	pkgB := filepath.Join(dir, "b")
+	os.MkdirAll(pkgA, 0o755)
+	os.MkdirAll(pkgB, 0o755)
+
+	// Package b has a file that sorts AFTER pkg a's file alphabetically.
+	os.WriteFile(filepath.Join(pkgA, "a.go"), []byte("package a\n\nfunc F(x int) int {\n\treturn x + 1 - x\n}\n"), 0o644)
+	os.WriteFile(filepath.Join(pkgB, "b.go"), []byte("package b\nfunc G(x int) int { return x * 2 + 1 }\n"), 0o644)
+
+	pkgs := []Package{
+		{Dir: pkgB, ImportPath: "example.com/mod/b", GoFiles: []string{"b.go"}},
+		{Dir: pkgA, ImportPath: "example.com/mod/a", GoFiles: []string{"a.go"}},
+	}
+
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.Mutators(), dir, "example.com/mod")
+
+	// Verify file ordering: a.go mutants come before b.go mutants.
+	var aIdx, bIdx []int
+	for i, m := range mutants {
+		if strings.HasSuffix(m.File, "a.go") {
+			aIdx = append(aIdx, i)
+		} else if strings.HasSuffix(m.File, "b.go") {
+			bIdx = append(bIdx, i)
+		}
+	}
+	if len(aIdx) == 0 || len(bIdx) == 0 {
+		t.Fatalf("need mutants in both files, got a=%d b=%d", len(aIdx), len(bIdx))
+	}
+	if aIdx[len(aIdx)-1] >= bIdx[0] {
+		t.Errorf("a.go mutants should all come before b.go: last a=%d, first b=%d", aIdx[len(aIdx)-1], bIdx[0])
+	}
+
+	// Within a.go, verify mutants are sorted ascending by (line, col, type).
+	var prevLine, prevCol int
+	var prevType mutator.MutationType
+	for i, idx := range aIdx {
+		m := mutants[idx]
+		if i > 0 {
+			if m.Line < prevLine {
+				t.Errorf("a.go mutants not sorted by line: [%d] line=%d < prev=%d", idx, m.Line, prevLine)
+			}
+			if m.Line == prevLine && m.Col < prevCol {
+				t.Errorf("a.go mutants not sorted by col: [%d] col=%d < prev=%d", idx, m.Col, prevCol)
+			}
+			if m.Line == prevLine && m.Col == prevCol && m.Type < prevType {
+				t.Errorf("a.go mutants not sorted by type: [%d] %v < prev=%v", idx, m.Type, prevType)
+			}
+		}
+		prevLine, prevCol, prevType = m.Line, m.Col, m.Type
+	}
+}
+
+// TestDiscoverRelFileFormat kills mutations on the RelFile computation.
+// Three cases:
+//   - pkg == commonPrefix (sub == ""): RelFile = filename only.
+//   - pkg startswith commonPrefix (sub != ""): RelFile = sub/filename.
+//   - No common prefix: RelFile = filepath.Rel(moduleRoot, absPath).
+func TestDiscoverRelFileSubEmpty(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\nfunc F() int { return 1 + 2 }\n"), 0o644)
+
+	pkgs := []Package{
+		{Dir: dir, ImportPath: "example.com/mod", GoFiles: []string{"x.go"}},
+	}
+
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), dir, "example.com/mod")
+	if len(mutants) == 0 {
+		t.Fatal("expected mutants")
+	}
+	// Single package with import "example.com/mod" and common prefix same → sub is "" → RelFile is filename only.
+	if mutants[0].RelFile != "x.go" {
+		t.Errorf("RelFile=%q, want %q", mutants[0].RelFile, "x.go")
+	}
+}
+
+func TestDiscoverRelFileSubNonEmpty(t *testing.T) {
+	dir := t.TempDir()
+	pkgA := filepath.Join(dir, "a")
+	pkgAB := filepath.Join(dir, "a", "b")
+	os.MkdirAll(pkgA, 0o755)
+	os.MkdirAll(pkgAB, 0o755)
+	os.WriteFile(filepath.Join(pkgA, "a.go"), []byte("package a\nfunc F() int { return 1 + 2 }\n"), 0o644)
+	os.WriteFile(filepath.Join(pkgAB, "b.go"), []byte("package b\nfunc G() int { return 3 + 4 }\n"), 0o644)
+
+	// Common prefix = "example.com/mod", packages are "example.com/mod/a" and "example.com/mod/a/b".
+	pkgs := []Package{
+		{Dir: pkgA, ImportPath: "example.com/mod/a", GoFiles: []string{"a.go"}},
+		{Dir: pkgAB, ImportPath: "example.com/mod/a/b", GoFiles: []string{"b.go"}},
+	}
+
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), dir, "example.com")
+
+	// a.go has common prefix "example.com/mod/a", sub == "" → RelFile = "a.go"
+	// b.go has common prefix "example.com/mod/a", sub = "/b" → "b" → RelFile = "b/b.go"
+	found := map[string]bool{}
+	for _, m := range mutants {
+		found[m.RelFile] = true
+	}
+	if !found["a.go"] {
+		t.Errorf("expected RelFile=a.go, got map %v", found)
+	}
+	if !found["b/b.go"] {
+		t.Errorf("expected RelFile=b/b.go, got map %v", found)
+	}
+}
+
+// TestPreReadFilesActuallyDeduplicates stubs readFileBytesFunc to count calls
+// and asserts duplicate paths are read only once. Kills BRANCH_IF on the
+// `if _, ok := files[absPath]; ok { continue }` guard.
+func TestPreReadFilesActuallyDeduplicates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	os.WriteFile(path, []byte("package p\n"), 0o644)
+
+	orig := readFileBytesFunc
+	var callCount int
+	readFileBytesFunc = func(p string) ([]byte, error) {
+		callCount++
+		return os.ReadFile(p)
+	}
+	defer func() { readFileBytesFunc = orig }()
+
+	pkgs := []Package{
+		{Dir: dir, GoFiles: []string{"a.go"}},
+		{Dir: dir, GoFiles: []string{"a.go"}}, // duplicate
+		{Dir: dir, GoFiles: []string{"a.go"}}, // triplicate
+	}
+
+	files, err := PreReadFiles(pkgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Errorf("expected 1 unique file, got %d", len(files))
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 read call (dedup), got %d", callCount)
+	}
+
+	_ = path
+}
+
+// TestFilterByCoveragePreservesNonPendingStatus kills BRANCH_IF on the
+// `if mutants[i].Status != StatusPending { continue }` guard.
+func TestFilterByCoveragePreservesNonPendingStatus(t *testing.T) {
+	profile := &coverage.Profile{} // No covered blocks.
+
+	pkgs := []Package{
+		{Dir: "/abs/path/pkg", ImportPath: "example.com/mod/pkg", GoFiles: []string{"file.go"}},
+	}
+
+	// All statuses: Killed, Lived, NotCovered, NotViable, TimedOut, Pending.
+	// File is in the mapping so direct lookup succeeds; profile is empty so IsCovered is false.
+	mutants := []mutator.Mutant{
+		{ID: 1, File: "/abs/path/pkg/file.go", Line: 1, Col: 1, Status: mutator.StatusKilled},
+		{ID: 2, File: "/abs/path/pkg/file.go", Line: 1, Col: 1, Status: mutator.StatusLived},
+		{ID: 3, File: "/abs/path/pkg/file.go", Line: 1, Col: 1, Status: mutator.StatusNotViable},
+		{ID: 4, File: "/abs/path/pkg/file.go", Line: 1, Col: 1, Status: mutator.StatusTimedOut},
+		{ID: 5, File: "/abs/path/pkg/file.go", Line: 1, Col: 1, Status: mutator.StatusPending},
+	}
+
+	FilterByCoverage(mutants, profile, pkgs, "example.com/mod")
+
+	// Non-pending statuses unchanged.
+	if mutants[0].Status != mutator.StatusKilled {
+		t.Errorf("#1 Killed was overwritten to %v", mutants[0].Status)
+	}
+	if mutants[1].Status != mutator.StatusLived {
+		t.Errorf("#2 Lived was overwritten to %v", mutants[1].Status)
+	}
+	if mutants[2].Status != mutator.StatusNotViable {
+		t.Errorf("#3 NotViable was overwritten to %v", mutants[2].Status)
+	}
+	if mutants[3].Status != mutator.StatusTimedOut {
+		t.Errorf("#4 TimedOut was overwritten to %v", mutants[3].Status)
+	}
+	// Pending → NotCovered (profile is empty).
+	if mutants[4].Status != mutator.StatusNotCovered {
+		t.Errorf("#5 Pending should become NotCovered, got %v", mutants[4].Status)
 	}
 }
 

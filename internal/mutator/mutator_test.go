@@ -463,22 +463,136 @@ func TestRegistryEnabledMutators(t *testing.T) {
 
 // --- Offset sanity ---
 
+// TestOffsetsMatchSource asserts StartOffset:EndOffset corresponds to Original
+// text for every mutator type. Kills mutations on the offset arithmetic in each
+// mutator (e.g. `+ len(original)` → `- len(original)` produces wrong byte range,
+// either out of bounds or mismatching the token text).
 func TestOffsetsMatchSource(t *testing.T) {
+	// Source covers every mutator's target construct so each mutator produces
+	// at least one candidate and this test exercises its offset computation.
 	src := `package p
-func f() int { return 1 + 2 }
+
+func f(a, b int) int {
+	if a > 0 {
+		a++
+		a = a - 1
+	} else {
+		a--
+	}
+	switch a {
+	case 1:
+		return a + b
+	case 2:
+		return a * b / 2 % 3
+	}
+	if a == b && a < b {
+		return -a
+	}
+	if a != b || a >= b {
+		return a
+	}
+	return 0
+}
 `
 	fset, file, srcBytes := parse(t, src)
 	reg := mutator.NewRegistry()
+	totalCandidates := 0
 	for _, m := range reg.Mutators() {
-		for _, c := range m.Discover(fset, file, srcBytes) {
+		candidates := m.Discover(fset, file, srcBytes)
+		totalCandidates += len(candidates)
+		for _, c := range candidates {
 			if c.StartOffset < 0 || c.EndOffset > len(srcBytes) || c.StartOffset > c.EndOffset {
-				t.Errorf("%s: invalid offset [%d:%d) in %d-byte source", c.Type, c.StartOffset, c.EndOffset, len(srcBytes))
+				t.Errorf("%s: invalid offset [%d:%d) in %d-byte source",
+					c.Type, c.StartOffset, c.EndOffset, len(srcBytes))
+				continue
 			}
 			got := string(srcBytes[c.StartOffset:c.EndOffset])
 			if got != c.Original {
 				t.Errorf("%s at offset [%d:%d): source has %q, candidate says %q",
 					c.Type, c.StartOffset, c.EndOffset, got, c.Original)
 			}
+		}
+		// Each built-in mutator must produce at least one candidate on this rich source.
+		if len(candidates) == 0 {
+			t.Errorf("%s: expected at least one candidate on rich source, got 0", m.Type())
+		}
+	}
+	if totalCandidates == 0 {
+		t.Fatal("no mutators produced candidates")
+	}
+}
+
+// TestBitwiseOpsProduceNoArithCandidates kills BRANCH_IF and BRANCH_CASE
+// mutations on the `!ok`/default guards in arithmetic/boundary/negation
+// mutators: if the guard is removed, bitwise ops produce bogus candidates.
+func TestBitwiseOpsProduceNoArithCandidates(t *testing.T) {
+	src := `package p
+
+func f(a, b int) int {
+	_ = a & b
+	_ = a | b
+	_ = a ^ b
+	_ = a << 1
+	_ = a >> 1
+	return 0
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	targets := []mutator.MutationType{
+		mutator.ArithmeticBase,
+		mutator.ConditionalsBoundary,
+		mutator.ConditionalsNegation,
+	}
+	for _, tt := range targets {
+		m := findMutator(t, tt)
+		if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+			t.Errorf("%s: expected 0 candidates for bitwise-only source, got %d (%+v)", tt, len(got), got)
+		}
+	}
+}
+
+// TestExpressionRemoveSkipsArithmetic kills BRANCH_CASE on the default
+// clause of the LAND/LOR switch — without the default return, arithmetic
+// ops would incorrectly produce EXPRESSION_REMOVE candidates with empty
+// identity value.
+func TestExpressionRemoveSkipsArithmetic(t *testing.T) {
+	src := `package p
+func f(a, b int) int { return a + b }
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ExpressionRemove)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("ExpressionRemove: arithmetic ops should produce 0 candidates, got %d (%+v)", len(got), got)
+	}
+}
+
+// TestInvertNegativesSkipsNonSub kills the BRANCH_IF on `node.Op != token.SUB`
+// guards: without them, unary `+` and binary `+` would produce candidates.
+func TestInvertNegativesSkipsNonSub(t *testing.T) {
+	src := `package p
+func f(a, b int) int { _ = +a; return a + b }
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.InvertNegatives)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("InvertNegatives: non-SUB ops should produce 0 candidates, got %d (%+v)", len(got), got)
+	}
+}
+
+// TestEnabledMutatorsPreservesOrderAndSet kills CONDITIONALS_BOUNDARY on
+// `len(disable) > 0` in EnabledMutators: mutating to `>=` would include the
+// empty-disable case and return a copy (different slice than r.mutators).
+func TestEnabledMutatorsEmptyDisableReturnsSameSlice(t *testing.T) {
+	reg := mutator.NewRegistry()
+	full := reg.Mutators()
+	got := reg.EnabledMutators(nil, nil)
+	// Must return the ORIGINAL mutators slice (same length, same ordering, same type ids).
+	if len(got) != len(full) {
+		t.Fatalf("len=%d, want %d", len(got), len(full))
+	}
+	for i := range got {
+		if got[i].Type() != full[i].Type() {
+			t.Errorf("[%d] type=%v, want %v", i, got[i].Type(), full[i].Type())
 		}
 	}
 }

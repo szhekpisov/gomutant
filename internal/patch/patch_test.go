@@ -76,6 +76,42 @@ func TestApplyInvalidRange(t *testing.T) {
 	}
 }
 
+// Kills CONDITIONALS_BOUNDARY on `start < 0` (start==0 is valid).
+func TestApplyStartZero(t *testing.T) {
+	original := []byte("hello")
+	got, err := patch.Apply(original, 0, 0, "X")
+	if err != nil {
+		t.Fatalf("Apply with start=0, end=0 should succeed: %v", err)
+	}
+	if string(got) != "Xhello" {
+		t.Errorf("got %q, want %q", string(got), "Xhello")
+	}
+}
+
+// Kills CONDITIONALS_BOUNDARY on `start > end` (start==end is valid, empty insertion).
+func TestApplyStartEqualsEnd(t *testing.T) {
+	original := []byte("hello")
+	got, err := patch.Apply(original, 2, 2, "XY")
+	if err != nil {
+		t.Fatalf("Apply with start==end should succeed: %v", err)
+	}
+	if string(got) != "heXYllo" {
+		t.Errorf("got %q, want %q", string(got), "heXYllo")
+	}
+}
+
+// Kills CONDITIONALS_BOUNDARY on `end > len(original)` (end==len is valid, append to end).
+func TestApplyEndAtLength(t *testing.T) {
+	original := []byte("hello")
+	got, err := patch.Apply(original, 5, 5, "!")
+	if err != nil {
+		t.Fatalf("Apply with end==len should succeed: %v", err)
+	}
+	if string(got) != "hello!" {
+		t.Errorf("got %q, want %q", string(got), "hello!")
+	}
+}
+
 func TestApplyDoesNotMutateOriginal(t *testing.T) {
 	original := []byte("a + b")
 	snapshot := string(original)

@@ -57,19 +57,15 @@ func (r *Registry) EnabledMutators(only, disable []string) []Mutator {
 		return out
 	}
 
-	if len(disable) > 0 {
-		set := make(map[string]bool, len(disable))
-		for _, t := range disable {
-			set[t] = true
-		}
-		var out []Mutator
-		for _, m := range r.mutators {
-			if !set[string(m.Type())] {
-				out = append(out, m)
-			}
-		}
-		return out
+	set := make(map[string]bool, len(disable))
+	for _, t := range disable {
+		set[t] = true
 	}
-
-	return r.mutators
+	var out []Mutator
+	for _, m := range r.mutators {
+		if !set[string(m.Type())] {
+			out = append(out, m)
+		}
+	}
+	return out
 }

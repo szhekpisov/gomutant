@@ -22,7 +22,7 @@ func (b *branchIf) Discover(fset *token.FileSet, file *ast.File, src []byte) []M
 		}
 		pos := fset.Position(body.Lbrace)
 		startOffset := pos.Offset
-		endOffset := fset.Position(body.Rbrace).Offset + 1 // include '}'
+		endOffset := fset.Position(body.End()).Offset // body.End() is after '}'
 		original := string(src[startOffset:endOffset])
 		candidates = append(candidates, MutantCandidate{
 			Type:        BranchIf,
