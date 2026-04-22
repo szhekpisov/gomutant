@@ -83,6 +83,34 @@ func TestDiscoverUnparseableFile(t *testing.T) {
 	}
 }
 
+// TestDiscoverPartiallyInvalidFileSkips kills BRANCH_IF on the `if err != nil`
+// body of parseFile: when parser.ParseFile returns an error together with a
+// partial AST (common for recoverable syntax errors), the original code
+// returns early so Discover skips the file. Under BRANCH_IF the early-return
+// is elided; parseFile yields (src, partialFile, nil) and Discover then
+// walks the partial AST, producing mutants from whatever valid expressions
+// the parser recovered — e.g., the "1 + 2" here would surface as an
+// ARITHMETIC_BASE candidate.
+func TestDiscoverPartiallyInvalidFileSkips(t *testing.T) {
+	dir := t.TempDir()
+	// First two lines parse cleanly; the third line is garbage and makes
+	// parser.ParseFile return an error — but the partial AST still contains
+	// F() with its `1 + 2` binary expression.
+	src := "package bad\nfunc F() int { return 1 + 2 }\nthis is garbage\n"
+	if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgs := []Package{
+		{Dir: dir, ImportPath: "example.com/bad", GoFiles: []string{"bad.go"}},
+	}
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), dir, "example.com")
+	if len(mutants) != 0 {
+		t.Errorf("parseFile error must short-circuit discovery; got %d mutants from partial AST", len(mutants))
+	}
+}
+
 func TestLongestCommonPrefix(t *testing.T) {
 	tests := []struct {
 		pkgs []Package
@@ -258,9 +286,15 @@ func TestDecodeGoListJSONPkgError(t *testing.T) {
 }
 
 func TestResolvePackagesError(t *testing.T) {
-	_, err := ResolvePackages(context.Background(), t.TempDir(), []string{"nonexistent/pkg"})
+	_, err := ResolvePackages(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"})
 	if err == nil {
 		t.Fatal("expected error")
+	}
+	// Error must wrap stderr text. Kills STATEMENT_REMOVE on
+	// `cmd.Stderr = &stderr` in ResolvePackages.
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "no required module") && !strings.Contains(msg, "cannot find") {
+		t.Errorf("error should include stderr content, got: %q", msg)
 	}
 }
 
@@ -320,10 +354,20 @@ func TestDiscoverRelFileNoCommonPrefix(t *testing.T) {
 	if len(mutants) < 2 {
 		t.Fatalf("expected at least 2 mutants, got %d", len(mutants))
 	}
-	// When no common prefix, RelFile should fall back to filepath.Rel from moduleRoot.
+	// When no common prefix, RelFile must come from filepath.Rel(moduleRoot, absPath) —
+	// not from concatenating the package import path with the file base. Kills
+	// EXPRESSION_REMOVE on the left operand of
+	// `commonPrefix != "" && strings.HasPrefix(pkg, commonPrefix)`: if that
+	// operand is replaced with `true`, HasPrefix(pkg, "") is trivially true,
+	// the then-branch fires, and RelFile ends up prefixed with the full
+	// package import path ("alpha/pkg/a.go" / "beta/pkg/b.go").
 	for _, m := range mutants {
 		if m.RelFile == "" {
 			t.Errorf("mutant ID=%d has empty RelFile", m.ID)
+		}
+		if strings.HasPrefix(m.RelFile, "alpha/pkg") || strings.HasPrefix(m.RelFile, "beta/pkg") {
+			t.Errorf("mutant ID=%d RelFile=%q should not carry package import path when commonPrefix is empty",
+				m.ID, m.RelFile)
 		}
 	}
 }
