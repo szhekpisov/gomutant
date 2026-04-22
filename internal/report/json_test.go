@@ -145,3 +145,4 @@ func TestWriteJSON(t *testing.T) {
 		t.Errorf("Total=%d", loaded.MutantsTotal)
 	}
 }
+

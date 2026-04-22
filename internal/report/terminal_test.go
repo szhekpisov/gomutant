@@ -352,7 +352,12 @@ func TestWriteJSONMarshalError(t *testing.T) {
 
 // TestWriteJSONMkdirError kills BRANCH_IF on the os.MkdirAll error branch in
 // json.go. Passing a path whose parent "directory" is actually a regular file
-// forces MkdirAll to fail; the test asserts the error propagates.
+// forces MkdirAll to fail with a "mkdir …: not a directory" error (Op="mkdir").
+//
+// Asserting `err != nil` alone doesn't kill the mutant: when BRANCH_IF elides
+// the early return, execution falls through to os.WriteFile, which also fails
+// but with a distinct "open …: not a directory" error (Op="open"). Matching
+// on "mkdir" distinguishes the two error paths.
 func TestWriteJSONMkdirError(t *testing.T) {
 	dir := t.TempDir()
 	blocker := filepath.Join(dir, "blocker-file")
@@ -365,6 +370,9 @@ func TestWriteJSONMkdirError(t *testing.T) {
 	err := WriteJSON(r, path)
 	if err == nil {
 		t.Fatal("expected WriteJSON to return MkdirAll error")
+	}
+	if !strings.Contains(err.Error(), "mkdir") {
+		t.Errorf("expected mkdir-phase error, got %q (BRANCH_IF would leak a WriteFile/open-phase error here)", err)
 	}
 }
 

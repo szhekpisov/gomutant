@@ -10,11 +10,11 @@ Status of gomutant's self-mutation test. "Efficacy" = `killed / (killed + lived)
 | config   | 42     | 0     | 100.00%  |
 | patch    | 13     | 0     | 100.00%  |
 | mutator  | 78     | 0     | 100.00%  |
-| report   | 94     | 1     | 98.95%   |
+| report   | 95     | 0     | 100.00%  |
 | coverage | 106    | 16    | 86.89%   |
 | discover | 50     | 8     | 86.21%   |
 | runner   | 69     | 28    | 71.13%   |
-| **total**| **452**| **53**| **89.50%** |
+| **total**| **453**| **52**| **89.70%** |
 
 Run the no-main self-test with `scripts/` (external) or replicate with
 `gomutant -w 8 -o <pkg>.json ./internal/<pkg>/` per package.
@@ -90,8 +90,6 @@ only tested path, the mutation is unreachable without a subprocess mock.
 - `coverage/testmap.go:137, 173, 177, 242` — context cancellation, cwd
   setting, error-path returns that observe the same final result as the
   success path in integration tests.
-- `report/json.go:111` — `os.MkdirAll` failure followed by `WriteFile`
-  which also fails; both paths return an error, only the message differs.
 
 ### 5. Pool / worker control-flow with ctx-gated or panic-safe fall-through
 
@@ -198,10 +196,7 @@ distinguish "no data" from "data I couldn't parse." Same-state classes.
    and unit-test with hand-built slices. Kills ~5 mutants cleanly.
 2. **Inject `exec.Command` indirection** in `runner/pool.go` and
    `coverage/testmap.go` to simulate partial failures. Kills ~10 mutants.
-3. **Classify `WriteJSON` errors** with typed sentinels (`ErrMkdir`,
-   `ErrWrite`) so tests can distinguish which sub-call failed. Kills 1
-   in report.
-4. **Drop the GOMUTANT_TEST_SHORT branch** if no longer needed —
+3. **Drop the GOMUTANT_TEST_SHORT branch** if no longer needed —
    removing code removes its mutants. (Confirm it's still load-bearing
    for self-testing first.)
 
