@@ -181,9 +181,23 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
+		// cmd.Start failure is an infrastructure problem (exec/fork failure,
+		// PATH misconfig, rlimit), not a mutant-viability signal. Log loudly
+		// so it doesn't silently inflate NotViable counts and mislead efficacy.
+		fmt.Fprintf(os.Stderr, "gomutant: worker %d: cmd.Start failed, treating as NotViable: %v\n", w.id, err)
 		m.Status = mutator.StatusNotViable
 		m.Duration = nonZeroSince(start)
 		return m
+	}
+
+	// Resolve the actual pgid of the child. With Setpgid:true, Go invokes
+	// setpgid in the parent on Linux before returning from Start, but on
+	// macOS it happens in the child post-fork, so there's a brief window
+	// where cmd.Process.Pid and the group leader's pid may differ.
+	// Getpgid(pid) avoids both the race and any future scheduler changes.
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		pgid = cmd.Process.Pid
 	}
 
 	var memKilled atomic.Bool
@@ -191,7 +205,6 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	go func() {
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
-		pgid := cmd.Process.Pid
 		for {
 			select {
 			case <-monitorDone:
@@ -210,6 +223,16 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	close(monitorDone)
 	m.Duration = time.Since(start)
 
+	// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
+	// exec.CommandContext as a non-nil cmd.Wait error that is neither
+	// memKilled nor the test's own timeout. Leaving classification to
+	// classifyTestOutcome would fall through to StatusKilled, which would
+	// silently mark cancelled mutants as tested — inflating efficacy.
+	// Detect parent cancel first and preserve the incoming Status so the
+	// pool surfaces the mutant as Pending (i.e. not tested).
+	if ctx.Err() != nil {
+		return m
+	}
 	m.Status = classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String())
 	return m
 }

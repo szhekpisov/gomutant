@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -216,8 +217,11 @@ func readModuleName(dir string) (string, error) {
 		return "", fmt.Errorf("reading go.mod: %w", err)
 	}
 	for _, line := range splitLines(data) {
-		if len(line) > 7 && string(line[:7]) == "module " {
-			return string(line[7:]), nil
+		// `module foo` — tolerate arbitrary whitespace (tabs, multiple
+		// spaces) between the directive and the path.
+		fields := strings.Fields(string(line))
+		if len(fields) >= 2 && fields[0] == "module" {
+			return fields[1], nil
 		}
 	}
 	return "", fmt.Errorf("module name not found in go.mod")

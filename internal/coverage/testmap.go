@@ -73,11 +73,11 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, cov
 			continue
 		}
 
-		// Verify binary was created (packages with no tests produce no binary).
-		if _, err := exec.LookPath(binPath); err != nil {
-			if _, statErr := statFile(binPath); statErr != nil {
-				continue
-			}
+		// Verify binary was created (packages with no tests produce no
+		// binary). Stat is the right probe here — LookPath is for PATH
+		// resolution, not file existence.
+		if _, err := statFile(binPath); err != nil {
+			continue
 		}
 
 		pkgBins[pkg.importPath] = &compiledPkg{

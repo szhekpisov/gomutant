@@ -53,16 +53,19 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 	}
 
 	work := make(chan int, len(pending))
-	results := make(chan mutator.Mutant, p.workers)
+	results := make(chan mutator.Mutant, len(pending))
 
 	var wg sync.WaitGroup
 
 	// Start workers.
+	workersStarted := 0
 	for i := range p.workers {
 		w, err := NewWorker(i, p.tmpDir, p.timeout, p.srcCache, p.projectDir, p.testMap)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "gomutant: NewWorker %d failed: %v\n", i, err)
 			continue
 		}
+		workersStarted++
 		wg.Add(1)
 		go func(w *Worker) {
 			defer wg.Done()
@@ -74,6 +77,13 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 				results <- result
 			}
 		}(w)
+	}
+
+	// If no worker could be created, abort cleanly rather than deadlocking
+	// on a feeder blocked forever sending into `work` with no readers.
+	if workersStarted == 0 {
+		fmt.Fprintln(os.Stderr, "gomutant: no workers could be started; skipping mutation run")
+		return mutants
 	}
 
 	// Feed work.
@@ -94,8 +104,18 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 		close(results)
 	}()
 
+	// Build ID → index lookup so we don't rely on IDs being a dense
+	// 1-based contiguous range. Future filter steps that drop mutants
+	// before Pool won't silently corrupt results with an off-by-one.
+	idToIdx := make(map[int]int, len(mutants))
+	for i, m := range mutants {
+		idToIdx[m.ID] = i
+	}
+
 	for result := range results {
-		mutants[result.ID-1] = result // IDs are 1-based.
+		if idx, ok := idToIdx[result.ID]; ok {
+			mutants[idx] = result
+		}
 		if onResult != nil {
 			onResult(result)
 		}

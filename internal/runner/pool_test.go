@@ -126,6 +126,74 @@ func TestPoolRunWithPending(t *testing.T) {
 	}
 }
 
+// TestPoolRunNoWorkersAvailable verifies that when every NewWorker call
+// fails, Run surfaces the condition cleanly and does not hang on a feeder
+// goroutine stuck sending into a channel that no one reads.
+func TestPoolRunNoWorkersAvailable(t *testing.T) {
+	// tmpDir that NewWorker can't write into — pass a path that is a
+	// regular file. os.WriteFile(worker-N.go) fails with "not a directory".
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewPool(4, 30*time.Second, blocker, nil, ".", nil)
+	mutants := []mutator.Mutant{
+		{ID: 1, File: "/abs/f.go", Pkg: "p", Status: mutator.StatusPending},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Run(context.Background(), mutants, nil)
+	}()
+	select {
+	case <-done:
+		// OK — Run returned rather than deadlocking.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pool.Run hung when all workers failed to start")
+	}
+}
+
+// TestPoolRunNonDenseIDs kills the assumption that mutant IDs are a
+// dense 1-based contiguous range. With sparse IDs the old
+// `mutants[result.ID-1] = result` corrupted arbitrary slots.
+func TestPoolRunNonDenseIDs(t *testing.T) {
+	dir := setupTestProject(t)
+	srcPath := filepath.Join(dir, "add.go")
+	src, _ := os.ReadFile(srcPath)
+	cache := map[string][]byte{srcPath: src}
+
+	plusIdx := 0
+	for i, c := range string(src) {
+		if c == '+' && i > 30 {
+			plusIdx = i
+			break
+		}
+	}
+
+	p := NewPool(1, 30*time.Second, t.TempDir(), cache, dir, nil)
+	mutants := []mutator.Mutant{
+		// Sparse IDs: 100 and 500. Not 1 and 2.
+		{ID: 100, File: srcPath, Pkg: "testmod",
+			StartOffset: plusIdx, EndOffset: plusIdx + 1, Replacement: "-",
+			Status: mutator.StatusPending},
+		{ID: 500, File: srcPath, Pkg: "testmod",
+			StartOffset: plusIdx, EndOffset: plusIdx + 1, Replacement: "*",
+			Status: mutator.StatusPending},
+	}
+	result := p.Run(context.Background(), mutants, nil)
+	if len(result) != 2 {
+		t.Fatalf("len(result)=%d, want 2", len(result))
+	}
+	for _, m := range result {
+		if m.Status == mutator.StatusPending {
+			t.Errorf("mutant ID=%d still Pending — ID→index lookup failed", m.ID)
+		}
+	}
+}
+
 func TestPoolRunCancelled(t *testing.T) {
 	dir := setupTestProject(t)
 	srcPath := filepath.Join(dir, "add.go")

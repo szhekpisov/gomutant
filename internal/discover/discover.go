@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -20,7 +21,7 @@ import (
 // Package holds resolved package info from go list.
 type Package struct {
 	Dir        string   // Absolute directory path.
-	ImportPath string   // e.g. "github.com/szhekpisov/diffyml/pkg/diffyml"
+	ImportPath string   // e.g. "github.com/szhekpisov/gomutant/internal/discover"
 	GoFiles    []string // .go source files (base names).
 	TestGoFiles []string // _test.go files (base names).
 }
@@ -87,7 +88,10 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 			absPath := filepath.Join(pkg.Dir, filename)
 			src, file, err := parseFile(fset, absPath)
 			if err != nil {
-				continue // Soft failure: skip unparseable files.
+				// Soft failure: skip unparseable files. Log so silent
+				// skips don't hide classifier-blindspots in reports.
+				fmt.Fprintf(os.Stderr, "gomutant: skipping unparseable %s: %v\n", absPath, err)
+				continue
 			}
 			for _, m := range mutators {
 				candidates := m.Discover(fset, file, src)

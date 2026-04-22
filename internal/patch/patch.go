@@ -7,7 +7,9 @@ func Apply(original []byte, start, end int, replacement string) ([]byte, error) 
 	if start < 0 || end > len(original) || start > end {
 		return nil, fmt.Errorf("patch: invalid range [%d:%d) in %d-byte file", start, end, len(original))
 	}
-	var out []byte
+	// Pre-size so the three appends below don't grow the backing array.
+	// For large files × many mutants this saves ~2× the final size in churn.
+	out := make([]byte, 0, len(original)-(end-start)+len(replacement))
 	out = append(out, original[:start]...)
 	out = append(out, replacement...)
 	out = append(out, original[end:]...)

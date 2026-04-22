@@ -479,6 +479,58 @@ func TestCappedBufferString(t *testing.T) {
 	}
 }
 
+// TestWorkerTestParentCtxCancel verifies that a parent-context
+// cancellation (Ctrl-C, upstream deadline) is NOT classified as Killed.
+// The worker should preserve the incoming Status (Pending) so the pool
+// doesn't surface cancelled work as if it had been tested.
+func TestWorkerTestParentCtxCancel(t *testing.T) {
+	dir := t.TempDir()
+	goMod := "module testmod\n\ngo 1.26\n"
+	src := "package testpkg\n\nfunc Add(a, b int) int { return a + b }\n"
+	testSrc := "package testpkg\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestSlow(t *testing.T) { time.Sleep(30 * time.Second) }\n"
+
+	for name, body := range map[string]string{
+		"go.mod": goMod, "add.go": src, "add_test.go": testSrc,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cache := map[string][]byte{filepath.Join(dir, "add.go"): []byte(src)}
+	w, err := NewWorker(0, t.TempDir(), 30*time.Second, cache, dir, nil)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	plusIdx := 0
+	for i, c := range src {
+		if c == '+' && i > 30 {
+			plusIdx = i
+			break
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := mutator.Mutant{
+		ID: 1, File: filepath.Join(dir, "add.go"), Pkg: "testmod",
+		StartOffset: plusIdx, EndOffset: plusIdx + 1, Replacement: "-",
+		Status: mutator.StatusPending,
+	}
+
+	// Cancel mid-run: the test binary above sleeps 30s, so parent-ctx
+	// cancellation fires before the test returns naturally.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	result := w.Test(ctx, m)
+	if result.Status != mutator.StatusPending {
+		t.Errorf("Status=%v, want Pending — parent-ctx cancel must not produce a terminal classification", result.Status)
+	}
+}
+
 // TestBuildTestArgsShortFlag kills CONDITIONALS_NEGATION / BRANCH_IF on
 // the GOMUTANT_TEST_SHORT gate: passing short=true must add "-short" to
 // the command line; short=false must omit it. We assert both directions.

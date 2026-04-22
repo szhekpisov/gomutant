@@ -9,6 +9,10 @@ type arithmeticBase struct{}
 
 func (a *arithmeticBase) Type() MutationType { return ArithmeticBase }
 
+// arithmeticSwaps maps each arithmetic operator to a single replacement.
+// Asymmetric by design: REM → MUL catches divisor/remainder confusion, but
+// MUL → REM would emit code that changes types on float operands and is
+// rarely semantically meaningful as a mutant, so we only keep the one side.
 var arithmeticSwaps = map[token.Token]token.Token{
 	token.ADD: token.SUB,
 	token.SUB: token.ADD,

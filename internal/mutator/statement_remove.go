@@ -19,6 +19,11 @@ func (s *statementRemove) Discover(fset *token.FileSet, file *ast.File, src []by
 			if stmt.Tok != token.ASSIGN {
 				return true
 			}
+			// Parser can — under recovery from earlier syntax errors — yield
+			// an AssignStmt with no Rhs. Skip rather than deref Rhs[0].
+			if len(stmt.Rhs) == 0 {
+				return true
+			}
 			// Replace "x = expr" with "_ = expr".
 			// The replacement keeps the RHS to avoid unused-import errors.
 			pos := fset.Position(stmt.Pos())
