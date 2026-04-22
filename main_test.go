@@ -207,6 +207,9 @@ func TestRunDryRun(t *testing.T) {
 }
 
 func TestRunFullPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
 	dir := t.TempDir()
 	files := map[string]string{
 		"go.mod":      "module testmod\n\ngo 1.26\n",

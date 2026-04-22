@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,13 +8,73 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/szhekpisov/gomutant/internal/coverage"
 	"github.com/szhekpisov/gomutant/internal/mutator"
 	"github.com/szhekpisov/gomutant/internal/patch"
 )
+
+// maxSubprocRSSBytes caps per-mutant subprocess group memory. A mutation that
+// flips a loop termination or allocation bound can make go test (or its test
+// binary) balloon to tens of GB within seconds. We SIGKILL the whole process
+// group at this cap; a killed mutant is classified as TimedOut.
+const maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+// pgroupRSSBytes returns the summed RSS of all processes in the given PGID.
+// Uses `ps -g` (BSD/macOS flag) which is also supported on Linux GNU ps.
+func pgroupRSSBytes(pgid int) int64 {
+	out, err := exec.Command("ps", "-o", "rss=", "-g", strconv.Itoa(pgid)).Output()
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			continue
+		}
+		total += n * 1024 // ps rss is KB
+	}
+	return total
+}
+
+// killPgroup sends SIGKILL to the entire process group.
+func killPgroup(pgid int) {
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+// maxCapturedOutput caps per-stream subprocess capture. A misbehaving mutant
+// (panic-loop, infinite logging) can otherwise balloon RSS by gigabytes before
+// the timeout fires.
+const maxCapturedOutput = 1 << 20 // 1 MiB
+
+// cappedBuffer accumulates writes up to cap bytes and silently drops the rest.
+// Compile-error detection only needs early output; later noise is useless.
+type cappedBuffer struct {
+	buf []byte
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := maxCapturedOutput - len(c.buf); remaining > 0 {
+		if len(p) <= remaining {
+			c.buf = append(c.buf, p...)
+		} else {
+			c.buf = append(c.buf, p[:remaining]...)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return string(c.buf) }
 
 var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 
@@ -104,6 +163,13 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 		fmt.Sprintf("-overlay=%s", w.overlayPath),
 	}
 
+	// GOMUTANT_TEST_SHORT=1 propagates -short to inner go test, letting the
+	// target suite skip heavy integration tests. Used for gomutant self-testing
+	// to avoid recursive worker-pool fanout.
+	if os.Getenv("GOMUTANT_TEST_SHORT") == "1" {
+		args = append(args, "-short")
+	}
+
 	// Use per-test coverage map to run only relevant tests.
 	if w.testMap != nil {
 		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
@@ -114,15 +180,50 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	args = append(args, m.Pkg)
 	cmd := exec.CommandContext(testCtx, "go", args...)
 	cmd.Dir = w.projectDir
+	// Put go test + its compiler + test-binary descendants in their own
+	// process group so we can kill the whole tree if RSS runs away.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err = cmd.Run()
+	if err := cmd.Start(); err != nil {
+		m.Status = mutator.StatusNotViable
+		m.Duration = time.Since(start)
+		return m
+	}
+
+	var memKilled atomic.Bool
+	monitorDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		pgid := cmd.Process.Pid
+		for {
+			select {
+			case <-monitorDone:
+				return
+			case <-t.C:
+				if pgroupRSSBytes(pgid) > maxSubprocRSSBytes {
+					memKilled.Store(true)
+					killPgroup(pgid)
+					return
+				}
+			}
+		}
+	}()
+
+	err = cmd.Wait()
+	close(monitorDone)
 	m.Duration = time.Since(start)
 
 	// 6. Classify result.
+	if memKilled.Load() {
+		m.Status = mutator.StatusTimedOut
+		return m
+	}
+
 	if err == nil {
 		m.Status = mutator.StatusLived
 		return m
