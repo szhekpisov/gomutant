@@ -2,12 +2,15 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/szhekpisov/gomutant/internal/coverage"
 	"github.com/szhekpisov/gomutant/internal/mutator"
 )
 
@@ -474,6 +477,162 @@ func TestCappedBufferString(t *testing.T) {
 	if got := c.String(); got != "hello" {
 		t.Errorf("String() = %q, want %q", got, "hello")
 	}
+}
+
+// TestBuildTestArgsShortFlag kills CONDITIONALS_NEGATION / BRANCH_IF on
+// the GOMUTANT_TEST_SHORT gate: passing short=true must add "-short" to
+// the command line; short=false must omit it. We assert both directions.
+func TestBuildTestArgsShortFlag(t *testing.T) {
+	w := &Worker{timeout: time.Second, overlayPath: "/tmp/o.json"}
+	m := mutator.Mutant{Pkg: "mymod"}
+
+	withShort := w.buildTestArgs(m, true)
+	if !containsStr(withShort, "-short") {
+		t.Errorf("short=true: args %v missing -short", withShort)
+	}
+	withoutShort := w.buildTestArgs(m, false)
+	if containsStr(withoutShort, "-short") {
+		t.Errorf("short=false: args %v should not contain -short", withoutShort)
+	}
+}
+
+// TestBuildTestArgsPackageArgLast kills STATEMENT_REMOVE on
+// `args = append(args, m.Pkg)`: removing that line leaves the command
+// without a package target. Asserting that the package shows up as the
+// final positional arg catches both the removal and any reordering.
+func TestBuildTestArgsPackageArgLast(t *testing.T) {
+	w := &Worker{timeout: time.Second, overlayPath: "/tmp/o.json"}
+	m := mutator.Mutant{Pkg: "example.com/mod/sub"}
+	args := w.buildTestArgs(m, false)
+	if len(args) == 0 || args[len(args)-1] != "example.com/mod/sub" {
+		t.Errorf("last arg = %q, want package import path; full args: %v",
+			args[len(args)-1], args)
+	}
+	// Also: -timeout, -overlay, -failfast, -count=1 must all be present.
+	for _, want := range []string{"-failfast", "-count=1"} {
+		if !containsStr(args, want) {
+			t.Errorf("args missing %q: %v", want, args)
+		}
+	}
+	if !anyHasPrefix(args, "-overlay=") {
+		t.Errorf("args missing -overlay=…: %v", args)
+	}
+	if !anyHasPrefix(args, "-timeout=") {
+		t.Errorf("args missing -timeout=…: %v", args)
+	}
+}
+
+// TestBuildTestArgsWithTestMap kills CONDITIONALS_NEGATION / BRANCH_IF on
+// `if w.testMap != nil`. With a non-nil map that actually contains the
+// mutant's (file, line), the command line must include `-run=<regex>`.
+// With no map, no -run should appear. Under either mutation, the -run
+// flag would be either missing (when it should appear) or leak (via a
+// nil-deref panic in the negation case).
+func TestBuildTestArgsWithTestMap(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("go.mod", "module testmod\n\ngo 1.26\n")
+	mustWrite("add.go", "package testmod\n\nfunc Add(a, b int) int { return a + b }\n")
+	mustWrite("add_test.go", "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"wrong\") } }\n")
+
+	tm, err := coverage.BuildTestMap(context.Background(), dir, []string{"testmod"}, "", t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+
+	wWith := &Worker{testMap: tm, timeout: time.Second, overlayPath: "/tmp/o.json"}
+	wWithout := &Worker{timeout: time.Second, overlayPath: "/tmp/o.json"}
+	m := mutator.Mutant{
+		CoverageFile: "testmod/add.go",
+		Line:         3,
+		Pkg:          "testmod",
+	}
+	// With map: -run=<pattern> must appear.
+	argsWith := wWith.buildTestArgs(m, false)
+	if !anyHasPrefix(argsWith, "-run=") {
+		t.Errorf("testMap non-nil with matching entry: expected -run= in %v", argsWith)
+	}
+	// Without map: -run= must not appear.
+	argsWithout := wWithout.buildTestArgs(m, false)
+	if anyHasPrefix(argsWithout, "-run=") {
+		t.Errorf("testMap nil: -run= must be absent, got %v", argsWithout)
+	}
+	// With map but no matches for this (file, line): -run= must not appear.
+	// Kills CONDITIONALS_BOUNDARY on `len(tests) > 0` — mutated `>= 0` would
+	// always enter the branch and append -run= with an empty pattern.
+	mMiss := mutator.Mutant{CoverageFile: "unknown/file.go", Line: 9999, Pkg: "testmod"}
+	argsMiss := wWith.buildTestArgs(mMiss, false)
+	if anyHasPrefix(argsMiss, "-run=") {
+		t.Errorf("testMap non-nil but no matches: -run= must be absent (len(tests)>0 guard), got %v", argsMiss)
+	}
+}
+
+// TestClassifyTestOutcome covers every branch of the classifier.
+// Kills BRANCH_IF on the memKilled short-circuit, the runErr==nil
+// Lived return, the DeadlineExceeded arm, and both EXPRESSION_REMOVE
+// mutations on the `compileErrorRe && ([build failed] || [setup failed])`
+// predicate.
+func TestClassifyTestOutcome(t *testing.T) {
+	anyErr := errors.New("exit status 1")
+	tests := []struct {
+		name       string
+		runErr     error
+		memKilled  bool
+		testCtxErr error
+		stdout     string
+		stderr     string
+		want       mutator.MutantStatus
+	}{
+		{"memkilled beats everything", anyErr, true, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
+		// memKilled early return is elided, execution falls through to
+		// `runErr == nil → Lived`. Asserting TimedOut here kills that
+		// mutation.
+		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
+		{"success => lived", nil, false, nil, "", "", mutator.StatusLived},
+		{"timeout before classify", anyErr, false, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		{"compile failure => not viable", anyErr, false, nil,
+			"FAIL\ttestmod [build failed]\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
+		{"setup failure => not viable", anyErr, false, nil,
+			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\n", mutator.StatusNotViable},
+		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
+			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
+		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
+			"FAIL [build failed]\n", "", mutator.StatusKilled},
+		{"normal test failure => killed", anyErr, false, nil,
+			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Test helpers.
+func containsStr(xs []string, target string) bool {
+	for _, x := range xs {
+		if x == target {
+			return true
+		}
+	}
+	return false
+}
+func anyHasPrefix(xs []string, prefix string) bool {
+	for _, x := range xs {
+		if strings.HasPrefix(x, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCompileErrorRegex(t *testing.T) {

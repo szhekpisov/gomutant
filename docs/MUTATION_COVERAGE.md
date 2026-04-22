@@ -13,8 +13,8 @@ Status of gomutant's self-mutation test. "Efficacy" = `killed / (killed + lived)
 | report   | 95     | 0     | 100.00%  |
 | coverage | 113    | 9     | 92.62%   |
 | discover | 50     | 4     | 92.59%   |
-| runner   | 69     | 28    | 71.13%   |
-| **total**| **460**| **41**| **91.82%** |
+| runner   | 80     | 20    | 80.00%   |
+| **total**| **471**| **33**| **93.45%** |
 
 Run the no-main self-test with `scripts/` (external) or replicate with
 `gomutant -w 8 -o <pkg>.json ./internal/<pkg>/` per package.

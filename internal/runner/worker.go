@@ -169,26 +169,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	testCtx, cancel := context.WithTimeout(ctx, w.timeout)
 	defer cancel()
 
-	args := []string{"test", "-count=1", "-failfast",
-		fmt.Sprintf("-timeout=%s", w.timeout),
-		fmt.Sprintf("-overlay=%s", w.overlayPath),
-	}
-
-	// GOMUTANT_TEST_SHORT=1 propagates -short to inner go test, letting the
-	// target suite skip heavy integration tests. Used for gomutant self-testing
-	// to avoid recursive worker-pool fanout.
-	if os.Getenv("GOMUTANT_TEST_SHORT") == "1" {
-		args = append(args, "-short")
-	}
-
-	// Use per-test coverage map to run only relevant tests.
-	if w.testMap != nil {
-		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
-			args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
-		}
-	}
-
-	args = append(args, m.Pkg)
+	args := w.buildTestArgs(m, os.Getenv("GOMUTANT_TEST_SHORT") == "1")
 	cmd := exec.CommandContext(testCtx, "go", args...)
 	cmd.Dir = w.projectDir
 	// Put go test + its compiler + test-binary descendants in their own
@@ -229,31 +210,58 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	close(monitorDone)
 	m.Duration = time.Since(start)
 
-	// 6. Classify result.
-	if memKilled.Load() {
-		m.Status = mutator.StatusTimedOut
-		return m
-	}
-
-	if err == nil {
-		m.Status = mutator.StatusLived
-		return m
-	}
-
-	if testCtx.Err() == context.DeadlineExceeded {
-		m.Status = mutator.StatusTimedOut
-		return m
-	}
-
-	// Non-zero exit: distinguish KILLED from NOT_VIABLE.
-	// Build failures show "[build failed]" or "[setup failed]" in stdout.
-	stdoutStr := stdout.String()
-	if compileErrorRe.MatchString(stderr.String()) &&
-		(strings.Contains(stdoutStr, "[build failed]") || strings.Contains(stdoutStr, "[setup failed]")) {
-		m.Status = mutator.StatusNotViable
-		return m
-	}
-
-	m.Status = mutator.StatusKilled
+	m.Status = classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String())
 	return m
+}
+
+// buildTestArgs constructs the `go test` argv for a single mutant. Split
+// out so callers can verify the -short, -run, and package arg wiring
+// without spinning up a subprocess.
+func (w *Worker) buildTestArgs(m mutator.Mutant, short bool) []string {
+	args := []string{"test", "-count=1", "-failfast",
+		fmt.Sprintf("-timeout=%s", w.timeout),
+		fmt.Sprintf("-overlay=%s", w.overlayPath),
+	}
+	// GOMUTANT_TEST_SHORT=1 propagates -short to inner go test, letting the
+	// target suite skip heavy integration tests. Used for gomutant self-testing
+	// to avoid recursive worker-pool fanout.
+	if short {
+		args = append(args, "-short")
+	}
+	// Use per-test coverage map to run only relevant tests.
+	if w.testMap != nil {
+		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
+			args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
+		}
+	}
+	args = append(args, m.Pkg)
+	return args
+}
+
+// classifyTestOutcome decides a mutant's terminal status from the raw
+// subprocess outcome. Pure function so the branching can be unit-tested
+// without staging actual test failures.
+//
+// Priority order:
+//  1. memKilled → TimedOut (RSS monitor SIGKILL'd the tree).
+//  2. runErr == nil → Lived (tests all passed with the mutant applied).
+//  3. testCtxErr == DeadlineExceeded → TimedOut.
+//  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
+//     `[build failed]` / `[setup failed]` → NotViable.
+//  5. Otherwise → Killed.
+func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string) mutator.MutantStatus {
+	if memKilled {
+		return mutator.StatusTimedOut
+	}
+	if runErr == nil {
+		return mutator.StatusLived
+	}
+	if testCtxErr == context.DeadlineExceeded {
+		return mutator.StatusTimedOut
+	}
+	if compileErrorRe.MatchString(stderr) &&
+		(strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")) {
+		return mutator.StatusNotViable
+	}
+	return mutator.StatusKilled
 }
