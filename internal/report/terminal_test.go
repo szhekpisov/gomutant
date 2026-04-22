@@ -349,3 +349,72 @@ func TestWriteJSONMarshalError(t *testing.T) {
 		t.Fatal("expected error from marshalJSON")
 	}
 }
+
+// TestWriteJSONMkdirError kills BRANCH_IF on the os.MkdirAll error branch in
+// json.go. Passing a path whose parent "directory" is actually a regular file
+// forces MkdirAll to fail; the test asserts the error propagates.
+func TestWriteJSONMkdirError(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker-file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// MkdirAll("blocker-file/nested") fails because blocker-file is a regular file.
+	path := filepath.Join(blocker, "nested", "report.json")
+	r := &Report{GoModule: "test", MutatorStatistics: map[string]int{}}
+	err := WriteJSON(r, path)
+	if err == nil {
+		t.Fatal("expected WriteJSON to return MkdirAll error")
+	}
+}
+
+// TestNewTerminalDetectsCharDevice kills STATEMENT_REMOVE on the isTTY
+// assignment in NewTerminal. /dev/null is a character device on Unix; if the
+// assignment is removed, isTTY stays at its zero value (false) and the check
+// here fails.
+func TestNewTerminalDetectsCharDevice(t *testing.T) {
+	f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+	defer f.Close()
+	term := NewTerminal(f, 10, false)
+	if !term.isTTY {
+		t.Errorf("expected isTTY=true for char device %s, got false", os.DevNull)
+	}
+}
+
+// TestOnResultProgressBarWidth kills ARITHMETIC_BASE on the bar-fill
+// computation and CONDITIONALS_BOUNDARY on `t.total > 0`. We set isTTY
+// directly since our test buffer isn't a char device.
+func TestOnResultProgressBarWidth(t *testing.T) {
+	var buf bytes.Buffer
+	term := &Terminal{w: &buf, isTTY: true, total: 10, start: time.Now(), verbose: false}
+	for range 5 {
+		term.OnResult(mutator.Mutant{})
+	}
+	// barWidth=30, done=5, total=10 -> filled = 30*5/10 = 15 '=' chars.
+	// If ARITHMETIC_BASE flips * -> / : 30/5/10 = 0 (no '=').
+	// If ARITHMETIC_BASE flips / -> * : 30*5*10 = 1500 (buffer overflow, but
+	// the bar is a fixed [30]byte so at minimum count differs).
+	// Final frame is after the last '\r'.
+	frames := strings.Split(buf.String(), "\r")
+	last := frames[len(frames)-1]
+	equals := strings.Count(last, "=")
+	if equals != 15 {
+		t.Errorf("bar fill: got %d '=', want 15. last frame: %q", equals, last)
+	}
+	// Also assert the percentage displayed, which catches pctDone mutations.
+	if !strings.Contains(last, "50%") {
+		t.Errorf("expected 50%% progress, got: %q", last)
+	}
+}
+
+// TestOnResultZeroTotalNoPanic kills CONDITIONALS_BOUNDARY on `t.total > 0`.
+// Mutating > to >= lets the block execute with total=0 and divide by zero.
+func TestOnResultZeroTotalNoPanic(t *testing.T) {
+	var buf bytes.Buffer
+	term := &Terminal{w: &buf, isTTY: true, total: 0, start: time.Now(), verbose: false}
+	// Must not panic. Under mutation (>= 0), pctDone = done*100/0 -> panic.
+	term.OnResult(mutator.Mutant{})
+}

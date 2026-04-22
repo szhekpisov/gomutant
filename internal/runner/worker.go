@@ -52,6 +52,17 @@ func killPgroup(pgid int) {
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
+// nonZeroSince returns time.Since(start) but guarantees a strictly positive
+// result, so callers can use Duration==0 as a "never set" sentinel. Without
+// this, rapid early-return paths can yield a zero Duration on some clocks.
+func nonZeroSince(start time.Time) time.Duration {
+	d := time.Since(start)
+	if d <= 0 {
+		return time.Nanosecond
+	}
+	return d
+}
+
 // maxCapturedOutput caps per-stream subprocess capture. A misbehaving mutant
 // (panic-loop, infinite logging) can otherwise balloon RSS by gigabytes before
 // the timeout fires.
@@ -126,7 +137,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	original, ok := w.sourceCache[m.File]
 	if !ok {
 		m.Status = mutator.StatusNotViable
-		m.Duration = time.Since(start)
+		m.Duration = nonZeroSince(start)
 		return m
 	}
 
@@ -134,14 +145,14 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	patched, err := patch.Apply(original, m.StartOffset, m.EndOffset, m.Replacement)
 	if err != nil {
 		m.Status = mutator.StatusNotViable
-		m.Duration = time.Since(start)
+		m.Duration = nonZeroSince(start)
 		return m
 	}
 
 	// 3. Write patched source to worker's temp file.
 	if err := os.WriteFile(w.tmpSrcPath, patched, 0o644); err != nil {
 		m.Status = mutator.StatusNotViable
-		m.Duration = time.Since(start)
+		m.Duration = nonZeroSince(start)
 		return m
 	}
 
@@ -150,7 +161,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	ovBytes, _ := json.Marshal(ov)
 	if err := os.WriteFile(w.overlayPath, ovBytes, 0o644); err != nil {
 		m.Status = mutator.StatusNotViable
-		m.Duration = time.Since(start)
+		m.Duration = nonZeroSince(start)
 		return m
 	}
 
@@ -190,7 +201,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 
 	if err := cmd.Start(); err != nil {
 		m.Status = mutator.StatusNotViable
-		m.Duration = time.Since(start)
+		m.Duration = nonZeroSince(start)
 		return m
 	}
 

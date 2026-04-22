@@ -73,12 +73,13 @@ func (t *Terminal) OnResult(m mutator.Mutant) {
 
 	if t.isTTY {
 		elapsed := time.Since(t.start).Round(time.Second)
+		const barWidth = 30
 		pctDone := 0
+		filled := 0
 		if t.total > 0 {
 			pctDone = t.done * 100 / t.total
+			filled = barWidth * t.done / t.total
 		}
-		const barWidth = 30
-		filled := barWidth * t.done / t.total
 		var bar [barWidth]byte
 		for i := range barWidth {
 			if i < filled {

@@ -17,7 +17,10 @@ func (b *branchIf) Discover(fset *token.FileSet, file *ast.File, src []byte) []M
 			return true
 		}
 		body := ifStmt.Body
-		if body == nil || len(body.List) == 0 {
+		// body is always non-nil for a parser-produced IfStmt (go/ast.Walk
+		// itself would panic on a nil body before we reach here). Only the
+		// empty-body case needs guarding.
+		if len(body.List) == 0 {
 			return true
 		}
 		pos := fset.Position(body.Lbrace)
