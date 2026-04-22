@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -333,6 +334,145 @@ func TestAdd(t *testing.T) {
 	result := w.Test(context.Background(), m)
 	if result.Status != mutator.StatusTimedOut {
 		t.Errorf("Status=%v, want TIMED_OUT", result.Status)
+	}
+}
+
+// TestPgroupRSSBytesSelf exercises pgroupRSSBytes against our own process
+// group. Kills:
+//   - CONDITIONALS_NEGATION on `err != nil` (line 32): mutated `err == nil`
+//     would short-circuit to return 0 on the success path.
+//   - STATEMENT_REMOVE on `line = strings.TrimSpace(line)` (line 37):
+//     without trimming, `ps` output lines (" 12345") fail strconv.ParseInt.
+//   - CONDITIONALS_NEGATION on `line == ""` (line 38): mutated `!=` skips
+//     every non-empty line, never reaching ParseInt.
+//   - CONDITIONALS_NEGATION on `err != nil` (line 42): mutated `==` skips
+//     successful parses, total stays 0.
+//   - ARITHMETIC_BASE on `n * 1024` (line 45): mutated `n / 1024` produces
+//     byte totals roughly 1e6× too small.
+//
+// We assert the returned value exceeds 1 MiB — real Go test processes use
+// tens of MiB, but all the mutations above collapse the result toward 0.
+func TestPgroupRSSBytesSelf(t *testing.T) {
+	pgid, err := syscall.Getpgid(os.Getpid())
+	if err != nil {
+		t.Fatalf("Getpgid: %v", err)
+	}
+	bytes := pgroupRSSBytes(pgid)
+	if bytes < 1<<20 {
+		t.Errorf("pgroupRSSBytes(self pgid=%d) = %d bytes, want >= 1 MiB (a running Go test process is typically tens of MiB)", pgid, bytes)
+	}
+	// Sanity upper bound — catches mutations that inflate the total.
+	if bytes > 100*(1<<30) {
+		t.Errorf("pgroupRSSBytes(self) = %d bytes, implausibly large", bytes)
+	}
+}
+
+// TestPgroupRSSBytesInvalidPgid kills the err-path return: passing an
+// invalid PGID makes `ps -g` emit either an error or empty output. The
+// original returns 0; a mutation that keeps the loop running still
+// returns 0 on empty output (no lines to parse), so this specifically
+// verifies the call doesn't panic or return garbage.
+func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
+	// Very large pgid unlikely to exist.
+	bytes := pgroupRSSBytes(99999999)
+	if bytes < 0 {
+		t.Errorf("pgroupRSSBytes(invalid) = %d, want >= 0", bytes)
+	}
+}
+
+// TestNonZeroSinceSleep kills CONDITIONALS_NEGATION on `d <= 0` (line 60):
+// mutated `d > 0` takes the Nanosecond branch on every normal call, so
+// the returned duration would be exactly 1 ns even after a real sleep.
+func TestNonZeroSinceSleep(t *testing.T) {
+	start := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	d := nonZeroSince(start)
+	if d < 5*time.Millisecond {
+		t.Errorf("nonZeroSince after 5ms sleep = %v, want >= 5ms (mutation returns 1ns)", d)
+	}
+}
+
+// TestNonZeroSinceFuture kills the BRANCH_IF on `{ return time.Nanosecond }`:
+// a start time in the future yields d <= 0 from time.Since. The original
+// returns time.Nanosecond (>0) so callers can use 0 as a "never set"
+// sentinel. Under BRANCH_IF the body is elided and 0 or negative leaks out.
+func TestNonZeroSinceFuture(t *testing.T) {
+	future := time.Now().Add(1 * time.Hour)
+	d := nonZeroSince(future)
+	if d <= 0 {
+		t.Errorf("nonZeroSince(future) = %v, want > 0 (sentinel positive duration)", d)
+	}
+}
+
+// TestCappedBufferCapsAtMax kills ARITHMETIC_BASE and INVERT_NEGATIVES on
+// `maxCapturedOutput - len(c.buf)` (line 78): mutated `+` makes remaining
+// always large, so the buffer grows past its cap. We write 2× the cap and
+// assert the stored bytes don't exceed the cap.
+func TestCappedBufferCapsAtMax(t *testing.T) {
+	var c cappedBuffer
+	chunk := make([]byte, 64*1024) // 64 KiB chunks
+	for range 40 {                 // 40 * 64 KiB = 2.5 MiB, well above 1 MiB cap
+		n, _ := c.Write(chunk)
+		if n != len(chunk) {
+			t.Errorf("Write returned n=%d, want %d (must report full length to satisfy io.Writer)", n, len(chunk))
+		}
+	}
+	if len(c.buf) > maxCapturedOutput {
+		t.Errorf("buf grew to %d bytes, exceeds cap %d — capping arithmetic broken", len(c.buf), maxCapturedOutput)
+	}
+	// Must have captured at least something up to the cap.
+	if len(c.buf) == 0 {
+		t.Errorf("buf is empty after writes — cap check too aggressive")
+	}
+}
+
+// TestCappedBufferPartialFinalWrite kills patterns that mishandle the
+// "final write exceeds remaining" branch. After writing cap-1 bytes, a
+// second write of 10 bytes should fill to exactly the cap (1 byte taken
+// from the second chunk).
+func TestCappedBufferPartialFinalWrite(t *testing.T) {
+	var c cappedBuffer
+	first := make([]byte, maxCapturedOutput-1)
+	c.Write(first)
+	if len(c.buf) != maxCapturedOutput-1 {
+		t.Fatalf("after first write: len=%d, want %d", len(c.buf), maxCapturedOutput-1)
+	}
+	// Second write: 10 bytes, but only 1 byte of remaining capacity.
+	n, _ := c.Write([]byte("0123456789"))
+	if n != 10 {
+		t.Errorf("Write n=%d, want 10 (must report full input length)", n)
+	}
+	if len(c.buf) != maxCapturedOutput {
+		t.Errorf("after partial write: len=%d, want %d (cap)", len(c.buf), maxCapturedOutput)
+	}
+}
+
+// TestCappedBufferWriteAtCap kills mutations on the `remaining > 0` guard:
+// once buf is at the cap, further writes must be no-ops but still return
+// the input length (to satisfy the io.Writer contract).
+func TestCappedBufferWriteAtCap(t *testing.T) {
+	var c cappedBuffer
+	c.buf = make([]byte, maxCapturedOutput)
+	before := len(c.buf)
+	n, err := c.Write([]byte("extra"))
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("Write n=%d, want 5", n)
+	}
+	if len(c.buf) != before {
+		t.Errorf("buf grew past cap: len=%d, was %d", len(c.buf), before)
+	}
+}
+
+// TestCappedBufferString kills trivial mutations on the String() accessor
+// (e.g., STATEMENT_REMOVE on the return) by exercising it on real data.
+func TestCappedBufferString(t *testing.T) {
+	var c cappedBuffer
+	c.Write([]byte("hello"))
+	if got := c.String(); got != "hello" {
+		t.Errorf("String() = %q, want %q", got, "hello")
 	}
 }
 

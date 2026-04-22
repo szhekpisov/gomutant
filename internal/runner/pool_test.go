@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,9 +168,14 @@ func TestMeasureBaseline(t *testing.T) {
 }
 
 func TestMeasureBaselineFailure(t *testing.T) {
-	_, err := MeasureBaseline(context.Background(), t.TempDir(), []string{"nonexistent/pkg"})
+	_, err := MeasureBaseline(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"})
 	if err == nil {
 		t.Fatal("expected error for nonexistent package")
+	}
+	// Error must wrap stderr. Kills STATEMENT_REMOVE on `cmd.Stderr = &stderr`.
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "no required module") && !strings.Contains(msg, "cannot find") {
+		t.Errorf("error should include stderr content, got: %q", msg)
 	}
 }
 
@@ -201,8 +207,40 @@ func TestRunCoverageWithCoverpkg(t *testing.T) {
 }
 
 func TestRunCoverageFailure(t *testing.T) {
-	_, err := RunCoverage(context.Background(), t.TempDir(), []string{"nonexistent/pkg"}, "", t.TempDir())
+	_, err := RunCoverage(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "", t.TempDir())
 	if err == nil {
 		t.Fatal("expected error for nonexistent package")
+	}
+	// Error must wrap stderr. Kills STATEMENT_REMOVE on `cmd.Stderr = &stderr`.
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "no required module") && !strings.Contains(msg, "cannot find") {
+		t.Errorf("error should include stderr content, got: %q", msg)
+	}
+}
+
+// TestRunCoverageCoverPkgApplied verifies that the -coverpkg flag is passed
+// through. Kills CONDITIONALS_NEGATION, BRANCH_IF, and STATEMENT_REMOVE
+// mutations on `if coverPkg != "" { args = append(args, "-coverpkg="+...) }`.
+//
+// Strategy: pass a coverpkg pattern that matches no package. Go still runs
+// the tests successfully but records "[no statements]" — the profile file
+// ends up containing only the "mode:" header. Without the flag passed
+// through, the tested package's own code is instrumented and the profile
+// contains block lines (e.g., "testmod/add.go:2.24,2.40 1 1").
+func TestRunCoverageCoverPkgApplied(t *testing.T) {
+	dir := setupTestProject(t)
+	tmpDir := t.TempDir()
+	profilePath, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "completely/nonexistent/zzz", tmpDir)
+	if err != nil {
+		t.Fatalf("RunCoverage: %v", err)
+	}
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// A profile produced with a no-match -coverpkg has only the "mode:" header.
+	// Block lines (".go:") appearing means the flag was dropped by mutation.
+	if strings.Contains(string(data), ".go:") {
+		t.Errorf("coverpkg=nonexistent should produce empty coverage, but profile has block lines:\n%s", data)
 	}
 }

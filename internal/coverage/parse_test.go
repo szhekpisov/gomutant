@@ -50,11 +50,14 @@ func TestParseFileNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing file")
 	}
-	// Also assert profile is nil — catches BRANCH_IF that elides the return,
-	// leaving execution to fall through into parseReader(nil) which would
-	// either panic or return a non-nil profile.
 	if p != nil {
 		t.Errorf("expected nil profile on open error, got %v", p)
+	}
+	// Error must come from the open-failure branch, not a fall-through to
+	// parseReader on a nil *os.File (which would wrap ErrInvalid with
+	// "reading coverage profile"). Kills BRANCH_IF that elides the return.
+	if !strings.Contains(err.Error(), "opening coverage profile") {
+		t.Errorf("error should wrap open failure, got: %v", err)
 	}
 }
 
@@ -276,6 +279,27 @@ func TestInBlock(t *testing.T) {
 				t.Errorf("inBlock(line=%d, col=%d) = %v, want %v", tc.line, tc.col, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestParseReaderSkipsModePrefixedLineThatWouldParse kills BRANCH_IF on the
+// `strings.HasPrefix(line, "mode:")` body. Under mutation the "continue" is
+// elided, so a line that begins with "mode:" but is otherwise well-formed
+// ("mode: file.go:10.1,15.2 2 1" — three fields after the last colon, valid
+// range/counts) is parsed as a coverage block instead of being skipped.
+// Using a mode-prefixed line that would *parse* forces the two paths to
+// diverge: original → 1 block, mutated → 2 blocks.
+func TestParseReaderSkipsModePrefixedLineThatWouldParse(t *testing.T) {
+	input := "mode: file.go:10.1,15.2 2 1\nfile.go:20.1,25.2 1 1\n"
+	profile, err := parseReader(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parseReader: %v", err)
+	}
+	if len(profile.blocks) != 1 {
+		t.Fatalf("want 1 block (mode-prefixed line skipped), got %d: %+v", len(profile.blocks), profile.blocks)
+	}
+	if strings.HasPrefix(profile.blocks[0].File, "mode:") {
+		t.Errorf("mode-prefixed line was parsed as a block: %+v", profile.blocks[0])
 	}
 }
 

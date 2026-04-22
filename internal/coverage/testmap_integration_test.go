@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,10 +72,48 @@ func TestBuildTestMap(t *testing.T) {
 		t.Error("expected tests covering add.go:4, got none")
 	}
 
+	// Unused() at lines 7-9 is not called by any test. Its block exists in
+	// every test's coverage profile with Count=0. Kills BRANCH_IF on
+	// `if b.Count == 0 { continue }`: under mutation the zero-count block
+	// would still be indexed, falsely mapping Unused's lines to tests that
+	// never exercised it.
+	tests = tm.TestsFor("testmod/add.go", 8)
+	if len(tests) != 0 {
+		t.Errorf("Unused() line 8 should have no covering tests (Count=0 block), got %v", tests)
+	}
+
 	// TestsFor should return nil for uncovered lines.
 	tests = tm.TestsFor("testmod/add.go", 999)
 	if tests != nil {
 		t.Errorf("expected nil for uncovered line, got %v", tests)
+	}
+}
+
+// TestBuildTestMapListTestsErrorMessage kills STATEMENT_REMOVE on
+// `cmd.Stderr = &stderr` in listTests: without stderr capture, the
+// returned error wouldn't include the underlying go-tool stderr text.
+func TestBuildTestMapListTestsErrorMessage(t *testing.T) {
+	_, err := listTests(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"})
+	if err == nil {
+		t.Fatal("expected error for nonexistent package")
+	}
+	// go's list/test for a missing pkg emits stderr text like "no required module" or "cannot find".
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
+		t.Errorf("error should include stderr content, got: %q", msg)
+	}
+}
+
+// TestResolvePackagesErrorMessage kills STATEMENT_REMOVE on
+// `cmd.Stderr = &stderr` in resolvePackages.
+func TestResolvePackagesErrorMessage(t *testing.T) {
+	_, err := resolvePackages(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"})
+	if err == nil {
+		t.Fatal("expected error for nonexistent package")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
+		t.Errorf("error should include stderr content, got: %q", msg)
 	}
 }
 
