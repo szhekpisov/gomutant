@@ -824,3 +824,91 @@ func TestPreReadFilesDeduplicate(t *testing.T) {
 		t.Errorf("expected 1 unique file, got %d", len(files))
 	}
 }
+
+// TestCandidateLessFallThrough directly exercises candidateLess with two
+// candidates that share every field except Line. The extracted comparator
+// makes this reachable: under BRANCH_IF on the line-inequality return,
+// the body is elided and the function falls through to the equal column
+// and equal type checks, finally returning `false` on the type tiebreaker.
+// The original returns `true` because a.Line < b.Line.
+func TestCandidateLessFallThrough(t *testing.T) {
+	a := mutator.MutantCandidate{
+		Type: mutator.ArithmeticBase,
+		Pos:  mutator.Position{Filename: "/abs/f.go", Line: 4, Column: 11},
+	}
+	b := mutator.MutantCandidate{
+		Type: mutator.ArithmeticBase,
+		Pos:  mutator.Position{Filename: "/abs/f.go", Line: 8, Column: 11},
+	}
+	if got := candidateLess(a, b); !got {
+		t.Errorf("candidateLess(line=4, line=8) = %v, want true — BRANCH_IF on the line-return body lets execution fall through to equal column/type comparisons and returns false", got)
+	}
+}
+
+// TestCandidateLessEqualCandidates exercises the final `return a.Type < b.Type`
+// with two candidates that are identical in every field. The original
+// returns false (equal types aren't "less than"); CONDITIONALS_BOUNDARY
+// on `<` → `<=` returns true. This boundary is unreachable through sort
+// because sort never compares an element to itself — hence the unit test.
+func TestCandidateLessEqualCandidates(t *testing.T) {
+	a := mutator.MutantCandidate{
+		Type: mutator.ArithmeticBase,
+		Pos:  mutator.Position{Filename: "/abs/f.go", Line: 4, Column: 11},
+	}
+	if got := candidateLess(a, a); got {
+		t.Errorf("candidateLess(x, x) = true, want false — CONDITIONALS_BOUNDARY on the final `a.Type < b.Type` flips equal to true")
+	}
+}
+
+// TestComputeRelFileNonMatchingPkg kills EXPRESSION_REMOVE on the right
+// operand of `commonPrefix != "" && strings.HasPrefix(pkg, commonPrefix)`.
+// With commonPrefix="x/y" and pkg="z/q" (unrelated), HasPrefix is false
+// and the else branch wins: RelFile comes from filepath.Rel(moduleRoot,
+// absPath). Replacing the right operand with `true` sends us into the
+// then branch, which concatenates the full pkg path with the file base.
+func TestComputeRelFileNonMatchingPkg(t *testing.T) {
+	got := computeRelFile("x/y", "z/q", "/root/sub/file.go", "/root")
+	if got == "z/q/file.go" {
+		t.Errorf("computeRelFile returned %q — EXPRESSION_REMOVE on HasPrefix sent non-matching pkg through the then branch", got)
+	}
+	// Original answer uses filepath.Rel.
+	if got != "sub/file.go" {
+		t.Errorf("computeRelFile(x/y, z/q, /root/sub/file.go, /root) = %q, want sub/file.go", got)
+	}
+}
+
+// TestFilterByCoverageStatusOnMissingEntry kills BRANCH_IF on filter.go's
+// `if !ok { Status = NotCovered; continue }`. The mutation elides the
+// body — execution falls through to `profile.IsCovered(profilePath, ...)`
+// where profilePath is "" (the zero value from a missing map entry).
+// Normally IsCovered("") always returns false so the next statement
+// *also* sets Status=NotCovered and the mutation stays invisible. We
+// construct a profile whose File="" block *does* cover the point; under
+// mutation IsCovered("") returns true, leaving Status=Pending.
+func TestFilterByCoverageStatusOnMissingEntry(t *testing.T) {
+	// Coverage line with empty file: ":L.C,L.C N count".
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "c.out")
+	if err := os.WriteFile(profilePath, []byte("mode: set\n:1.1,1000.1000 1 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := coverage.ParseFile(profilePath)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+
+	// Mutant whose File isn't in any pkg → map miss on absToProfile.
+	mutants := []mutator.Mutant{
+		{ID: 1, File: "/not/in/any/pkg/file.go", Line: 10, Col: 5, Status: mutator.StatusPending},
+	}
+	pkgs := []Package{
+		{Dir: "/abs/pkg", ImportPath: "mod/pkg", GoFiles: []string{"other.go"}},
+	}
+
+	FilterByCoverage(mutants, profile, pkgs, "mod")
+
+	if mutants[0].Status != mutator.StatusNotCovered {
+		t.Errorf("Status=%v, want NotCovered — BRANCH_IF on `if !ok` elides the early assignment; IsCovered(\"\") on a profile with an empty-file block returns true, leaving Status=Pending",
+			mutants[0].Status)
+	}
+}

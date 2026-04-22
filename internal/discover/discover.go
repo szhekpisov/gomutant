@@ -98,17 +98,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 
 	// Sort by file, line, column, type for deterministic output.
 	sort.Slice(allCandidates, func(i, j int) bool {
-		a, b := allCandidates[i], allCandidates[j]
-		if a.Pos.Filename != b.Pos.Filename {
-			return a.Pos.Filename < b.Pos.Filename
-		}
-		if a.Pos.Line != b.Pos.Line {
-			return a.Pos.Line < b.Pos.Line
-		}
-		if a.Pos.Column != b.Pos.Column {
-			return a.Pos.Column < b.Pos.Column
-		}
-		return a.Type < b.Type
+		return candidateLess(allCandidates[i], allCandidates[j])
 	})
 
 	// Build file→package lookup.
@@ -131,18 +121,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		pkg := filePkg[absPath]
 
 		// Compute gremlins-compatible relative path: strip common prefix from ImportPath.
-		var relPath string
-		if commonPrefix != "" && strings.HasPrefix(pkg, commonPrefix) {
-			sub := strings.TrimPrefix(pkg, commonPrefix)
-			sub = strings.TrimPrefix(sub, "/")
-			if sub == "" {
-				relPath = filepath.Base(absPath)
-			} else {
-				relPath = sub + "/" + filepath.Base(absPath)
-			}
-		} else {
-			relPath, _ = filepath.Rel(moduleRoot, absPath)
-		}
+		relPath := computeRelFile(commonPrefix, pkg, absPath, moduleRoot)
 
 		// Coverage profile path: ImportPath/filename.
 		coverageFile := pkg + "/" + filepath.Base(absPath)
@@ -178,6 +157,39 @@ func parseFile(fset *token.FileSet, path string) ([]byte, *ast.File, error) {
 		return nil, nil, err
 	}
 	return src, file, nil
+}
+
+// candidateLess orders candidates by (file, line, column, type) so
+// Discover produces deterministic output regardless of the AST-walk order.
+func candidateLess(a, b mutator.MutantCandidate) bool {
+	if a.Pos.Filename != b.Pos.Filename {
+		return a.Pos.Filename < b.Pos.Filename
+	}
+	if a.Pos.Line != b.Pos.Line {
+		return a.Pos.Line < b.Pos.Line
+	}
+	if a.Pos.Column != b.Pos.Column {
+		return a.Pos.Column < b.Pos.Column
+	}
+	return a.Type < b.Type
+}
+
+// computeRelFile produces a gremlins-compatible module-relative path.
+// If the candidate's package shares the common prefix, we strip it and
+// append the file base; otherwise we fall back to filepath.Rel against
+// moduleRoot. Factored out so the empty / no-prefix / non-matching-pkg
+// cases can be unit-tested independently of Discover's wiring.
+func computeRelFile(commonPrefix, pkg, absPath, moduleRoot string) string {
+	if commonPrefix != "" && strings.HasPrefix(pkg, commonPrefix) {
+		sub := strings.TrimPrefix(pkg, commonPrefix)
+		sub = strings.TrimPrefix(sub, "/")
+		if sub == "" {
+			return filepath.Base(absPath)
+		}
+		return sub + "/" + filepath.Base(absPath)
+	}
+	rel, _ := filepath.Rel(moduleRoot, absPath)
+	return rel
 }
 
 // longestCommonPrefix finds the longest common import path prefix across all packages.
