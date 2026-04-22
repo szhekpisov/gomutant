@@ -12,6 +12,7 @@
 # Code coverage profiles
 *.out
 *.coverprofile
+*.cov
 
 # Mutation testing reports
 mutation-report.json
