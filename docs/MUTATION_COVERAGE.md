@@ -11,10 +11,10 @@ Status of gomutant's self-mutation test. "Efficacy" = `killed / (killed + lived)
 | patch    | 13     | 0     | 100.00%  |
 | mutator  | 78     | 0     | 100.00%  |
 | report   | 95     | 0     | 100.00%  |
-| coverage | 106    | 16    | 86.89%   |
+| coverage | 113    | 9     | 92.62%   |
 | discover | 50     | 8     | 86.21%   |
 | runner   | 69     | 28    | 71.13%   |
-| **total**| **453**| **52**| **89.70%** |
+| **total**| **460**| **45**| **91.09%** |
 
 Run the no-main self-test with `scripts/` (external) or replicate with
 `gomutant -w 8 -o <pkg>.json ./internal/<pkg>/` per package.

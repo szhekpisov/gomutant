@@ -72,6 +72,15 @@ func TestBuildTestMap(t *testing.T) {
 		t.Error("expected tests covering add.go:4, got none")
 	}
 
+	// Add's coverage block spans lines 3–5 (opening brace to closing brace).
+	// Asserting coverage at line 5 (the block's EndLine) kills
+	// CONDITIONALS_BOUNDARY on the indexer's `line <= b.EndLine` loop —
+	// mutating to `<` would exclude EndLine, leaving this key unmapped.
+	tests = tm.TestsFor("testmod/add.go", 5)
+	if len(tests) == 0 {
+		t.Error("expected tests covering add.go:5 (block EndLine), got none — CONDITIONALS_BOUNDARY on `line <= b.EndLine` would drop this")
+	}
+
 	// Unused() at lines 7-9 is not called by any test. Its block exists in
 	// every test's coverage profile with Count=0. Kills BRANCH_IF on
 	// `if b.Count == 0 { continue }`: under mutation the zero-count block
@@ -92,15 +101,20 @@ func TestBuildTestMap(t *testing.T) {
 // TestBuildTestMapListTestsErrorMessage kills STATEMENT_REMOVE on
 // `cmd.Stderr = &stderr` in listTests: without stderr capture, the
 // returned error wouldn't include the underlying go-tool stderr text.
+//
+// The error's format string already embeds the package name ("go test
+// -list for %s: %w\n%s"), so asserting on the pkg name doesn't
+// distinguish the two paths. We instead check for text only the go
+// tool's stderr produces ("is not in std" / "no required module" /
+// "cannot find").
 func TestBuildTestMapListTestsErrorMessage(t *testing.T) {
 	_, err := listTests(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"})
 	if err == nil {
 		t.Fatal("expected error for nonexistent package")
 	}
-	// go's list/test for a missing pkg emits stderr text like "no required module" or "cannot find".
 	msg := err.Error()
-	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
-		t.Errorf("error should include stderr content, got: %q", msg)
+	if !strings.Contains(msg, "is not in std") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
+		t.Errorf("error should include stderr content (stderr-only text like 'is not in std'), got: %q", msg)
 	}
 }
 
@@ -114,6 +128,70 @@ func TestResolvePackagesErrorMessage(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "definitely/nonexistent/pkg/zzz") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
 		t.Errorf("error should include stderr content, got: %q", msg)
+	}
+}
+
+// TestBuildTestMapCoverPkgNoMatch kills three mutations on the
+// `if coverPkg != "" { args = append(args, "-coverpkg="+coverPkg) }` block:
+//
+//   - CONDITIONALS_NEGATION (!=  →  ==): a non-empty coverPkg would no
+//     longer trigger the append; the test binary would be built with
+//     default coverage (of the tested package) and the map populates.
+//   - BRANCH_IF (body elided): the append is skipped; same as negation.
+//   - STATEMENT_REMOVE on the append: same as BRANCH_IF.
+//
+// Strategy: pass a coverpkg pattern that matches no real package. Under
+// original behavior, the test binary is built with `-coverpkg=<nomatch>`
+// and records coverage for nothing — so no test lines end up in the map.
+// Under any of the three mutations, the flag isn't passed, the default
+// coverage of "testmod" kicks in, and add.go:4 gets mapped to TestAdd.
+func TestBuildTestMapCoverPkgNoMatch(t *testing.T) {
+	dir := setupTestProject(t)
+	tmpDir := t.TempDir()
+
+	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"},
+		"completely/nonexistent/zzz", tmpDir, 2)
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	tests := tm.TestsFor("testmod/add.go", 4)
+	if len(tests) != 0 {
+		t.Errorf("with coverpkg=nomatch, no lines should be mapped; got %v — flag must have been dropped by mutation", tests)
+	}
+}
+
+// TestBuildTestMapPackageArgPassed kills STATEMENT_REMOVE on
+// `args = append(args, pkg.importPath)`. Root has go.mod only (no Go
+// files), tests live in a subpackage. Under the original the compile
+// command is `go test -c ... rootmod/sub` — builds sub's tests. Under
+// mutation the command runs in projectDir (rootDir) without a package
+// arg, fails with "no Go files", skips the package, and the map is
+// empty.
+func TestBuildTestMapPackageArgPassed(t *testing.T) {
+	rootDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rootDir, "go.mod"), []byte("module rootmod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	subDir := filepath.Join(rootDir, "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	libSrc := "package sub\n\nfunc F() int { return 1 + 2 }\n"
+	testSrc := "package sub\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) { if F() != 3 { t.Fatal(\"wrong\") } }\n"
+	if err := os.WriteFile(filepath.Join(subDir, "lib.go"), []byte(libSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "lib_test.go"), []byte(testSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tm, err := BuildTestMap(context.Background(), rootDir, []string{"rootmod/sub"}, "", t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	tests := tm.TestsFor("rootmod/sub/lib.go", 3)
+	if len(tests) == 0 {
+		t.Error("expected TestF mapped to lib.go:3 — without the package arg `go test -c` defaults to cwd (rootDir) which has no Go files")
 	}
 }
 
@@ -316,6 +394,72 @@ func TestBuildTestMapNoTestsPkg(t *testing.T) {
 	// No tests found, map should be empty.
 	if tm == nil {
 		t.Fatal("TestMap should not be nil")
+	}
+}
+
+// TestRunCompiledTestStaleProfileNotReturned kills BRANCH_IF on
+// runCompiledTest's `if err := cmd.Run(); err != nil { return nil }`.
+// We pre-seed the profile path with valid coverage data, then hand in a
+// nonexistent binary so cmd.Run fails. Under the original, the failing
+// Run short-circuits and returns nil. Under mutation, execution falls
+// through to parseFileFunc, which happily reads the pre-seeded stale
+// data and returns its blocks.
+func TestRunCompiledTestStaleProfileNotReturned(t *testing.T) {
+	tmpDir := t.TempDir()
+	ctx := context.Background()
+
+	profilePath := filepath.Join(tmpDir, "stale.cov")
+	staleProfile := "mode: set\ntestmod/fake.go:1.1,2.2 1 1\n"
+	if err := os.WriteFile(profilePath, []byte(staleProfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cp := &compiledPkg{
+		binPath:    "/nonexistent/absolutely/not/a/binary",
+		importPath: "testmod",
+		dir:        tmpDir,
+	}
+	blocks := runCompiledTest(ctx, cp, "TestAnything", profilePath)
+	if blocks != nil {
+		t.Errorf("cmd.Run failed but got %d blocks from stale profile — BRANCH_IF on the err check lets it through", len(blocks))
+	}
+}
+
+// TestProcessWorkContextCancelledSkipsWork kills BRANCH_IF on processWork's
+// `if ctx.Err() != nil { return }`. Under the original, a cancelled
+// context makes the worker return before reading the next entry, so the
+// pre-filled work item is left unprocessed. Under mutation, the return
+// is elided and the worker falls through to the test-run path, which
+// would actually execute our real compiled binary and push a result.
+func TestProcessWorkContextCancelledSkipsWork(t *testing.T) {
+	dir := setupTestProject(t)
+	tmpDir := t.TempDir()
+
+	binPath := filepath.Join(tmpDir, "testbin.test")
+	cmd := exec.CommandContext(context.Background(), "go", "test", "-c", "-o", binPath, "-cover", "testmod")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go test -c: %v", err)
+	}
+	cp := &compiledPkg{binPath: binPath, importPath: "testmod", dir: dir}
+	pkgBins := map[string]*compiledPkg{"testmod": cp}
+
+	work := make(chan testEntry, 1)
+	results := make(chan testCoverage, 1)
+	work <- testEntry{name: "TestAdd", pkg: "testmod"}
+	close(work)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel before processWork reads
+
+	processWork(ctx, work, pkgBins, tmpDir, 0, results)
+	close(results)
+
+	count := 0
+	for range results {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("processWork produced %d results on a cancelled ctx — BRANCH_IF on ctx.Err() check lets work through", count)
 	}
 }
 
