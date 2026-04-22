@@ -51,6 +51,10 @@ func TestWorkerTestMissingSource(t *testing.T) {
 	if result.Status != mutator.StatusNotViable {
 		t.Errorf("Status=%v, want NOT_VIABLE for missing source", result.Status)
 	}
+	// Duration must be set even on early return paths.
+	if result.Duration <= 0 {
+		t.Errorf("Duration should be > 0 on early-return path, got %v", result.Duration)
+	}
 }
 
 func TestWorkerTestInvalidPatch(t *testing.T) {
@@ -75,6 +79,9 @@ func TestWorkerTestInvalidPatch(t *testing.T) {
 	result := w.Test(context.Background(), m)
 	if result.Status != mutator.StatusNotViable {
 		t.Errorf("Status=%v, want NOT_VIABLE for invalid patch", result.Status)
+	}
+	if result.Duration <= 0 {
+		t.Errorf("Duration should be > 0 on early-return path, got %v", result.Duration)
 	}
 }
 

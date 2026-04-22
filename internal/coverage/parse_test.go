@@ -242,24 +242,84 @@ func TestInBlock(t *testing.T) {
 	b := Block{StartLine: 10, StartCol: 5, EndLine: 20, EndCol: 15}
 
 	tests := []struct {
+		name string
 		line int
 		col  int
 		want bool
 	}{
-		{9, 10, false},   // before start line
-		{21, 1, false},   // after end line
-		{10, 4, false},   // start line, before start col
-		{10, 5, true},    // start line, at start col
-		{10, 10, true},   // start line, after start col
-		{15, 1, true},    // middle line
-		{20, 15, true},   // end line, at end col
-		{20, 16, false},  // end line, after end col
+		{"before start line", 9, 10, false},
+		{"after end line", 21, 1, false},
+		{"start line, before start col", 10, 4, false},
+		{"start line, at start col", 10, 5, true},
+		{"start line, after start col", 10, 10, true},
+		{"middle line", 15, 1, true},
+		{"end line, at end col", 20, 15, true},
+		{"end line, after end col", 20, 16, false},
+		// Critical for EXPRESSION_REMOVE on `line == b.EndLine && col > b.EndCol`:
+		// col > EndCol but NOT on end line → must still return true (inside the block).
+		{"mid-line col exceeds EndCol", 15, 99, true},
+		// Critical for EXPRESSION_REMOVE right operand → true: end line with col <= EndCol must return true.
+		{"end line at start col", 20, 1, true},
+		{"end line middle col", 20, 7, true},
 	}
 
 	for _, tc := range tests {
-		got := inBlock(b, tc.line, tc.col)
-		if got != tc.want {
-			t.Errorf("inBlock(line=%d, col=%d) = %v, want %v", tc.line, tc.col, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := inBlock(b, tc.line, tc.col)
+			if got != tc.want {
+				t.Errorf("inBlock(line=%d, col=%d) = %v, want %v", tc.line, tc.col, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseLineColonAtStart covers CONDITIONALS_BOUNDARY on `lastColon < 0`:
+// with mutation `<= 0`, a line starting with ":" (lastColon = 0) would incorrectly error.
+func TestParseLineColonAtStart(t *testing.T) {
+	// Line with colon at position 0 → lastColon = 0, not -1.
+	// Format ":<rest>" → file = "", rest = "<rest>".
+	// But "<rest>" needs 3 fields to be valid.
+	// Use ":10.2,15.3 2 1" → file="", valid range and numStmt/count.
+	b, err := parseLine(":10.2,15.3 2 1")
+	if err != nil {
+		t.Errorf("parseLine with colon at start should succeed, got error: %v", err)
+	}
+	if b.File != "" {
+		t.Errorf("File=%q, want empty", b.File)
+	}
+}
+
+// TestParseLineCommaAtStart covers CONDITIONALS_BOUNDARY on `comma < 0`:
+// with mutation `<= 0`, a line with comma at position 0 (empty start) would error.
+func TestParseLineCommaAtStart(t *testing.T) {
+	// Comma at position 0 within the range string → comma = 0.
+	// parseLineCol("") fails (no dot) → error.
+	_, err := parseLine("file.go:,10.5 2 1")
+	if err == nil {
+		t.Error("parseLine with empty start of range should error (no dot in startStr)")
+	}
+	// The error should come from parseLineCol, not from comma-not-found.
+	// The `comma < 0` guard with mutation `<= 0` would cause comma=0 to be treated as -1 (error).
+	// But with original `< 0`, comma=0 proceeds to parseLineCol which errors with "no dot".
+	// Either way errors, but error message differs.
+	if !strings.Contains(err.Error(), "no dot") {
+		t.Errorf("expected 'no dot' error (from parseLineCol), got: %v", err)
+	}
+}
+
+// TestParseLineColDotAtStart covers CONDITIONALS_BOUNDARY on `dot < 0` in parseLineCol:
+// position input ".5" has dot at 0.
+func TestParseLineColDotAtStart(t *testing.T) {
+	// ".5,10.3" → startStr = ".5" → dot = 0.
+	// Original `< 0` false → proceed. Atoi("") errors → return error (numeric parse).
+	// Mutation `<= 0` true → return "no dot" error.
+	_, err := parseLine("file.go:.5,10.3 1 1")
+	if err == nil {
+		t.Error("parseLine with empty start line should error")
+	}
+	// Error should NOT be "no dot" — it should be a numeric parse error, because original
+	// `dot < 0` is false (dot is 0), so we proceed to Atoi which fails.
+	if strings.Contains(err.Error(), "no dot") {
+		t.Errorf("unexpected 'no dot' error (should be numeric): %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"go/token"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +31,12 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// stdout is the writer for user-facing output. Tests swap this to capture output.
+var stdout io.Writer = os.Stdout
+
+// stderr is the writer for warnings. Tests swap this to capture output.
+var stderr io.Writer = os.Stderr
 
 func run(ctx context.Context, args []string) error {
 	// Strip "unleash" for gremlins CLI compat.
@@ -71,7 +78,7 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	if showVersion {
-		fmt.Printf("gomutant v%s\n", version)
+		fmt.Fprintf(stdout, "gomutant v%s\n", version)
 		return nil
 	}
 
@@ -102,7 +109,7 @@ func run(ctx context.Context, args []string) error {
 	reg := mutator.NewRegistry()
 	enabledMutators := reg.EnabledMutators(cfg.Only, cfg.Disable)
 
-	term := report.NewTerminal(os.Stdout, 0, cfg.Verbose)
+	term := report.NewTerminal(stdout, 0, cfg.Verbose)
 	term.Header(version, fmt.Sprintf("%v", packages), cfg.Workers, len(enabledMutators))
 
 	// 1. Resolve packages.
@@ -161,7 +168,7 @@ func run(ctx context.Context, args []string) error {
 
 	if cfg.DryRun {
 		for _, m := range mutants {
-			fmt.Printf("[%s] %s:%d:%d  %s → %s  (%s)\n",
+			fmt.Fprintf(stdout, "[%s] %s:%d:%d  %s → %s  (%s)\n",
 				m.Status.String(), m.RelFile, m.Line, m.Col,
 				m.Original, m.Replacement, m.Type)
 		}
@@ -179,7 +186,7 @@ func run(ctx context.Context, args []string) error {
 	testMap, err := coverage.BuildTestMap(ctx, projectDir, packages, cfg.CoverPkg, tmpDir, cfg.Workers)
 	if err != nil {
 		// Non-fatal: fall back to running all tests per mutant.
-		fmt.Fprintf(os.Stderr, "warning: per-test coverage map failed: %v\n", err)
+		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
 		testMap = nil
 		term.PhaseDone("skipped (will run all tests per mutant)")
 	} else {
@@ -188,7 +195,7 @@ func run(ctx context.Context, args []string) error {
 
 	// 8. Run mutation testing.
 	runStart := time.Now()
-	term2 := report.NewTerminal(os.Stdout, pendingCount, cfg.Verbose)
+	term2 := report.NewTerminal(stdout, pendingCount, cfg.Verbose)
 	pool := runner.NewPool(cfg.Workers, testTimeout, tmpDir, srcCache, projectDir, testMap)
 	mutants = pool.Run(ctx, mutants, term2.OnResult)
 	elapsed := time.Since(runStart)
@@ -202,7 +209,7 @@ func run(ctx context.Context, args []string) error {
 	if err := report.WriteJSON(r, cfg.Output); err != nil {
 		return fmt.Errorf("writing report: %w", err)
 	}
-	fmt.Printf("Report: %s\n", cfg.Output)
+	fmt.Fprintf(stdout, "Report: %s\n", cfg.Output)
 	_ = elapsed
 
 	return nil
