@@ -731,6 +731,35 @@ func TestFilterByCoveragePreservesNonPendingStatus(t *testing.T) {
 	}
 }
 
+// TestDiscoverSortLinePrimary kills BRANCH_IF on the sort comparator's
+// line-inequality branch. Two mutants on *different lines* but the *same
+// column* in the same file force the sort to rely on the line comparison:
+// under BRANCH_IF that branch body is removed and the sort falls through
+// to column (equal) then type (equal), so order becomes undefined.
+func TestDiscoverSortLinePrimary(t *testing.T) {
+	dir := t.TempDir()
+	// Two ARITHMETIC_BASE mutants on different lines but same column index
+	// (both operators sit at the same byte column within their line).
+	src := "package p\n\nfunc F(x int) int {\n\treturn x + 1\n}\n\nfunc G(x int) int {\n\treturn x - 1\n}\n"
+	os.WriteFile(filepath.Join(dir, "f.go"), []byte(src), 0o644)
+	pkgs := []Package{
+		{Dir: dir, ImportPath: "example.com/p", GoFiles: []string{"f.go"}},
+	}
+	fset := token.NewFileSet()
+	reg := mutator.NewRegistry()
+	mutants := Discover(fset, pkgs,
+		reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil),
+		dir, "example.com")
+	if len(mutants) < 2 {
+		t.Fatalf("expected >=2 arithmetic mutants, got %d", len(mutants))
+	}
+	// Earlier-line mutant must come first.
+	if mutants[0].Line >= mutants[1].Line {
+		t.Errorf("sort broken: mutants[0].Line=%d not < mutants[1].Line=%d",
+			mutants[0].Line, mutants[1].Line)
+	}
+}
+
 func TestPreReadFilesDeduplicate(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package p\n"), 0o644); err != nil {

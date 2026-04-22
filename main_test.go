@@ -140,17 +140,20 @@ func TestRunAllLongFlags(t *testing.T) {
 	if !strings.Contains(out, "Workers: 1") {
 		t.Errorf("missing workers line: %q", out)
 	}
-	if !strings.Contains(out, "Resolving packages...") {
-		t.Errorf("missing resolving phase: %q", out)
+	// Phase banners AND their paired PhaseDone outputs, as joined strings.
+	// Checking only the prefix lets STATEMENT_REMOVE on PhaseDone(...) calls
+	// survive (the overall output still has "done (" strings from other
+	// phases). We check the full "Phase... PhaseDone" pair.
+	joined := []string{
+		"Resolving packages... done (1 packages)",
+		"Collecting coverage... done (",   // "done (Ns)" — duration varies
+		"Measuring baseline... done (",    // "done (Ns, timeout: Ns)"
+		"Discovering mutants... ",         // "N found (N not covered, N to test)"
 	}
-	if !strings.Contains(out, "Collecting coverage...") {
-		t.Errorf("missing coverage phase: %q", out)
-	}
-	if !strings.Contains(out, "Measuring baseline...") {
-		t.Errorf("missing baseline phase: %q", out)
-	}
-	if !strings.Contains(out, "Discovering mutants...") {
-		t.Errorf("missing discover phase: %q", out)
+	for _, s := range joined {
+		if !strings.Contains(out, s) {
+			t.Errorf("missing output %q: full output:\n%s", s, out)
+		}
 	}
 }
 
@@ -178,6 +181,149 @@ func TestRunOnlyFlag(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("run --only: %v", err)
+	}
+}
+
+// TestRunShortFlags exercises -w, -o, -v short-form flags, killing
+// STATEMENT_REMOVE mutants on those fs.XxxVar shorthand registrations.
+func TestRunShortFlags(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"add.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go": "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1,2) != 3 { t.Fatal(\"wrong\") } }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	outPath := filepath.Join(dir, "r.json")
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{
+			"-w", "1", "-o", outPath, "-v", "--dry-run", "testmod",
+		})
+	})
+	if err != nil {
+		t.Fatalf("run with short flags: %v", err)
+	}
+	if !strings.Contains(out, "Workers: 1") {
+		t.Errorf("short -w didn't set workers: %q", out)
+	}
+	// Verbose mode triggers per-mutant markers like "[PENDING]" or "[NOT COVERED]".
+	if !strings.Contains(out, "[") || !strings.Contains(out, "]") {
+		t.Errorf("short -v verbose output missing brackets: %q", out)
+	}
+}
+
+// TestRunPendingCountExact asserts the exact "N found (N not covered, N to test)"
+// output for a known-shape testmod. Kills INCREMENT_DECREMENT on pendingCount++
+// and notCoveredCount++, STATEMENT_REMOVE on those assignments, and
+// CONDITIONALS_NEGATION on the status-comparison branches.
+func TestRunPendingCountExact(t *testing.T) {
+	dir := t.TempDir()
+	// Two functions: Add is covered by TestAdd; Unused is not covered.
+	files := map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"lib.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n\nfunc Unused(x, y int) int { return x + y }\n",
+		"lib_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1,2) != 3 { t.Fatal(\"wrong\") } }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{
+			"--only", "ARITHMETIC_BASE",
+			"--dry-run",
+			"testmod",
+		})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// Expected: 2 ARITHMETIC_BASE mutants total (Add's +, Unused's +).
+	// Add is covered -> 1 to test. Unused is not covered -> 1 not covered.
+	want := "2 found (1 not covered, 1 to test)"
+	if !strings.Contains(out, want) {
+		t.Errorf("expected counts %q in output, got: %q", want, out)
+	}
+}
+
+// TestRunConfigLoadError kills BRANCH_IF on the config.Load error check.
+// An invalid YAML file forces Load to return an error.
+func TestRunConfigLoadError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
+		[]byte("module testmod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Config with invalid YAML.
+	cfgPath := filepath.Join(dir, "bad.yml")
+	if err := os.WriteFile(cfgPath, []byte("not: valid: yaml: at: all:\n  : : :"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+	err := run(context.Background(), []string{"--config", cfgPath, "--dry-run", "testmod"})
+	if err == nil {
+		t.Fatal("expected run() to return config.Load error")
+	}
+}
+
+// TestRunResolvePackagesError kills BRANCH_IF on the discover.ResolvePackages
+// error check by pointing at a package pattern go-list can't resolve.
+func TestRunResolvePackagesError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
+		[]byte("module testmod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+	err := run(context.Background(), []string{"--dry-run", "completely/nonexistent/package/xyz"})
+	if err == nil {
+		t.Fatal("expected run() to error on unresolvable package")
+	}
+}
+
+// TestRunCoverageError kills BRANCH_IF on the runner.RunCoverage error check
+// by providing a package with a failing test.
+func TestRunCoverageError(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod":       "module testmod\n\ngo 1.26\n",
+		"add.go":       "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go":  "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { t.Fatal(\"always fail\") }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+	// Non-dry-run so coverage collection actually runs.
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if err == nil {
+		t.Fatal("expected run() to return coverage error when baseline tests fail")
 	}
 }
 

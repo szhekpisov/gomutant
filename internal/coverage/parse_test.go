@@ -46,9 +46,15 @@ github.com/foo/bar/other.go:5.1,8.2 3 5
 }
 
 func TestParseFileNotFound(t *testing.T) {
-	_, err := ParseFile("/nonexistent/coverage.out")
+	p, err := ParseFile("/nonexistent/coverage.out")
 	if err == nil {
 		t.Fatal("expected error for missing file")
+	}
+	// Also assert profile is nil — catches BRANCH_IF that elides the return,
+	// leaving execution to fall through into parseReader(nil) which would
+	// either panic or return a non-nil profile.
+	if p != nil {
+		t.Errorf("expected nil profile on open error, got %v", p)
 	}
 }
 

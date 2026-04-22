@@ -194,24 +194,19 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	// 8. Run mutation testing.
-	runStart := time.Now()
 	term2 := report.NewTerminal(stdout, pendingCount, cfg.Verbose)
 	pool := runner.NewPool(cfg.Workers, testTimeout, tmpDir, srcCache, projectDir, testMap)
 	mutants = pool.Run(ctx, mutants, term2.OnResult)
-	elapsed := time.Since(runStart)
 
-	// 8. Generate report.
+	// 9. Generate report.
 	totalElapsed := time.Since(coverStart)
 	r := report.Generate(mutants, goModule, totalElapsed)
-
 	term2.Summary(r)
 
 	if err := report.WriteJSON(r, cfg.Output); err != nil {
 		return fmt.Errorf("writing report: %w", err)
 	}
 	fmt.Fprintf(stdout, "Report: %s\n", cfg.Output)
-	_ = elapsed
-
 	return nil
 }
 
