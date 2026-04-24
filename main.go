@@ -126,7 +126,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// 3. Collect coverage.
 	term.Phase("Collecting coverage...")
@@ -159,9 +159,10 @@ func run(ctx context.Context, args []string) error {
 	pendingCount := 0
 	notCoveredCount := 0
 	for _, m := range mutants {
-		if m.Status == mutator.StatusPending {
+		switch m.Status {
+		case mutator.StatusPending:
 			pendingCount++
-		} else if m.Status == mutator.StatusNotCovered {
+		case mutator.StatusNotCovered:
 			notCoveredCount++
 		}
 	}

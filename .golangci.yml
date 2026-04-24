@@ -1,0 +1,23 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # fmt.Fprintf / fmt.Fprintln return (n, err) where the error only
+      # fires on a broken writer (closed pipe). In user-facing terminal
+      # output there's nothing useful we can do with that error — the
+      # terminal we'd log to is the same one that just failed. Exclude
+      # the package-qualified calls instead of scattering `_, _ =` ignores.
+      exclude-functions:
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+  exclusions:
+    rules:
+      # Test code routinely ignores errors on cleanup paths (defer
+      # file.Close, os.Remove, os.Chdir back to orig dir, buffer Write
+      # that can't fail). Enforcing errcheck there trades signal for
+      # boilerplate without catching real bugs.
+      - path: _test\.go
+        linters:
+          - errcheck

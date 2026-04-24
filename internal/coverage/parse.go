@@ -32,7 +32,7 @@ func ParseFile(path string) (*Profile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening coverage profile: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return parseReader(f)
 }
 
