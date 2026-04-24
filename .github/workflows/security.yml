@@ -130,3 +130,9 @@ jobs:
         with:
           # v9 of the action only supports golangci-lint v2+.
           version: v2.1.6
+          # The v2.1.6 prebuilt binary was compiled with Go 1.24 and
+          # refuses to lint projects targeting a newer Go version.
+          # goinstall rebuilds golangci-lint with the toolchain from
+          # the setup-go step above (go.mod's 1.26.1), so the linter's
+          # Go version matches the target.
+          install-mode: goinstall
