@@ -481,8 +481,11 @@ func TestCappedBufferString(t *testing.T) {
 
 // TestWorkerTestParentCtxCancel verifies that a parent-context
 // cancellation (Ctrl-C, upstream deadline) is NOT classified as Killed.
-// The worker should preserve the incoming Status (Pending) so the pool
-// doesn't surface cancelled work as if it had been tested.
+// The worker should preserve the incoming Status (Pending) + zero
+// Duration so the pool surfaces the mutant as not tested.
+//
+// Cost: ~300-500 ms per run — the inner test binary sleeps until the
+// parent ctx fires. Keep this in mind when adding similar patterns.
 func TestWorkerTestParentCtxCancel(t *testing.T) {
 	dir := t.TempDir()
 	goMod := "module testmod\n\ngo 1.26\n"
@@ -528,6 +531,11 @@ func TestWorkerTestParentCtxCancel(t *testing.T) {
 	result := w.Test(ctx, m)
 	if result.Status != mutator.StatusPending {
 		t.Errorf("Status=%v, want Pending — parent-ctx cancel must not produce a terminal classification", result.Status)
+	}
+	// Invariant: Pending ⇒ Duration==0. Otherwise the report shows a
+	// "not tested" mutant with an execution time, which is misleading.
+	if result.Duration != 0 {
+		t.Errorf("Duration=%v on cancelled (Pending) mutant, want 0", result.Duration)
 	}
 }
 

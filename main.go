@@ -218,7 +218,12 @@ func readModuleName(dir string) (string, error) {
 	}
 	for _, line := range splitLines(data) {
 		// `module foo` — tolerate arbitrary whitespace (tabs, multiple
-		// spaces) between the directive and the path.
+		// spaces) between the directive and the path. Inline comments
+		// (`module foo // comment`) yield extra fields after fields[1]
+		// which we ignore — fields[1] is always the module path for a
+		// well-formed go.mod. Prefer golang.org/x/mod/modfile if parsing
+		// ever needs to handle `go.mod` deprecation markers or version
+		// directives.
 		fields := strings.Fields(string(line))
 		if len(fields) >= 2 && fields[0] == "module" {
 			return fields[1], nil

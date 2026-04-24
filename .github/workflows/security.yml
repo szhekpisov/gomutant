@@ -45,7 +45,12 @@ jobs:
 
   govulncheck:
     needs: changes
-    # On PRs only run when Go sources changed; push/schedule always run.
+    # Gate logic:
+    #   - always(): required because `needs: changes` would otherwise
+    #     skip this job when changes itself is skipped (non-PR events).
+    #   - github.event_name != 'pull_request': force-run on push/schedule.
+    #   - needs.changes.outputs.code == 'true': on PRs, only run when
+    #     Go sources or go.mod/go.sum changed.
     if: |
       always() &&
       (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')

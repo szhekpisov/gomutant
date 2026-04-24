@@ -10,9 +10,11 @@ type arithmeticBase struct{}
 func (a *arithmeticBase) Type() MutationType { return ArithmeticBase }
 
 // arithmeticSwaps maps each arithmetic operator to a single replacement.
-// Asymmetric by design: REM → MUL catches divisor/remainder confusion, but
-// MUL → REM would emit code that changes types on float operands and is
-// rarely semantically meaningful as a mutant, so we only keep the one side.
+// Asymmetric by design: REM → MUL catches divisor/remainder confusion,
+// but MUL → REM isn't a useful mutation because Go's `%` operator is
+// undefined on float operands — the mutant would be a compile error on
+// any code that multiplies floats, and gomutant already classifies those
+// as NotViable (no signal for the test suite to catch). Keep only one side.
 var arithmeticSwaps = map[token.Token]token.Token{
 	token.ADD: token.SUB,
 	token.SUB: token.ADD,

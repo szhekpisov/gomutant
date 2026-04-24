@@ -221,18 +221,19 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 
 	err = cmd.Wait()
 	close(monitorDone)
-	m.Duration = time.Since(start)
 
 	// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
 	// exec.CommandContext as a non-nil cmd.Wait error that is neither
 	// memKilled nor the test's own timeout. Leaving classification to
 	// classifyTestOutcome would fall through to StatusKilled, which would
 	// silently mark cancelled mutants as tested — inflating efficacy.
-	// Detect parent cancel first and preserve the incoming Status so the
-	// pool surfaces the mutant as Pending (i.e. not tested).
+	// Detect parent cancel first and preserve the incoming Status + zero
+	// Duration so the pool surfaces the mutant as Pending (i.e. not tested)
+	// with the invariant Pending ⇒ Duration==0 intact.
 	if ctx.Err() != nil {
 		return m
 	}
+	m.Duration = time.Since(start)
 	m.Status = classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String())
 	return m
 }
