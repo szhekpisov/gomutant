@@ -88,7 +88,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      security-events: write
     steps:
       - uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
@@ -98,7 +97,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+      # Run zizmor directly rather than via zizmor-action: the action
+      # uploads SARIF via codeql-action/upload-sarif which needs
+      # code-scanning enabled on the repo and an `actions: read` token
+      # scope we'd rather not grant. Plain CLI exits non-zero on
+      # findings, which is all we need for a PR gate. pipx is
+      # preinstalled on ubuntu-latest runners.
+      - name: Run zizmor
+        run: pipx run zizmor==1.22.0 .github/workflows/
 
   golangci-lint:
     needs: changes
@@ -122,4 +128,5 @@ jobs:
 
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9
         with:
-          version: v1.62.2
+          # v9 of the action only supports golangci-lint v2+.
+          version: v2.1.6
