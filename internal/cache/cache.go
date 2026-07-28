@@ -312,7 +312,11 @@ func goFilesIn(pkgDirs []string) ([]string, error) {
 // This keeps the helper usable on modules with no recorded checksums
 // (single-module repos with no external deps) without an extra branch
 // at every call site.
-func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags, toolchain, envSnapshot string) (string, error) {
+// testFlags is the user's --test-flags string. It is a hash dimension
+// because those flags reach the coverage run itself: `-short` can skip
+// tests, which changes which lines the profile marks covered, so a profile
+// recorded under one value must never be replayed under another.
+func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags, testFlags, toolchain, envSnapshot string) (string, error) {
 	// 1. Collect every .go file under pkgDirs (deduped + sorted) so the hash
 	// is independent of pkgDir ordering. Extracted into goFilesIn to keep
 	// this method's cognitive complexity in check. h.File is used below so
@@ -353,6 +357,7 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 	// length-prefixed framing so adjacent values can't alias.
 	fmt.Fprintf(hh, "coverpkg:%d:%s|", len(coverPkg), coverPkg)
 	fmt.Fprintf(hh, "tags:%d:%s|", len(tags), tags)
+	fmt.Fprintf(hh, "testflags:%d:%s|", len(testFlags), testFlags)
 	fmt.Fprintf(hh, "toolchain:%d:%s|", len(toolchain), toolchain)
 	fmt.Fprintf(hh, "env:%d:%s|", len(envSnapshot), envSnapshot)
 

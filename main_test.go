@@ -516,6 +516,112 @@ func TestRunQuietConflictsWithVerbose(t *testing.T) {
 	}
 }
 
+// TestCheckTestFlags covers both directions of the --test-flags guard:
+// flags gomutants manages are rejected in every spelling a user might
+// reach for, and ordinary test flags pass through untouched. The
+// pass-through cases matter as much as the rejections — an over-eager
+// match would block the exact use case the flag exists for.
+func TestCheckTestFlags(t *testing.T) {
+	rejected := []struct {
+		name  string
+		flags []string
+	}{
+		{"single dash with value", []string{"-overlay=/tmp/x.json"}},
+		{"double dash", []string{"--overlay=/tmp/x.json"}},
+		{"space-separated value", []string{"-overlay", "/tmp/x.json"}},
+		{"bare flag", []string{"-c"}},
+		{"not first", []string{"-short", "-run=TestFoo"}},
+		{"coverprofile", []string{"-coverprofile=/tmp/c.out"}},
+		{"coverpkg", []string{"-coverpkg=./..."}},
+		{"binary output", []string{"-o=/tmp/bin"}},
+		{"exec wrapper", []string{"-exec=wine"}},
+	}
+	for _, tc := range rejected {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			err := checkTestFlags(tc.flags)
+			if err == nil {
+				t.Fatalf("checkTestFlags(%v) = nil, want an error", tc.flags)
+			}
+			if !strings.Contains(err.Error(), "--test-flags") {
+				t.Errorf("error should name the flag that carried the value, got: %v", err)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name  string
+		flags []string
+	}{
+		{"nil", nil},
+		{"the motivating case", []string{"-rapid.checks=20"}},
+		{"short", []string{"-short"}},
+		{"race and count", []string{"-race", "-count=2"}},
+		// A managed name appearing as a *value* rather than a flag: the
+		// non-flag skip must let it through, or `-gcflags c` and friends
+		// would be rejected for spelling a managed flag by coincidence.
+		{"managed name as a value", []string{"-gcflags", "c"}},
+		{"timeout override", []string{"-timeout=30s"}},
+	}
+	for _, tc := range accepted {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			if err := checkTestFlags(tc.flags); err != nil {
+				t.Errorf("checkTestFlags(%v) = %v, want nil", tc.flags, err)
+			}
+		})
+	}
+}
+
+// TestRunRejectsManagedTestFlags pins the guard at the run() boundary,
+// not just on the helper: the check must sit after ApplyFlags and abort
+// before any work happens.
+func TestRunRejectsManagedTestFlags(t *testing.T) {
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--test-flags", "-overlay=/tmp/x.json", "testmod"})
+	})
+	if err == nil {
+		t.Fatal("expected --test-flags -overlay to error")
+	}
+	if !strings.Contains(err.Error(), "-overlay") {
+		t.Errorf("error should name the rejected flag, got: %v", err)
+	}
+	if out != "" {
+		t.Errorf("the check must short-circuit before any stdout, got %q", out)
+	}
+}
+
+// TestRunRejectsManagedTestFlagsFromYAML pins the *placement* of the
+// guard: it runs after ApplyFlags, so a value that arrived from
+// .gomutants.yml is screened too. Hoisting the check above the merge
+// would pass this project straight through.
+func TestRunRejectsManagedTestFlagsFromYAML(t *testing.T) {
+	dir := setupTinyProject(t)
+	cfgPath := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(cfgPath, []byte("test-flags: \"-overlay=x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{"--config", cfgPath, "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("YAML-supplied managed flag must be rejected, got err: %v", err)
+	}
+}
+
+// TestRunTestFlagsRepeatAccumulate pins the fs.Func accumulation: a second
+// --test-flags must add to the first, not replace it. Verified through the
+// config the CLI layer builds, since that is what every consumer reads.
+func TestRunTestFlagsRepeatAccumulate(t *testing.T) {
+	// A managed flag in the *second* occurrence only errors if that
+	// occurrence survived the join — a last-one-wins bug would drop the
+	// first, and an overwrite bug would drop the second.
+	err := run(context.Background(), []string{"--test-flags", "-short", "--test-flags", "-overlay=x", "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("second --test-flags value must survive the join, got err: %v", err)
+	}
+	err = run(context.Background(), []string{"--test-flags", "-overlay=x", "--test-flags", "-short", "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("first --test-flags value must survive the join, got err: %v", err)
+	}
+}
+
 // TestRunQuietSuppressesProgressKeepsSummary mirrors TestRunFullPipeline's
 // fixture so any drift in non-quiet output is caught by that test, not this one.
 func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
@@ -864,7 +970,7 @@ func TestRunCoverageErrorMessage(t *testing.T) {
 
 	origCov := runCoverageFunc
 	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string) (string, error) {
+	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
 		return "", errors.New("inject coverage failure: marker_xyz")
 	}
 
@@ -887,7 +993,7 @@ func TestRunMeasureBaselineErrorMessage(t *testing.T) {
 
 	origM := measureBaselineFunc
 	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string) (time.Duration, error) {
+	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
 		return 0, errors.New("inject baseline failure: marker_pdq")
 	}
 
@@ -1363,7 +1469,7 @@ func TestRun_CoverageCacheHit_SkipsRunCoverage(t *testing.T) {
 	// Second run: any call to runCoverageFunc would surface as an error.
 	origRC := runCoverageFunc
 	defer func() { runCoverageFunc = origRC }()
-	runCoverageFunc = func(context.Context, string, []string, string, string, string) (string, error) {
+	runCoverageFunc = func(context.Context, string, []string, string, string, string, []string) (string, error) {
 		return "", errors.New("runCoverageFunc must NOT be called on a cache hit")
 	}
 
@@ -1406,9 +1512,9 @@ func TestRun_CoverageCacheMiss_RunsCoverage(t *testing.T) {
 	called := false
 	origRC := runCoverageFunc
 	defer func() { runCoverageFunc = origRC }()
-	runCoverageFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string) (string, error) {
+	runCoverageFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string, testFlags []string) (string, error) {
 		called = true
-		return origRC(ctx, projectDir, packages, coverPkg, tags, tmpDir)
+		return origRC(ctx, projectDir, packages, coverPkg, tags, tmpDir, testFlags)
 	}
 
 	// Pin the toolchain string so the hand-written cache below passes the

@@ -711,6 +711,30 @@ That would drop the single-package targets below ~1 s and the tsdb-4
 target to single-digit seconds. Filed as
 [issue #38](https://github.com/szhekpisov/gomutants/issues/38).
 
+## Property-based suites: `--test-flags`
+
+None of the targets on this page use property-based testing, so the
+numbers above don't capture its cost — but it is the sharpest known
+cliff. Under [`rapid`](https://pgregory.net/rapid), every mutant on a
+covered line re-runs the whole property (100 checks by default), so a
+package's mutation time scales with checks × mutants rather than with
+mutants alone.
+
+`--test-flags` forwards flags to the inner `go test`, which makes the
+iteration count a knob rather than a constant:
+
+```bash
+gomutants --changed-since main --test-flags '-rapid.checks=20' ./...
+```
+
+The flags reach the per-mutant runs, the coverage run, and the baseline
+run — never `go list` or the build steps, which is what makes this safe
+where `GOFLAGS=-short` is not. The trade is explicit: fewer checks means
+fewer chances to catch a mutant, so this belongs on a fast pre-push gate,
+not on the run whose score you publish.
+
+Not benchmarked here — no target on this page exercises it.
+
 ## Go 1.26.x compatibility
 
 The cross-comparison rows force `GOTOOLCHAIN=go1.25.7` because gremlins

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -43,6 +44,7 @@ func TestLoadValid(t *testing.T) {
 test-cpu: 2
 timeout-coefficient: 20
 coverpkg: "./pkg/..."
+test-flags: "-rapid.checks=20 -short"
 output: report.json
 dry-run: true
 verbose: true
@@ -72,6 +74,9 @@ only:
 	}
 	if cfg.CoverPkg != "./pkg/..." {
 		t.Errorf("CoverPkg=%q, want %q", cfg.CoverPkg, "./pkg/...")
+	}
+	if cfg.TestFlags != "-rapid.checks=20 -short" {
+		t.Errorf("TestFlags=%q, want %q", cfg.TestFlags, "-rapid.checks=20 -short")
 	}
 	if cfg.Output != "report.json" {
 		t.Errorf("Output=%q, want %q", cfg.Output, "report.json")
@@ -218,6 +223,7 @@ func TestApplyFlags(t *testing.T) {
 		CheckpointInterval: CheckpointIntervalFlag{Set: true, Value: 30 * time.Second},
 		CoverPkg:           "./pkg/...",
 		Tags:               "integration,debug",
+		TestFlags:          "-rapid.checks=20",
 		Output:             "out.json",
 		Disable:            "BRANCH_IF,BRANCH_ELSE",
 		Only:               "ARITHMETIC_BASE",
@@ -256,6 +262,9 @@ func TestApplyFlags(t *testing.T) {
 	if cfg.Tags != "integration,debug" {
 		t.Errorf("Tags=%q, want integration,debug", cfg.Tags)
 	}
+	if cfg.TestFlags != "-rapid.checks=20" {
+		t.Errorf("TestFlags=%q, want -rapid.checks=20", cfg.TestFlags)
+	}
 	if cfg.Output != "out.json" {
 		t.Errorf("Output=%q", cfg.Output)
 	}
@@ -290,6 +299,7 @@ func TestApplyFlagsZeroValuesNoOverride(t *testing.T) {
 	cfg := Default()
 	cfg.TestCPU = 7
 	cfg.Tags = "integration" // e.g. set via YAML
+	cfg.TestFlags = "-short" // e.g. set via YAML
 	orig := cfg
 
 	// Zero/empty values should not override defaults.
@@ -325,6 +335,39 @@ func TestApplyFlagsZeroValuesNoOverride(t *testing.T) {
 	}
 	if cfg.Tags != orig.Tags {
 		t.Errorf("Tags changed from %q to %q; an empty --tags must not clobber a YAML value", orig.Tags, cfg.Tags)
+	}
+	if cfg.TestFlags != orig.TestFlags {
+		t.Errorf("TestFlags changed from %q to %q; an empty --test-flags must not clobber a YAML value", orig.TestFlags, cfg.TestFlags)
+	}
+}
+
+// TestTestFlagFields pins the split contract every consumer depends on:
+// the argv fragments appended to the inner `go test`. Unset must yield
+// nothing appendable (not a one-element slice holding ""), which would
+// otherwise reach `go test` as an empty argument and be read as a package
+// pattern. Runs of whitespace collapse, and repeated --test-flags values
+// (joined with a space by the CLI layer) come back in order.
+func TestTestFlagFields(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"unset", "", nil},
+		{"whitespace only", "   ", nil},
+		{"single", "-short", []string{"-short"}},
+		{"multiple", "-short -rapid.checks=20", []string{"-short", "-rapid.checks=20"}},
+		{"collapses runs", "  -short   -race  ", []string{"-short", "-race"}},
+		{"preserves order", "-a -b -c", []string{"-a", "-b", "-c"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{TestFlags: tc.in}
+			got := cfg.TestFlagFields()
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("TestFlagFields(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

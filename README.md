@@ -423,6 +423,7 @@ timeout-margin: 3.0     # multiplier on per-test sums (only when adaptive)
 timeout-min: 2s         # floor on per-mutant adaptive timeout
 coverpkg: "./pkg/mypackage/..."
 tags: ""                # build tags forwarded to the inner go list/go test (e.g. "integration,debug")
+test-flags: ""          # flags forwarded to the inner go test only (e.g. "-rapid.checks=20")
 output: mutation-report.json
 changed-since: ""       # set to e.g. "main" to scope runs by default
 integration: false      # cross-package routing; manages -coverpkg itself (don't also set coverpkg)
@@ -493,6 +494,7 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `--timeout-min` | | 2s | Floor for the per-mutant adaptive timeout. Absorbs cold-start, child fork, and GC pause overhead that doesn't scale with the underlying test work. |
 | `--coverpkg` | | | Coverage package pattern (forwarded to `go test -coverpkg`) |
 | `--tags` | | | Comma-separated build tags forwarded as `-tags` to every inner `go list` / `go test` (including `go test -c`/`-list`), so mutation testing reaches code behind `//go:build` constraints (gremlins-compat) |
+| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
 | `--output` | `-o` | `mutation-report.json` | JSON report path |
 | `--config` | | `.gomutants.yml` | Config file path |
 | `--disable` | | | Comma-separated mutator types to disable |
@@ -548,6 +550,38 @@ gomutants --workers=1 --test-cpu=8 ./...
 ```
 
 `gomutants unleash ./...` is accepted unchanged for gremlins-compat scripts.
+
+### Speeding up property-based suites
+
+Property-based tests are the worst case for mutation testing: every mutant on
+a covered line re-runs the whole property. With [`rapid`](https://pgregory.net/rapid),
+that is 100 checks per mutant by default, and the run becomes dominated by
+iteration rather than by mutants.
+
+`--test-flags` forwards flags to the inner `go test`, so you can dial that
+down explicitly:
+
+```bash
+# Cheaper per-mutant runs; composes with --changed-since for a pre-push gate.
+gomutants --changed-since main --test-flags '-rapid.checks=20' ./...
+gomutants --changed-since main --test-flags '-short'           ./...
+```
+
+Two things to know:
+
+- **`go test` only.** The flags reach the per-mutant runs, the coverage run,
+  and the baseline run — never `go list` or the build steps. This is why
+  `GOFLAGS=-short` is not a workaround: `-short` is not a valid `go list`
+  flag, so it breaks package resolution before any test runs.
+- **`-short` narrows coverage too, deliberately.** The coverage run sees the
+  same flags, so a test that `-short` skips is not recorded as covering. Its
+  lines report as `NOT_COVERED` rather than as false survivors — an honest
+  gap instead of a misleading one.
+
+Flags gomutants manages itself (`-overlay`, `-run`, `-coverprofile`,
+`-coverpkg`, `-c`, `-o`, `-exec`) are rejected rather than silently honored:
+a replaced `-overlay`, for instance, would mean no mutant is ever applied and
+every one of them "survives".
 
 ## How It Works
 

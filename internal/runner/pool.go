@@ -20,12 +20,14 @@ import (
 type ResultCallback func(m mutator.Mutant)
 
 // ExecOpts bundles the inner `go test` knobs forwarded to each worker:
-// TestCPU (0 omits -cpu, letting go test default to GOMAXPROCS) and Tags
-// (empty omits -tags). Grouped into one struct so NewPool stays within a
-// sane parameter count.
+// TestCPU (0 omits -cpu, letting go test default to GOMAXPROCS), Tags
+// (empty omits -tags), and TestFlags (user-supplied flags appended
+// verbatim; nil appends nothing). Grouped into one struct so NewPool stays
+// within a sane parameter count.
 type ExecOpts struct {
-	TestCPU int
-	Tags    string
+	TestCPU   int
+	Tags      string
+	TestFlags []string
 }
 
 // Pool coordinates parallel mutation testing.
@@ -169,6 +171,7 @@ func (p *Pool) createWorkers() []*Worker {
 		w.childGOMAXPROCS = cap
 		w.testCPU = p.exec.TestCPU
 		w.tags = p.exec.Tags
+		w.testFlags = p.exec.TestFlags
 		workers = append(workers, w)
 	}
 	return workers
@@ -199,11 +202,15 @@ func mutantLess(a, b mutator.Mutant) bool {
 }
 
 // MeasureBaseline runs the test suite once to determine baseline duration.
-func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string) (time.Duration, error) {
+// testFlags are the user's --test-flags, forwarded here too so the baseline
+// measures the same work the per-mutant runs will do — otherwise a
+// `-short`-ed mutation run would be sized against a full-cost baseline.
+func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
 	args := []string{"test", "-count=1"}
 	if tags != "" {
 		args = append(args, "-tags="+tags)
 	}
+	args = append(args, testFlags...)
 	args = append(args, packages...)
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
@@ -220,7 +227,11 @@ func MeasureBaseline(ctx context.Context, projectDir string, packages []string, 
 }
 
 // RunCoverage runs go test with coverage and returns the profile path.
-func RunCoverage(ctx context.Context, projectDir string, packages []string, coverPkg, tags string, tmpDir string) (string, error) {
+// testFlags are the user's --test-flags. Forwarding them here keeps the
+// profile consistent with what the per-mutant runs execute: a test that
+// `-short` skips must not be recorded as covering, or every mutant on its
+// lines would be reported as a survivor instead of NOT_COVERED.
+func RunCoverage(ctx context.Context, projectDir string, packages []string, coverPkg, tags string, tmpDir string, testFlags []string) (string, error) {
 	profilePath := filepath.Join(tmpDir, "coverage.out")
 
 	args := []string{"test", "-count=1", "-coverprofile=" + profilePath}
@@ -230,6 +241,7 @@ func RunCoverage(ctx context.Context, projectDir string, packages []string, cove
 	if tags != "" {
 		args = append(args, "-tags="+tags)
 	}
+	args = append(args, testFlags...)
 	args = append(args, packages...)
 
 	cmd := exec.CommandContext(ctx, "go", args...)

@@ -38,13 +38,19 @@ type Config struct {
 	// command (list, test, test -c) so mutation testing reaches code
 	// guarded by `//go:build` constraints. Go parses the comma-separated
 	// list itself, so we pass the raw string through unchanged.
-	Tags    string   `yaml:"tags"`
-	Output  string   `yaml:"output"`
-	DryRun  bool     `yaml:"dry-run"`
-	Verbose bool     `yaml:"verbose"`
-	Quiet   bool     `yaml:"quiet"`
-	Disable []string `yaml:"disable"`
-	Only    []string `yaml:"only"`
+	Tags string `yaml:"tags"`
+	// TestFlags is forwarded verbatim to the inner `go test` invocations
+	// (per-mutant runs, the coverage run, the baseline run) and to nothing
+	// else — `go list` and `go test -c` reject test-only flags like
+	// `-short`, which is exactly why GOFLAGS is not a usable workaround.
+	// Whitespace-separated; see TestFlagFields.
+	TestFlags string   `yaml:"test-flags"`
+	Output    string   `yaml:"output"`
+	DryRun    bool     `yaml:"dry-run"`
+	Verbose   bool     `yaml:"verbose"`
+	Quiet     bool     `yaml:"quiet"`
+	Disable   []string `yaml:"disable"`
+	Only      []string `yaml:"only"`
 	// ExcludeFiles holds regexps matched (unanchored) against each
 	// production file's module-relative path; matching files are skipped
 	// entirely, producing no mutants. Test files are never mutated and so
@@ -103,6 +109,16 @@ func (c *Config) DetectEquivalentEnabled() bool {
 		return false
 	}
 	return *c.DetectEquivalent
+}
+
+// TestFlagFields splits TestFlags into the argv fragments appended to each
+// inner `go test`. Whitespace-separated, so a flag whose value contains a
+// space cannot be expressed — repeat the flag or use its `=` form instead.
+// Centralized here so every consumer (worker, coverage run, baseline run,
+// cache key) splits identically; a per-call-site strings.Fields would let
+// them drift.
+func (c *Config) TestFlagFields() []string {
+	return strings.Fields(c.TestFlags)
 }
 
 // DefaultWorkers returns the default worker count: NumCPU. Floored at 1.
@@ -223,6 +239,7 @@ type Flags struct {
 	CheckpointInterval CheckpointIntervalFlag
 	CoverPkg           string
 	Tags               string
+	TestFlags          string
 	Output             string
 	Disable            string
 	Only               string
@@ -276,6 +293,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.Tags != "" {
 		c.Tags = f.Tags
+	}
+	if f.TestFlags != "" {
+		c.TestFlags = f.TestFlags
 	}
 	if f.Output != "" {
 		c.Output = f.Output

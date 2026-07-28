@@ -232,6 +232,7 @@ func run(ctx context.Context, args []string) error {
 		checkpointInterval config.CheckpointIntervalFlag
 		coverPkg           string
 		tags               string
+		testFlags          []string
 		output             string
 		configPath         string
 		disable            string
@@ -295,6 +296,13 @@ func run(ctx context.Context, args []string) error {
 	})
 	fs.StringVar(&coverPkg, "coverpkg", "", "coverage package pattern")
 	fs.StringVar(&tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
+	// fs.Func rather than StringVar so repeated --test-flags accumulate
+	// instead of the last one silently winning; a user building the value
+	// up across a wrapper script and a CI invocation expects both to apply.
+	fs.Func("test-flags", "flags forwarded verbatim to the inner `go test` runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags='-rapid.checks=20' or --test-flags=-short", func(s string) error {
+		testFlags = append(testFlags, s)
+		return nil
+	})
 	fs.StringVar(&output, "output", "", "JSON report path")
 	fs.StringVar(&output, "o", "", "JSON report path (shorthand)")
 	fs.StringVar(&configPath, "config", ".gomutants.yml", "config file path")
@@ -354,6 +362,7 @@ func run(ctx context.Context, args []string) error {
 		CheckpointInterval: checkpointInterval,
 		CoverPkg:           coverPkg,
 		Tags:               tags,
+		TestFlags:          strings.Join(testFlags, " "),
 		Output:             output,
 		Disable:            disable,
 		Only:               only,
@@ -373,6 +382,12 @@ func run(ctx context.Context, args []string) error {
 	// rather than silently pick one.
 	if cfg.Integration && cfg.CoverPkg != "" {
 		return fmt.Errorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
+	}
+
+	// Checked after ApplyFlags so a value from .gomutants.yml is screened
+	// too, not just the CLI one.
+	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
+		return err
 	}
 
 	// Periodic checkpointing rides on the cache file; with --cache=off
@@ -512,7 +527,7 @@ func run(ctx context.Context, args []string) error {
 		}
 		if derr == nil {
 			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), goToolchain)
-			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, toolchain, captureCoverageEnv()); herr == nil {
+			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, cfg.TestFlags, toolchain, captureCoverageEnv()); herr == nil {
 				coverageKey = k
 			}
 		}
@@ -526,7 +541,7 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	if profile == nil {
-		profilePath, rerr := runCoverageFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir)
+		profilePath, rerr := runCoverageFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.TestFlagFields())
 		if rerr != nil {
 			return rerr
 		}
@@ -552,7 +567,7 @@ func run(ctx context.Context, args []string) error {
 
 	// 4. Measure baseline test duration.
 	term.Phase("Measuring baseline...")
-	baseline, err := measureBaselineFunc(ctx, projectDir, coveragePatterns, cfg.Tags)
+	baseline, err := measureBaselineFunc(ctx, projectDir, coveragePatterns, cfg.Tags, cfg.TestFlagFields())
 	if err != nil {
 		return err
 	}
@@ -763,7 +778,7 @@ func run(ctx context.Context, args []string) error {
 		lastCheckpoint = time.Now()
 	}
 
-	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags}, policy, tmpDir, srcCache, projectDir, testMap)
+	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags, TestFlags: cfg.TestFlagFields()}, policy, tmpDir, srcCache, projectDir, testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	lastCheckpoint = time.Now()
@@ -887,6 +902,40 @@ func runGoVersion(ctx context.Context) string {
 		return "go-version-unavailable"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// managedTestFlags are inner `go test` flags gomutants sets for itself,
+// mapped to the reason a user value can't be honored. Passing one through
+// --test-flags would not fail loudly, it would quietly produce a wrong
+// run: a replaced -overlay means no mutant is ever applied and every one
+// of them "survives", which reads as a legitimate result. Rejecting at
+// parse time is the only point where the user still finds out.
+var managedTestFlags = map[string]string{
+	"overlay":      "each mutant is applied through gomutants' own overlay",
+	"run":          "the test filter comes from the per-test coverage map",
+	"coverprofile": "gomutants owns the coverage profile path; see --coverpkg",
+	"coverpkg":     "use gomutants' own --coverpkg flag",
+	"c":            "gomutants runs tests here, it does not build binaries",
+	"o":            "gomutants runs tests here, it does not build binaries",
+	"exec":         "gomutants invokes the test binary itself",
+}
+
+// checkTestFlags rejects --test-flags entries that collide with a flag
+// gomutants manages. Matching is on the flag name only, so `-overlay=x`,
+// `-overlay x`, and `--overlay` are all caught. Non-flag fields (a value
+// sitting in its own field, as in `-gcflags all=-N`) are skipped so a
+// value that happens to spell a managed name can't trip the check.
+func checkTestFlags(flags []string) error {
+	for _, f := range flags {
+		if !strings.HasPrefix(f, "-") {
+			continue
+		}
+		name, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
+		if reason, ok := managedTestFlags[name]; ok {
+			return fmt.Errorf("--test-flags: -%s is managed by gomutants and cannot be overridden (%s)", name, reason)
+		}
+	}
+	return nil
 }
 
 // captureCoverageEnv returns an allowlisted snapshot of go-related env

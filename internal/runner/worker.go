@@ -125,6 +125,15 @@ type Worker struct {
 	// `-tags=<value>` so mutants in build-tag-gated files compile and run.
 	// Set by the pool after construction, mirroring testCPU.
 	tags string
+
+	// testFlags are the user's --test-flags, appended verbatim to every
+	// inner `go test` argv. Empty appends nothing. They land after the
+	// flags we set ourselves, so a user value for a flag we also pass
+	// (e.g. -timeout) wins — Go's flag parsing takes the last occurrence.
+	// Flags gomutants depends on (-overlay, -run, …) are rejected at the
+	// CLI boundary, so they cannot reach here. Set by the pool after
+	// construction, mirroring tags.
+	testFlags []string
 }
 
 // NewWorker creates a worker with stable temp file paths.
@@ -349,6 +358,8 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 	if short {
 		args = append(args, "-short")
 	}
+	// User flags go last so they override anything above them.
+	args = append(args, w.testFlags...)
 	return args
 }
 
