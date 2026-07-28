@@ -950,14 +950,23 @@ func TestHashCoverageInputs_StableAcrossCalls(t *testing.T) {
 // collapse one of these dimensions; the table forces every Fprintf to be
 // observable.
 func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
+	// coverageInputs bundles the dimensions HashCoverageInputs fingerprints.
+	// A struct rather than a positional parameter list: there are seven
+	// same-typed strings, so a transposed pair would silently still compile
+	// and the test would keep passing against the wrong dimension. Named
+	// fields also keep the helper below within the parameter-count limit.
+	type coverageInputs struct {
+		pkgDir, projectDir, coverPkg, tags, testFlags, toolchain, env string
+	}
 	// hash runs HashCoverageInputs and fails the test on error. Extracted so
 	// the baseline and each of the table cases below is a single call rather
 	// than repeating the hash-and-check boilerplate (which the duplication
 	// detector flags). Cases hash a single dir (pkgDir == projectDir); the
 	// baseline hashes the subpackage dir against the project root.
-	hash := func(t *testing.T, pkgDir, projectDir, coverPkg, tags, testFlags, toolchain, env string) string {
+	hash := func(t *testing.T, in coverageInputs) string {
 		t.Helper()
-		h, err := NewHasher(nil).HashCoverageInputs([]string{pkgDir}, projectDir, coverPkg, tags, testFlags, toolchain, env)
+		h, err := NewHasher(nil).HashCoverageInputs(
+			[]string{in.pkgDir}, in.projectDir, in.coverPkg, in.tags, in.testFlags, in.toolchain, in.env)
 		if err != nil {
 			t.Fatalf("hash: %v", err)
 		}
@@ -965,7 +974,13 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 	}
 	baseline := func(t *testing.T) (string, string) {
 		dir, pkg := setupCoverageProject(t)
-		return dir, hash(t, pkg, dir, "./...", "", "", "go1.26", "GOEXPERIMENT=|")
+		return dir, hash(t, coverageInputs{
+			pkgDir:     pkg,
+			projectDir: dir,
+			coverPkg:   "./...",
+			toolchain:  "go1.26",
+			env:        "GOEXPERIMENT=|",
+		})
 	}
 
 	// Each row changes exactly one HashCoverageInputs input relative to the
@@ -1010,12 +1025,15 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 			if tc.write != nil {
 				tc.write(t, dir)
 			}
-			got := hash(t, dir, dir,
-				cmp.Or(tc.coverPkg, baseCoverPkg),
-				tc.tags,
-				tc.testFlags,
-				cmp.Or(tc.toolchain, baseToolchain),
-				cmp.Or(tc.env, baseEnv))
+			got := hash(t, coverageInputs{
+				pkgDir:     dir,
+				projectDir: dir,
+				coverPkg:   cmp.Or(tc.coverPkg, baseCoverPkg),
+				tags:       tc.tags,
+				testFlags:  tc.testFlags,
+				toolchain:  cmp.Or(tc.toolchain, baseToolchain),
+				env:        cmp.Or(tc.env, baseEnv),
+			})
 			if got == base {
 				t.Errorf("hash unchanged after mutating %s — STATEMENT_REMOVE on the corresponding Fprintf collapses this dimension", tc.name)
 			}
