@@ -732,12 +732,7 @@ func run(ctx context.Context, args []string) error {
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
 	// baseline×coefficient ceiling. testTimeout stays the absolute cap.
-	policy := runner.TimeoutPolicy{
-		Global:   testTimeout,
-		Margin:   cfg.TimeoutMargin,
-		Min:      cfg.TimeoutMin,
-		Adaptive: cfg.AdaptiveTimeoutEnabled(),
-	}
+	policy := timeoutPolicyFor(&cfg, testTimeout)
 	term2 := report.NewTerminal(stdout, pendingCount, cfg.Verbose, cfg.Quiet)
 	// Idle "(compiling)" heartbeat so the TTY doesn't sit silent during
 	// the first per-package go-test compile (no OnResult until the first
@@ -908,6 +903,27 @@ func runGoVersion(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
+// timeoutPolicyFor builds the per-mutant deadline policy. global is the
+// baseline×coefficient ceiling, which stays the absolute cap in every
+// mode.
+//
+// Unmeasured is the one field that isn't a straight config read:
+// --test-flags reaches the per-mutant `go test` but not the timing phase
+// that fills the TestMap, so with flags in effect those durations describe
+// different work than the deadline is being set for, and adaptive sizing
+// has to stand down (see TimeoutPolicy.Unmeasured). Derived from the split
+// fields rather than the raw string so a whitespace-only value doesn't
+// needlessly give up adaptive sizing.
+func timeoutPolicyFor(cfg *config.Config, global time.Duration) runner.TimeoutPolicy {
+	return runner.TimeoutPolicy{
+		Global:     global,
+		Margin:     cfg.TimeoutMargin,
+		Min:        cfg.TimeoutMin,
+		Adaptive:   cfg.AdaptiveTimeoutEnabled(),
+		Unmeasured: len(cfg.TestFlagFields()) > 0,
+	}
+}
+
 // managedTestFlags are inner `go test` flags gomutants sets for itself,
 // mapped to the reason a user value can't be honored. Passing one through
 // --test-flags would not fail loudly, it would quietly produce a wrong
@@ -936,18 +952,28 @@ var managedTestFlags = map[string]string{
 }
 
 // checkTestFlags rejects --test-flags entries that collide with a flag
-// gomutants manages. Matching is on the flag name only, so `-overlay=x`,
-// `-overlay x`, and `--overlay` are all caught. Non-flag fields (a value
-// sitting in its own field, as in `-gcflags all=-N`) are skipped so a
-// value that happens to spell a managed name can't trip the check.
+// gomutants manages. Matching is on the flag name via config.FlagName, so
+// `-overlay=x`, `-overlay x`, `--overlay`, and the `-test.`-prefixed
+// spelling are all caught, while a non-flag field never matches.
+//
+// The `-test.` spelling has to be covered because `go test` forwards it
+// straight to the test binary, where it wins over the flag gomutants set:
+// `go test -run=A -test.run=B` runs B, and `-test.coverprofile` writes
+// the profile somewhere other than where RunCoverage looks for it. Those
+// are the same silent wrongness the un-prefixed names are rejected for.
 func checkTestFlags(flags []string) error {
 	for _, f := range flags {
-		if !strings.HasPrefix(f, "-") {
-			continue
-		}
-		name, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
+		// FlagName yields "" for a field that isn't a flag at all (a
+		// detached value, as in `-gcflags all=-N`), and "" is never a
+		// managed name — so a value that happens to spell one can't trip
+		// the check, with no separate skip branch to keep in sync.
+		name, _ := config.FlagName(f)
 		if reason, ok := managedTestFlags[name]; ok {
-			return fmt.Errorf("--test-flags: -%s is managed by gomutants and cannot be overridden (%s)", name, reason)
+			// Echo the spelling the user typed, not the canonical name:
+			// being told "-run is managed" after passing `-test.run` reads
+			// like the wrong flag was rejected.
+			spelled, _, _ := strings.Cut(f, "=")
+			return fmt.Errorf("--test-flags: %s is managed by gomutants and cannot be overridden (%s)", spelled, reason)
 		}
 	}
 	return nil

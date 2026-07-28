@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/szhekpisov/gomutants/internal/cache"
+	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
 )
@@ -552,6 +553,16 @@ func TestCheckTestFlags(t *testing.T) {
 		// context and still lands as TIMED_OUT, so honoring it on argv
 		// alone would be a lie.
 		{"timeout", []string{"-timeout=30s"}},
+		// `go test` forwards a `-test.`-prefixed flag straight to the test
+		// binary, where it beats the one gomutants set: `go test -run=A
+		// -test.run=B` runs B, and `-test.coverprofile` writes the profile
+		// somewhere RunCoverage never looks. Reading these as flags named
+		// "test.run" / "test.coverprofile" would wave through exactly the
+		// override the un-prefixed names are rejected for.
+		{"test-prefixed run", []string{"-test.run=TestFoo"}},
+		{"test-prefixed run, double dash", []string{"--test.run=TestFoo"}},
+		{"test-prefixed coverprofile", []string{"-test.coverprofile=/tmp/c.out"}},
+		{"test-prefixed timeout", []string{"-test.timeout=30s"}},
 	}
 	for _, tc := range rejected {
 		t.Run("reject/"+tc.name, func(t *testing.T) {
@@ -561,6 +572,22 @@ func TestCheckTestFlags(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "--test-flags") {
 				t.Errorf("error should name the flag that carried the value, got: %v", err)
+			}
+		})
+	}
+
+	// The message must echo the spelling the user typed. Being told
+	// "-run is managed" after passing `-test.run` reads like the wrong
+	// flag was rejected, and sends the reader looking for a `-run` they
+	// never wrote.
+	for _, spelled := range []string{"-test.run", "--overlay", "-coverprofile"} {
+		t.Run("spelling/"+spelled, func(t *testing.T) {
+			err := checkTestFlags([]string{spelled + "=x"})
+			if err == nil {
+				t.Fatalf("checkTestFlags(%q) = nil, want an error", spelled)
+			}
+			if !strings.Contains(err.Error(), spelled) {
+				t.Errorf("error must echo %q as typed, got: %v", spelled, err)
 			}
 		})
 	}
@@ -581,11 +608,64 @@ func TestCheckTestFlags(t *testing.T) {
 		// name, so these must not be caught by a sloppy HasPrefix.
 		{"prefix-adjacent to a managed name", []string{"-count=2", "-cpu=4", "-run.notreal"}},
 		{"parallel", []string{"-parallel=4"}},
+		// Only a leading `test.` is stripped, and only as a whole segment.
+		// Over-trimming here would reject an unrelated third-party flag.
+		{"test-prefixed but unmanaged", []string{"-test.short", "-test.v"}},
+		{"name merely starting with test", []string{"-testdata=x", "-testify.m=y"}},
 	}
 	for _, tc := range accepted {
 		t.Run("accept/"+tc.name, func(t *testing.T) {
 			if err := checkTestFlags(tc.flags); err != nil {
 				t.Errorf("checkTestFlags(%v) = %v, want nil", tc.flags, err)
+			}
+		})
+	}
+}
+
+// TestTimeoutPolicyFor covers the config→policy mapping, and in
+// particular the one field that isn't a straight read: Unmeasured must
+// track whether --test-flags is in effect. The timing phase never sees
+// those flags, so with them set the recorded durations describe different
+// work than the deadline is being sized for — a `-race` run given a
+// no-race deadline turns survivors into TIMED_OUT, which drops them out
+// of the efficacy denominator instead of into it. STATEMENT_REMOVE on any
+// assignment here leaves that field zero.
+func TestTimeoutPolicyFor(t *testing.T) {
+	off := false
+	cases := []struct {
+		name           string
+		cfg            config.Config
+		wantAdaptive   bool
+		wantUnmeasured bool
+	}{
+		{"no test flags", config.Config{}, true, false},
+		{"test flags set", config.Config{TestFlags: "-race"}, true, true},
+		// Whitespace-only is not a flag: the runner appends nothing, so
+		// giving up adaptive sizing here would cost speed for nothing.
+		{"whitespace-only test flags", config.Config{TestFlags: "   "}, true, false},
+		// The two switches are independent — a --test-flags run with
+		// adaptive already off must not read as adaptive.
+		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.TimeoutMargin = 2.5
+			tc.cfg.TimeoutMin = 3 * time.Second
+			p := timeoutPolicyFor(&tc.cfg, 42*time.Second)
+			if p.Global != 42*time.Second {
+				t.Errorf("Global = %v, want 42s", p.Global)
+			}
+			if p.Margin != 2.5 {
+				t.Errorf("Margin = %v, want 2.5", p.Margin)
+			}
+			if p.Min != 3*time.Second {
+				t.Errorf("Min = %v, want 3s", p.Min)
+			}
+			if p.Adaptive != tc.wantAdaptive {
+				t.Errorf("Adaptive = %v, want %v", p.Adaptive, tc.wantAdaptive)
+			}
+			if p.Unmeasured != tc.wantUnmeasured {
+				t.Errorf("Unmeasured = %v, want %v (--test-flags = %q)", p.Unmeasured, tc.wantUnmeasured, tc.cfg.TestFlags)
 			}
 		})
 	}

@@ -372,11 +372,11 @@ func TestTestFlagFields(t *testing.T) {
 }
 
 // TestCanonicalTestFlags pins the form cache identity is computed from.
-// The point is that values differing only in whitespace must canonicalize
-// to the same string: the runner splits into fields and never sees the
-// spacing, so hashing the raw value would invalidate a reusable cache over
-// a difference that changes nothing about what runs. The unset case must
-// stay "" so a flag-less run matches a flag-less cache.
+// Two normalizations, for the same reason: values that describe the same
+// run must land on the same cache generation. Whitespace never reaches
+// the runner at all, and neither does flag order in the ordinary case, so
+// hashing either would discard a perfectly reusable cache. The unset case
+// must stay "" so a flag-less run matches a flag-less cache.
 func TestCanonicalTestFlags(t *testing.T) {
 	cases := []struct {
 		name string
@@ -387,8 +387,18 @@ func TestCanonicalTestFlags(t *testing.T) {
 		{"whitespace only", "   ", ""},
 		{"already canonical", "-short", "-short"},
 		{"leading and trailing space", "  -short  ", "-short"},
-		{"collapses runs", "-short    -race", "-short -race"},
-		{"tabs and newlines", "-short\t-race\n-count=2", "-short -race -count=2"},
+		{"collapses runs and sorts", "-short    -race", "-race -short"},
+		{"tabs and newlines", "-short\t-race\n-count=2", "-count=2 -race -short"},
+		// Not reorderable: a detached value has to stay beside the flag it
+		// belongs to, so the whole list keeps the user's order and only
+		// whitespace is normalized. Sorting here would strand "all=-N".
+		{"detached value", "-gcflags  all=-N   -short", "-gcflags all=-N -short"},
+		// Not reorderable: Go takes the last occurrence, so these two
+		// orderings are different runs and must keep different identities.
+		{"repeated flag keeps order", "-count=2 -count=1", "-count=2 -count=1"},
+		{"repeated flag other order", "-count=1 -count=2", "-count=1 -count=2"},
+		// The `-test.` alias names the same flag, so it counts as a repeat.
+		{"aliased repeat keeps order", "-short -test.short", "-short -test.short"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -408,8 +418,61 @@ func TestCanonicalTestFlags(t *testing.T) {
 		t.Errorf("whitespace-only differences must canonicalize equal, got %q vs %q",
 			spaced.CanonicalTestFlags(), tight.CanonicalTestFlags())
 	}
+	// Order-only differences likewise: `-race -short` and `-short -race`
+	// invoke identical runs, and before sorting they cost a full re-run.
+	if reordered := (&Config{TestFlags: "-race -short"}).CanonicalTestFlags(); reordered != tight.CanonicalTestFlags() {
+		t.Errorf("order-only differences must canonicalize equal, got %q vs %q",
+			reordered, tight.CanonicalTestFlags())
+	}
+	// ...but only where reordering is provably safe. A last-one-wins pair
+	// must not collapse, or `-count=1 -count=2` would replay the verdicts
+	// of a run that used the opposite value.
+	lastWins := (&Config{TestFlags: "-count=1 -count=2"}).CanonicalTestFlags()
+	firstWins := (&Config{TestFlags: "-count=2 -count=1"}).CanonicalTestFlags()
+	if lastWins == firstWins {
+		t.Errorf("repeated-flag orderings run differently and must not share a cache key, both gave %q", lastWins)
+	}
 	if spaced.CanonicalTestFlags() == fewer.CanonicalTestFlags() {
 		t.Error("distinct flag sets must not canonicalize equal; the cache gate would stop discriminating")
+	}
+}
+
+// TestFlagName pins the parse both the CLI's managed-flag guard and
+// CanonicalTestFlags depend on. The `test.` case is the load-bearing one:
+// `go test` forwards `-test.run` to the test binary, where it beats the
+// `-run` gomutants set, so a guard that reads it as a flag named
+// "test.run" would wave through exactly the override it exists to stop.
+// The ok=false cases matter just as much — a value that happens to spell
+// a managed name must not be mistaken for the flag itself.
+func TestFlagName(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantOK   bool
+	}{
+		{"-short", "short", true},
+		{"--short", "short", true},
+		{"-count=2", "count", true},
+		{"--count=2", "count", true},
+		{"-rapid.checks=20", "rapid.checks", true}, // only a leading `test.` is stripped
+		{"-test.run=TestFoo", "run", true},
+		{"--test.run=TestFoo", "run", true},
+		{"-test.coverprofile=/tmp/c.out", "coverprofile", true},
+		{"-testdata=x", "testdata", true}, // `test.` is a prefix with a dot, not `test`
+		{"all=-N", "", false},             // a detached value
+		{"./...", "", false},              // a package pattern
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			name, ok := FlagName(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("FlagName(%q) ok = %v, want %v", tc.in, ok, tc.wantOK)
+			}
+			if name != tc.wantName {
+				t.Errorf("FlagName(%q) = %q, want %q", tc.in, name, tc.wantName)
+			}
+		})
 	}
 }
 

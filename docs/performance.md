@@ -742,7 +742,11 @@ Two things bound the speedup:
   flags, so `-short` would need translating. It runs every test once
   at full cost no matter what `--test-flags` says. On a suite where
   that phase is a large share of wall clock, the end-to-end win is
-  well short of the per-mutant ratio.
+  well short of the per-mutant ratio. Its durations also stop being
+  usable as deadlines once the flags change what runs, so adaptive
+  timeouts stand down and every mutant falls back to the global
+  `baseline × --timeout-coefficient` ceiling — a second-order cost,
+  since a hung mutant now occupies a worker for longer.
 - **Only the mutant loop scales down.** Discovery, the coverage run,
   and compilation are unchanged, so the usual Amdahl ceiling applies.
 

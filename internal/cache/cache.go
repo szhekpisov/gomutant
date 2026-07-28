@@ -105,8 +105,10 @@ type Cache struct {
 	// (tag-less) caches reusable for tag-less runs.
 	BuildTags string `json:"build_tags,omitempty"`
 	// TestFlags is the `--test-flags` value the cache was built with, in
-	// the canonical whitespace-collapsed form the runner actually passes
-	// (see config.TestFlagFields). It joins the metadata-gate identity for
+	// canonical form — whitespace collapsed, and sorted where sorting is
+	// behavior-preserving (see config.CanonicalTestFlags), so that two
+	// spellings of the same run share one generation instead of each
+	// paying for a cold start. It joins the metadata-gate identity for
 	// the same reason BuildTags does, but the pressure here is sharper:
 	// the documented workflow is alternating between a cheap gate run
 	// (`--test-flags '-rapid.checks=20'`) and a full scoring run, and

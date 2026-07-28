@@ -494,7 +494,7 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `--timeout-min` | | 2s | Floor for the per-mutant adaptive timeout. Absorbs cold-start, child fork, and GC pause overhead that doesn't scale with the underlying test work. |
 | `--coverpkg` | | | Coverage package pattern (forwarded to `go test -coverpkg`) |
 | `--tags` | | | Comma-separated build tags forwarded as `-tags` to every inner `go list` / `go test` (including `go test -c`/`-list`), so mutation testing reaches code behind `//go:build` constraints (gremlins-compat) |
-| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
+| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Setting it also stands adaptive timeouts down to the global ceiling, since the per-test timings are measured without these flags. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
 | `--output` | `-o` | `mutation-report.json` | JSON report path |
 | `--config` | | `.gomutants.yml` | Config file path |
 | `--disable` | | | Comma-separated mutator types to disable |
@@ -583,20 +583,30 @@ Four things to know:
   value keeps its own cache generation: switching back and forth re-runs from
   cold rather than resuming. That is the intended trade — a mutant that
   survived 20 `rapid` checks says nothing about whether it survives 100.
-- **The per-test timing phase does not see the flags.** It compiles with
-  `go test -c` and runs the binary directly with `-test.*`-namespaced flags,
-  so `-short` would need translating. Correctness is unaffected (adaptive
-  timeouts just stay generous), but it does cap the speedup: that phase runs
-  each test once at full cost regardless of `--test-flags`, so a suite whose
-  time is dominated by it will see less improvement than the per-mutant
-  arithmetic suggests.
+  Whitespace and flag order don't count as a change: `-race -short` and
+  `-short -race` share one generation, since they invoke the same run.
+- **The per-test timing phase does not see the flags,** so adaptive timeouts
+  stand down. That phase compiles with `go test -c` and runs the binary
+  directly with `-test.*`-namespaced flags, where `-short` would need
+  translating. Its durations therefore describe a run your flags have
+  changed, which is unusable as a deadline in either direction — under
+  `-race` a deadline measured without it would fire early, turning survivors
+  into `TIMED_OUT` and quietly dropping them out of the efficacy
+  denominator. With `--test-flags` set, every mutant gets the global
+  `baseline × --timeout-coefficient` ceiling instead (the baseline *is*
+  measured with your flags), exactly as under `--adaptive-timeout=false`.
+  This also caps the speedup: the timing phase runs each test once at full
+  cost regardless, so a suite dominated by it improves less than the
+  per-mutant arithmetic suggests.
 
 Flags gomutants manages itself (`-overlay`, `-run`, `-args`, `-timeout`,
 `-coverprofile`, `-coverpkg`, `-c`, `-o`, `-exec`) are rejected rather than
 silently honored. Each would fail quietly rather than loudly: a replaced
 `-overlay` means no mutant is ever applied and every one "survives", and
 `-args` swallows the package argument appended after your flags, so the run
-tests the wrong package and reports the same way.
+tests the wrong package and reports the same way. The `-test.`-prefixed
+spellings are rejected too — `go test` hands `-test.run` straight to the
+test binary, where it beats the `-run` filter gomutants computed.
 
 ## How It Works
 
