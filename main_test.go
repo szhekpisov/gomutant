@@ -535,6 +535,23 @@ func TestCheckTestFlags(t *testing.T) {
 		{"coverpkg", []string{"-coverpkg=./..."}},
 		{"binary output", []string{"-o=/tmp/bin"}},
 		{"exec wrapper", []string{"-exec=wine"}},
+		// -args swallows every argument after it, including the package
+		// pattern gomutants appends. `go test -args -foo ./pkg` tests the
+		// working directory, exits 0, and the mutant records as LIVED —
+		// wrong, and indistinguishable from a real survivor.
+		{"args", []string{"-args", "-foo"}},
+		{"args last", []string{"-short", "-args"}},
+		// A non-flag field *before* the managed one. The loop skips
+		// non-flag fields with `continue`; INVERT_LOOP_CTRL turns that
+		// into `break`, which would abandon the scan at "all=-N" and let
+		// -overlay through. Only an ordering like this catches it — the
+		// accept-side `{"-gcflags", "c"}` case ends on the non-flag field.
+		{"managed flag after a non-flag value", []string{"-gcflags", "all=-N", "-overlay=x"}},
+		// -timeout is enforced twice: on the argv and by the context
+		// deadline in Worker.Test. A longer user value is capped by the
+		// context and still lands as TIMED_OUT, so honoring it on argv
+		// alone would be a lie.
+		{"timeout", []string{"-timeout=30s"}},
 	}
 	for _, tc := range rejected {
 		t.Run("reject/"+tc.name, func(t *testing.T) {
@@ -560,7 +577,10 @@ func TestCheckTestFlags(t *testing.T) {
 		// non-flag skip must let it through, or `-gcflags c` and friends
 		// would be rejected for spelling a managed flag by coincidence.
 		{"managed name as a value", []string{"-gcflags", "c"}},
-		{"timeout override", []string{"-timeout=30s"}},
+		// Prefix-adjacent to managed names: matching is on the whole flag
+		// name, so these must not be caught by a sloppy HasPrefix.
+		{"prefix-adjacent to a managed name", []string{"-count=2", "-cpu=4", "-run.notreal"}},
+		{"parallel", []string{"-parallel=4"}},
 	}
 	for _, tc := range accepted {
 		t.Run("accept/"+tc.name, func(t *testing.T) {

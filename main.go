@@ -299,7 +299,11 @@ func run(ctx context.Context, args []string) error {
 	// fs.Func rather than StringVar so repeated --test-flags accumulate
 	// instead of the last one silently winning; a user building the value
 	// up across a wrapper script and a CI invocation expects both to apply.
-	fs.Func("test-flags", "flags forwarded verbatim to the inner `go test` runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags='-rapid.checks=20' or --test-flags=-short", func(s string) error {
+	// The back-quoted `flags` is deliberate and must come first: flag's
+	// UnquoteUsage takes the first back-quoted token as the value
+	// placeholder shown in --help. Any other backticks in this string
+	// would be consumed instead, printing e.g. "-test-flags go test".
+	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags='-rapid.checks=20' or --test-flags=-short", func(s string) error {
 		testFlags = append(testFlags, s)
 		return nil
 	})
@@ -432,7 +436,7 @@ func run(ctx context.Context, args []string) error {
 	)
 	if cfg.Cache != "" {
 		goToolchain = goVersionFunc(ctx)
-		loadedCache = cacheLoadFunc(cfg.Cache, goModule, cacheToolVersion(), cfg.Tags, goToolchain)
+		loadedCache = cacheLoadFunc(cfg.Cache, goModule, cacheToolVersion(), cfg.Tags, cfg.CanonicalTestFlags(), goToolchain)
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
 		// the in-memory source map exists (after step 6), so
@@ -527,7 +531,7 @@ func run(ctx context.Context, args []string) error {
 		}
 		if derr == nil {
 			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), goToolchain)
-			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, cfg.TestFlags, toolchain, captureCoverageEnv()); herr == nil {
+			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, cfg.CanonicalTestFlags(), toolchain, captureCoverageEnv()); herr == nil {
 				coverageKey = k
 			}
 		}
@@ -918,6 +922,17 @@ var managedTestFlags = map[string]string{
 	"c":            "gomutants runs tests here, it does not build binaries",
 	"o":            "gomutants runs tests here, it does not build binaries",
 	"exec":         "gomutants invokes the test binary itself",
+	// -args consumes every remaining argument, and gomutants appends the
+	// package pattern (and -run filter) after the user's flags. The inner
+	// `go test` would then test the working directory instead of the
+	// mutant's package, exit 0, and record the mutant as LIVED — the same
+	// silently-wrong outcome -overlay is rejected for.
+	"args": "gomutants appends the package argument after your flags, which -args would swallow",
+	// gomutants computes -timeout from the adaptive-timeout policy and
+	// caps every run with a context deadline of the same length, so a
+	// longer user value is silently overridden (the mutant still lands as
+	// TIMED_OUT) rather than honored.
+	"timeout": "the per-mutant deadline is computed by gomutants; see --timeout-coefficient, --timeout-margin, and --timeout-min",
 }
 
 // checkTestFlags rejects --test-flags entries that collide with a flag

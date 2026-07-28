@@ -23,6 +23,14 @@ timeout-coefficient: 10
 # test, so mutation testing reaches code behind //go:build constraints.
 # tags: "integration,debug"
 
+# Whitespace-separated flags forwarded verbatim to the inner go test runs
+# (per-mutant, coverage, baseline) and to nothing else. Mainly for trading
+# mutation fidelity for speed on property-based suites; changing this value
+# invalidates the incremental cache, since verdicts recorded under one value
+# don't describe another. Flags gomutants manages (-overlay, -run, -args,
+# -timeout, -coverprofile, -coverpkg, -c, -o, -exec) are rejected.
+# test-flags: "-rapid.checks=20"
+
 # JSON report output path (default: mutation-report.json).
 output: mutation-report.json
 

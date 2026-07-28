@@ -128,10 +128,15 @@ type Worker struct {
 
 	// testFlags are the user's --test-flags, appended verbatim to every
 	// inner `go test` argv. Empty appends nothing. They land after the
-	// flags we set ourselves, so a user value for a flag we also pass
-	// (e.g. -timeout) wins — Go's flag parsing takes the last occurrence.
-	// Flags gomutants depends on (-overlay, -run, …) are rejected at the
-	// CLI boundary, so they cannot reach here. Set by the pool after
+	// flags we set ourselves, so where both spell the same flag the user's
+	// value wins — Go's flag parsing takes the last occurrence.
+	//
+	// That "last one wins" rule is argv-level only, and it is not a
+	// general override guarantee: -timeout is also enforced out-of-band by
+	// the context deadline in Worker.Test, so lengthening it via argv
+	// alone would not work. Flags in that class, along with the ones
+	// gomutants depends on (-overlay, -run, -args, …), are rejected at the
+	// CLI boundary and cannot reach here. Set by the pool after
 	// construction, mirroring tags.
 	testFlags []string
 }

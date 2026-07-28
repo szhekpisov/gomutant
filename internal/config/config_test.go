@@ -371,6 +371,48 @@ func TestTestFlagFields(t *testing.T) {
 	}
 }
 
+// TestCanonicalTestFlags pins the form cache identity is computed from.
+// The point is that values differing only in whitespace must canonicalize
+// to the same string: the runner splits into fields and never sees the
+// spacing, so hashing the raw value would invalidate a reusable cache over
+// a difference that changes nothing about what runs. The unset case must
+// stay "" so a flag-less run matches a flag-less cache.
+func TestCanonicalTestFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"unset", "", ""},
+		{"whitespace only", "   ", ""},
+		{"already canonical", "-short", "-short"},
+		{"leading and trailing space", "  -short  ", "-short"},
+		{"collapses runs", "-short    -race", "-short -race"},
+		{"tabs and newlines", "-short\t-race\n-count=2", "-short -race -count=2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{TestFlags: tc.in}
+			if got := cfg.CanonicalTestFlags(); got != tc.want {
+				t.Errorf("CanonicalTestFlags(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// The property the cache gate actually relies on: equal field slices
+	// imply an equal canonical string, and different flags stay different.
+	spaced := &Config{TestFlags: " -short   -race "}
+	tight := &Config{TestFlags: "-short -race"}
+	fewer := &Config{TestFlags: "-short"}
+	if spaced.CanonicalTestFlags() != tight.CanonicalTestFlags() {
+		t.Errorf("whitespace-only differences must canonicalize equal, got %q vs %q",
+			spaced.CanonicalTestFlags(), tight.CanonicalTestFlags())
+	}
+	if spaced.CanonicalTestFlags() == fewer.CanonicalTestFlags() {
+		t.Error("distinct flag sets must not canonicalize equal; the cache gate would stop discriminating")
+	}
+}
+
 // TestAdaptiveTimeoutEnabledNilDefault kills BRANCH_IF on the
 // `if c.AdaptiveTimeout == nil { return true }` body. Without that
 // early return the function dereferences a nil pointer and panics; the

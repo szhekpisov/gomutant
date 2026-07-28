@@ -494,7 +494,7 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `--timeout-min` | | 2s | Floor for the per-mutant adaptive timeout. Absorbs cold-start, child fork, and GC pause overhead that doesn't scale with the underlying test work. |
 | `--coverpkg` | | | Coverage package pattern (forwarded to `go test -coverpkg`) |
 | `--tags` | | | Comma-separated build tags forwarded as `-tags` to every inner `go list` / `go test` (including `go test -c`/`-list`), so mutation testing reaches code behind `//go:build` constraints (gremlins-compat) |
-| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
+| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
 | `--output` | `-o` | `mutation-report.json` | JSON report path |
 | `--config` | | `.gomutants.yml` | Config file path |
 | `--disable` | | | Comma-separated mutator types to disable |
@@ -567,7 +567,7 @@ gomutants --changed-since main --test-flags '-rapid.checks=20' ./...
 gomutants --changed-since main --test-flags '-short'           ./...
 ```
 
-Two things to know:
+Four things to know:
 
 - **`go test` only.** The flags reach the per-mutant runs, the coverage run,
   and the baseline run — never `go list` or the build steps. This is why
@@ -577,11 +577,26 @@ Two things to know:
   same flags, so a test that `-short` skips is not recorded as covering. Its
   lines report as `NOT_COVERED` rather than as false survivors — an honest
   gap instead of a misleading one.
+- **Changing the value invalidates the cache.** `--test-flags` is part of the
+  cache's identity, so alternating between a cheap gate run and a full scoring
+  run does not replay one's verdicts as the other's. The cost is that each
+  value keeps its own cache generation: switching back and forth re-runs from
+  cold rather than resuming. That is the intended trade — a mutant that
+  survived 20 `rapid` checks says nothing about whether it survives 100.
+- **The per-test timing phase does not see the flags.** It compiles with
+  `go test -c` and runs the binary directly with `-test.*`-namespaced flags,
+  so `-short` would need translating. Correctness is unaffected (adaptive
+  timeouts just stay generous), but it does cap the speedup: that phase runs
+  each test once at full cost regardless of `--test-flags`, so a suite whose
+  time is dominated by it will see less improvement than the per-mutant
+  arithmetic suggests.
 
-Flags gomutants manages itself (`-overlay`, `-run`, `-coverprofile`,
-`-coverpkg`, `-c`, `-o`, `-exec`) are rejected rather than silently honored:
-a replaced `-overlay`, for instance, would mean no mutant is ever applied and
-every one of them "survives".
+Flags gomutants manages itself (`-overlay`, `-run`, `-args`, `-timeout`,
+`-coverprofile`, `-coverpkg`, `-c`, `-o`, `-exec`) are rejected rather than
+silently honored. Each would fail quietly rather than loudly: a replaced
+`-overlay` means no mutant is ever applied and every one "survives", and
+`-args` swallows the package argument appended after your flags, so the run
+tests the wrong package and reports the same way.
 
 ## How It Works
 

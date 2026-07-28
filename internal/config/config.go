@@ -121,6 +121,15 @@ func (c *Config) TestFlagFields() []string {
 	return strings.Fields(c.TestFlags)
 }
 
+// CanonicalTestFlags is TestFlags in the exact form the inner `go test`
+// receives it: the split fields rejoined by single spaces. Cache identity
+// must be computed from this, not from the raw string — `"-short"` and
+// `" -short "` run identically, so hashing the raw value would invalidate
+// a perfectly reusable cache over whitespace the runner never sees.
+func (c *Config) CanonicalTestFlags() string {
+	return strings.Join(c.TestFlagFields(), " ")
+}
+
 // DefaultWorkers returns the default worker count: NumCPU. Floored at 1.
 // Use --workers / -w to override.
 func DefaultWorkers() int {

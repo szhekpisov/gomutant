@@ -731,7 +731,20 @@ The flags reach the per-mutant runs, the coverage run, and the baseline
 run — never `go list` or the build steps, which is what makes this safe
 where `GOFLAGS=-short` is not. The trade is explicit: fewer checks means
 fewer chances to catch a mutant, so this belongs on a fast pre-push gate,
-not on the run whose score you publish.
+not on the run whose score you publish. Because the flags are part of the
+cache identity, the two runs keep separate cache generations and neither
+inherits the other's verdicts.
+
+Two things bound the speedup:
+
+- **The per-test timing phase is not covered.** It compiles with
+  `go test -c` and drives the binary through `-test.*`-namespaced
+  flags, so `-short` would need translating. It runs every test once
+  at full cost no matter what `--test-flags` says. On a suite where
+  that phase is a large share of wall clock, the end-to-end win is
+  well short of the per-mutant ratio.
+- **Only the mutant loop scales down.** Discovery, the coverage run,
+  and compilation are unchanged, so the usual Amdahl ceiling applies.
 
 Not benchmarked here — no target on this page exercises it.
 

@@ -199,7 +199,7 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	if err := Save(c, path); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if len(got.Entries) != 1 || got.Entries[0] != c.Entries[0] {
 		t.Fatalf("round-trip mismatch: %+v", got.Entries)
 	}
@@ -222,7 +222,7 @@ func TestSaveLoad_RoundTripCoverageFields(t *testing.T) {
 	if err := Save(c, path); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if got.CoverageKey != "deadbeefcafe" {
 		t.Errorf("CoverageKey not preserved: got %q", got.CoverageKey)
 	}
@@ -232,7 +232,7 @@ func TestSaveLoad_RoundTripCoverageFields(t *testing.T) {
 }
 
 func TestLoad_EmptyPath(t *testing.T) {
-	c := Load("", testModule, testVersion, "", "")
+	c := Load("", testModule, testVersion, "", "", "")
 	if c == nil || len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache, got %+v", c)
 	}
@@ -243,7 +243,7 @@ func TestLoad_EmptyPath(t *testing.T) {
 
 func TestLoad_Missing(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "nonexistent.json")
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache for missing file, got %d entries", len(c.Entries))
 	}
@@ -252,7 +252,7 @@ func TestLoad_Missing(t *testing.T) {
 func TestLoad_GarbageJSON(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, "{not json")
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for garbage")
 	}
@@ -261,7 +261,7 @@ func TestLoad_GarbageJSON(t *testing.T) {
 func TestLoad_SchemaVersionMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, `{"schema_version":99,"go_module":"`+testModule+`","tool_version":"`+testVersion+`","entries":[{"rel_file":"x.go","status":"KILLED"}]}`)
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for schema mismatch")
 	}
@@ -269,24 +269,24 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 4 must load under the current
-// constant. (Pins SchemaVersion == 4; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 5 must load under the current
+// constant. (Pins SchemaVersion == 5; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 4 {
+	if SchemaVersion != 5 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":4,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":5,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-4 cache must load under SchemaVersion=4, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-5 cache must load under SchemaVersion=5, got %d entries", len(c.Entries))
 	}
 }
 
 func TestLoad_ModuleMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"other/mod","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for module mismatch")
 	}
@@ -295,7 +295,7 @@ func TestLoad_ModuleMismatch(t *testing.T) {
 func TestLoad_ToolVersionMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"0.0.9","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for tool-version mismatch")
 	}
@@ -312,15 +312,15 @@ func TestLoad_BuildTagsMismatch(t *testing.T) {
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","build_tags":"integration","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
 
 	// Different tags → discard.
-	if c := Load(p, testModule, testVersion, "e2e", ""); len(c.Entries) != 0 {
+	if c := Load(p, testModule, testVersion, "e2e", "", ""); len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache for build-tags mismatch, got %d entries", len(c.Entries))
 	}
 	// No tags requested → still a mismatch against the tagged cache.
-	if c := Load(p, testModule, testVersion, "", ""); len(c.Entries) != 0 {
+	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache when requesting no tags against a tagged cache, got %d entries", len(c.Entries))
 	}
 	// Same tags → reuse.
-	if c := Load(p, testModule, testVersion, "integration", ""); len(c.Entries) != 1 {
+	if c := Load(p, testModule, testVersion, "integration", "", ""); len(c.Entries) != 1 {
 		t.Fatalf("expected entries preserved on matching build tags, got %d", len(c.Entries))
 	}
 }
@@ -332,8 +332,60 @@ func TestLoad_BuildTagsMismatch(t *testing.T) {
 func TestLoad_BuildTagsBackCompat(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-	if c := Load(p, testModule, testVersion, "", ""); len(c.Entries) != 1 {
+	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 1 {
 		t.Fatalf("a tag-less cache must stay reusable for a tag-less run, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_TestFlagsMismatch pins the --test-flags dimension of the
+// metadata gate. This is the sharpest case in the gate: the documented
+// workflow alternates between a cheap gate run (`-rapid.checks=20`) and a
+// full scoring run, and per-mutant verdicts are not comparable across the
+// two — a LIVED earned at 20 checks would otherwise be replayed as the
+// verdict for a 100-check run, and a KILLED under a full suite as the
+// verdict for a `-short` one. Kills CONDITIONALS_NEGATION and
+// STATEMENT_REMOVE on the `c.TestFlags != testFlags` clause in Load.
+func TestLoad_TestFlagsMismatch(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","test_flags":"-rapid.checks=20","entries":[{"rel_file":"x.go","status":"LIVED"}]}`, SchemaVersion, testModule, testVersion))
+
+	// Different flags → discard.
+	if c := Load(p, testModule, testVersion, "", "-short", ""); len(c.Entries) != 0 {
+		t.Fatalf("expected empty cache for test-flags mismatch, got %d entries", len(c.Entries))
+	}
+	// The critical direction: the full scoring run must not inherit
+	// verdicts recorded under a reduced-fidelity run.
+	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 0 {
+		t.Fatalf("a full run must not reuse verdicts recorded under --test-flags, got %d entries", len(c.Entries))
+	}
+	// Same flags → reuse; the gate must not defeat caching outright.
+	if c := Load(p, testModule, testVersion, "", "-rapid.checks=20", ""); len(c.Entries) != 1 {
+		t.Fatalf("expected entries preserved on matching test flags, got %d", len(c.Entries))
+	}
+}
+
+// TestLoad_TestFlagsBackCompat is the TestFlags analogue of
+// TestLoad_BuildTagsBackCompat: a cache with no test_flags field must stay
+// reusable for a flag-less run, so the new dimension costs nothing to the
+// overwhelmingly common case of never passing --test-flags at all.
+func TestLoad_TestFlagsBackCompat(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
+	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 1 {
+		t.Fatalf("a flag-less cache must stay reusable for a flag-less run, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_StampsTestFlagsOnDiscard pins that the empty cache handed back
+// on a gate miss carries the *requested* flags, not the rejected file's.
+// Without this the run would recompute every verdict and then save it
+// stamped with the old value, so the next matching run would miss again.
+func TestLoad_StampsTestFlagsOnDiscard(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","test_flags":"-short","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "-rapid.checks=20", "")
+	if c.TestFlags != "-rapid.checks=20" {
+		t.Errorf("discarded cache stamped TestFlags=%q, want the requested %q", c.TestFlags, "-rapid.checks=20")
 	}
 }
 
@@ -346,7 +398,7 @@ func TestLoad_V2CacheRejectedAfterV3Bump(t *testing.T) {
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":2,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache (v2 rejected by v%d Load); got %d entries", SchemaVersion, len(c.Entries))
 	}
@@ -416,7 +468,7 @@ func TestSave_RewriteIsAtomic(t *testing.T) {
 		t.Fatalf("save 2: %v", err)
 	}
 
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if len(got.Entries) != 1 || got.Entries[0].RelFile != "b.go" {
 		t.Fatalf("rewrite did not replace cleanly: %+v", got.Entries)
 	}
@@ -1193,10 +1245,10 @@ func TestLoad_GoToolchainMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","go_toolchain":"go1.26.1","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
 
-	if c := Load(p, testModule, testVersion, "", "go1.27.0"); len(c.Entries) != 0 {
+	if c := Load(p, testModule, testVersion, "", "", "go1.27.0"); len(c.Entries) != 0 {
 		t.Fatalf("expected discard on go_toolchain mismatch, got %d entries", len(c.Entries))
 	}
-	if c := Load(p, testModule, testVersion, "", "go1.26.1"); len(c.Entries) != 1 {
+	if c := Load(p, testModule, testVersion, "", "", "go1.26.1"); len(c.Entries) != 1 {
 		t.Fatalf("expected reuse on matching go_toolchain, got %d entries", len(c.Entries))
 	}
 }
