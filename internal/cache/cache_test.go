@@ -301,91 +301,128 @@ func TestLoad_ToolVersionMismatch(t *testing.T) {
 	}
 }
 
-// TestLoad_BuildTagsMismatch pins the build-tags dimension of the metadata
-// gate: a cache built with one --tags value must be discarded when loaded
-// for a different value, because a tag change can flip mutant outcomes
-// without touching source/test hashes. Kills CONDITIONALS_NEGATION and the
-// STATEMENT_REMOVE / logical mutants on the `c.BuildTags != buildTags`
-// clause in Load.
-func TestLoad_BuildTagsMismatch(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","build_tags":"integration","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
+// loadGateDims enumerates the free-form string dimensions of Load's
+// metadata gate. All three behave identically — a mismatch discards the
+// whole cache, a match reuses it, and an absent field reads as "" — so
+// they are exercised by one table rather than three near-identical tests.
+// Each entry carries the *reason* its dimension gates, since that is the
+// part a reader cannot recover from the mechanics.
+var loadGateDims = []struct {
+	name    string // dimension name, for failure messages
+	jsonKey string // the cache-file field it round-trips through
+	why     string // why a change here must discard cached verdicts
+	stored  string // value baked into the fixture
+	other   string // a different value, to force a mismatch
+	// load calls Load with value in this dimension's argument position,
+	// leaving the others empty. get reads the same dimension back off the
+	// returned Cache.
+	load func(path, value string) *Cache
+	get  func(c *Cache) string
+}{
+	{
+		name: "build tags", jsonKey: "build_tags",
+		why:    "a tag change pulls in different compiled-in code, flipping outcomes without touching source or test hashes",
+		stored: "integration", other: "e2e",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, v, "", "") },
+		get:  func(c *Cache) string { return c.BuildTags },
+	},
+	{
+		name: "test flags", jsonKey: "test_flags",
+		why:    "the documented workflow alternates a cheap --test-flags gate run with a full scoring run, and a LIVED earned at 20 rapid checks is not the verdict for a 100-check run",
+		stored: "-rapid.checks=20", other: "-short",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, "", v, "") },
+		get:  func(c *Cache) string { return c.TestFlags },
+	},
+	{
+		name: "go toolchain", jsonKey: "go_toolchain",
+		why:    "EQUIVALENT verdicts are decided by the compiler's generated code, which changes between toolchains",
+		stored: "go1.26.1", other: "go1.27.0",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, "", "", v) },
+		get:  func(c *Cache) string { return c.GoToolchain },
+	},
+}
 
-	// Different tags → discard.
-	if c := Load(p, testModule, testVersion, "e2e", "", ""); len(c.Entries) != 0 {
-		t.Fatalf("expected empty cache for build-tags mismatch, got %d entries", len(c.Entries))
+// writeGateFixture writes a one-entry cache file whose metadata matches the
+// test module/version, optionally carrying jsonKey:value. Passing an empty
+// jsonKey omits the field entirely, which is how a cache written before the
+// dimension existed looks on disk.
+func writeGateFixture(t *testing.T, jsonKey, value string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "cache.json")
+	field := ""
+	if jsonKey != "" {
+		field = fmt.Sprintf(`"%s":"%s",`, jsonKey, value)
 	}
-	// No tags requested → still a mismatch against the tagged cache.
-	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 0 {
-		t.Fatalf("expected empty cache when requesting no tags against a tagged cache, got %d entries", len(c.Entries))
-	}
-	// Same tags → reuse.
-	if c := Load(p, testModule, testVersion, "integration", "", ""); len(c.Entries) != 1 {
-		t.Fatalf("expected entries preserved on matching build tags, got %d", len(c.Entries))
+	mustWrite(t, p, fmt.Sprintf(
+		`{"schema_version":%d,"go_module":"%s","tool_version":"%s",%s"entries":[{"rel_file":"x.go","status":"KILLED"}]}`,
+		SchemaVersion, testModule, testVersion, field))
+	return p
+}
+
+// TestLoad_MetadataGateDimensions pins every string dimension of the gate
+// in both directions. Kills CONDITIONALS_NEGATION and the STATEMENT_REMOVE /
+// logical mutants on each `c.X != x` clause in Load: dropping a clause makes
+// the mismatch rows reuse a stale cache, and negating one makes the matching
+// row throw a good cache away.
+func TestLoad_MetadataGateDimensions(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, dim.jsonKey, dim.stored)
+
+			// A different value → discard. This is the direction that
+			// matters: reusing here yields a wrong result, for the
+			// reason the dimension records in `why`.
+			if c := dim.load(p, dim.other); len(c.Entries) != 0 {
+				t.Errorf("%s=%q must discard a cache built with %q, got %d entries (%s)",
+					dim.name, dim.other, dim.stored, len(c.Entries), dim.why)
+			}
+			// Requesting the default against a non-default cache is
+			// still a mismatch — "" must not be treated as a wildcard.
+			if c := dim.load(p, ""); len(c.Entries) != 0 {
+				t.Errorf("unset %s must discard a cache built with %q, got %d entries",
+					dim.name, dim.stored, len(c.Entries))
+			}
+			// The same value → reuse. Without this the gate could pass
+			// the rows above by rejecting unconditionally.
+			if c := dim.load(p, dim.stored); len(c.Entries) != 1 {
+				t.Errorf("matching %s=%q must reuse the cache, got %d entries",
+					dim.name, dim.stored, len(c.Entries))
+			}
+		})
 	}
 }
 
-// TestLoad_BuildTagsBackCompat ensures a pre-existing cache with no
-// build_tags field (the value before --tags existed) stays reusable for a
-// tag-less run — the default "" must compare equal so we don't gratuitously
-// invalidate every existing user's cache.
-func TestLoad_BuildTagsBackCompat(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 1 {
-		t.Fatalf("a tag-less cache must stay reusable for a tag-less run, got %d entries", len(c.Entries))
+// TestLoad_MetadataGateBackCompat pins that a cache file written before a
+// dimension existed stays reusable for a run that doesn't use it. The
+// absent field unmarshals to "" and must compare equal to an unset
+// argument, so adding a dimension costs nothing to the common case of
+// never setting it.
+func TestLoad_MetadataGateBackCompat(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, "", "") // field omitted entirely
+			if c := dim.load(p, ""); len(c.Entries) != 1 {
+				t.Errorf("a cache with no %s field must stay reusable for an unset run, got %d entries",
+					dim.jsonKey, len(c.Entries))
+			}
+		})
 	}
 }
 
-// TestLoad_TestFlagsMismatch pins the --test-flags dimension of the
-// metadata gate. This is the sharpest case in the gate: the documented
-// workflow alternates between a cheap gate run (`-rapid.checks=20`) and a
-// full scoring run, and per-mutant verdicts are not comparable across the
-// two — a LIVED earned at 20 checks would otherwise be replayed as the
-// verdict for a 100-check run, and a KILLED under a full suite as the
-// verdict for a `-short` one. Kills CONDITIONALS_NEGATION and
-// STATEMENT_REMOVE on the `c.TestFlags != testFlags` clause in Load.
-func TestLoad_TestFlagsMismatch(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","test_flags":"-rapid.checks=20","entries":[{"rel_file":"x.go","status":"LIVED"}]}`, SchemaVersion, testModule, testVersion))
-
-	// Different flags → discard.
-	if c := Load(p, testModule, testVersion, "", "-short", ""); len(c.Entries) != 0 {
-		t.Fatalf("expected empty cache for test-flags mismatch, got %d entries", len(c.Entries))
-	}
-	// The critical direction: the full scoring run must not inherit
-	// verdicts recorded under a reduced-fidelity run.
-	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 0 {
-		t.Fatalf("a full run must not reuse verdicts recorded under --test-flags, got %d entries", len(c.Entries))
-	}
-	// Same flags → reuse; the gate must not defeat caching outright.
-	if c := Load(p, testModule, testVersion, "", "-rapid.checks=20", ""); len(c.Entries) != 1 {
-		t.Fatalf("expected entries preserved on matching test flags, got %d", len(c.Entries))
-	}
-}
-
-// TestLoad_TestFlagsBackCompat is the TestFlags analogue of
-// TestLoad_BuildTagsBackCompat: a cache with no test_flags field must stay
-// reusable for a flag-less run, so the new dimension costs nothing to the
-// overwhelmingly common case of never passing --test-flags at all.
-func TestLoad_TestFlagsBackCompat(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-	if c := Load(p, testModule, testVersion, "", "", ""); len(c.Entries) != 1 {
-		t.Fatalf("a flag-less cache must stay reusable for a flag-less run, got %d entries", len(c.Entries))
-	}
-}
-
-// TestLoad_StampsTestFlagsOnDiscard pins that the empty cache handed back
-// on a gate miss carries the *requested* flags, not the rejected file's.
-// Without this the run would recompute every verdict and then save it
-// stamped with the old value, so the next matching run would miss again.
-func TestLoad_StampsTestFlagsOnDiscard(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","test_flags":"-short","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-	c := Load(p, testModule, testVersion, "", "-rapid.checks=20", "")
-	if c.TestFlags != "-rapid.checks=20" {
-		t.Errorf("discarded cache stamped TestFlags=%q, want the requested %q", c.TestFlags, "-rapid.checks=20")
+// TestLoad_MetadataGateStampsRequested pins that the empty cache handed
+// back on a gate miss carries the *requested* value, not the rejected
+// file's. Otherwise the run would recompute every verdict and then save it
+// stamped with the old value, so the next matching run would miss again
+// and the cache would never converge.
+func TestLoad_MetadataGateStampsRequested(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, dim.jsonKey, dim.stored)
+			c := dim.load(p, dim.other)
+			if got := dim.get(c); got != dim.other {
+				t.Errorf("discarded cache stamped %s=%q, want the requested %q", dim.name, got, dim.other)
+			}
+		})
 	}
 }
 
@@ -1251,23 +1288,6 @@ func TestHashCoverageInputs_IgnoresNonGoFiles(t *testing.T) {
 	}
 	if base != after {
 		t.Errorf("non-.go files leaked into hash: base=%s after=%s", base, after)
-	}
-}
-
-// TestLoad_GoToolchainMismatch pins the go_toolchain dimension of the
-// metadata gate: equivalence verdicts are decided by the compiler, so a
-// cache built under one toolchain must be discarded for a different one
-// and reused for a matching one. Kills the EXPRESSION_REMOVE on the
-// `c.GoToolchain != goToolchain` clause in Load.
-func TestLoad_GoToolchainMismatch(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","go_toolchain":"go1.26.1","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-
-	if c := Load(p, testModule, testVersion, "", "", "go1.27.0"); len(c.Entries) != 0 {
-		t.Fatalf("expected discard on go_toolchain mismatch, got %d entries", len(c.Entries))
-	}
-	if c := Load(p, testModule, testVersion, "", "", "go1.26.1"); len(c.Entries) != 1 {
-		t.Fatalf("expected reuse on matching go_toolchain, got %d entries", len(c.Entries))
 	}
 }
 
