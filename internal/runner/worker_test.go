@@ -65,8 +65,8 @@ func TestWorkerTestMissingSource(t *testing.T) {
 	}
 
 	m := mutator.Mutant{
-		ID:   1,
-		File: "/nonexistent/file.go",
+		ID:     1,
+		File:   "/nonexistent/file.go",
 		Status: mutator.StatusPending,
 	}
 

@@ -83,8 +83,8 @@ var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 // lets us hit the unhappy paths in NewWorker / Worker.Test (write failure,
 // fork/exec failure) without contriving filesystem or PATH state.
 var (
-	writeFileFunc       = os.WriteFile
-	execCommandContext  = exec.CommandContext
+	writeFileFunc      = os.WriteFile
+	execCommandContext = exec.CommandContext
 )
 
 // shortFlagFromEnv reports whether the inner `go test` should be invoked
@@ -107,7 +107,7 @@ type Worker struct {
 	policy      TimeoutPolicy
 	sourceCache map[string][]byte // Read-only, shared across workers.
 	projectDir  string            // Working directory for go test.
-	testMap     *coverage.TestMap  // Per-test coverage map (may be nil).
+	testMap     *coverage.TestMap // Per-test coverage map (may be nil).
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
 	// Limits compile + test runtime parallelism per child so N parallel workers

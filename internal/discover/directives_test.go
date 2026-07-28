@@ -49,10 +49,10 @@ func keptTypes(kept []mutator.Mutant) map[mutator.MutationType]int {
 
 func TestSplitMutatorsAndReason(t *testing.T) {
 	cases := []struct {
-		in            string
-		wantMutators  string
-		wantReason    string
-		wantOK        bool
+		in           string
+		wantMutators string
+		wantReason   string
+		wantOK       bool
 	}{
 		{"", "", "", true},
 		{"ARITHMETIC_BASE", "ARITHMETIC_BASE", "", true},
@@ -188,12 +188,12 @@ func TestParseDirectiveReasonRoundTrips(t *testing.T) {
 
 func TestNextNonCommentLine(t *testing.T) {
 	lines := []string{
-		"package p", // 1
-		"",          // 2
-		"// comment",        // 3 (the directive sits here)
-		"// another comment",// 4
-		"",                  // 5
-		"x := a + b",        // 6 — first non-comment, non-blank line
+		"package p",          // 1
+		"",                   // 2
+		"// comment",         // 3 (the directive sits here)
+		"// another comment", // 4
+		"",                   // 5
+		"x := a + b",         // 6 — first non-comment, non-blank line
 	}
 	if got := nextNonCommentLine(lines, 3); got != 6 {
 		t.Errorf("nextNonCommentLine(_, 3) = %d, want 6", got)

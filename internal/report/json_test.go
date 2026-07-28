@@ -255,10 +255,10 @@ func TestGenerateOmitsMutantsCachedWhenZero(t *testing.T) {
 
 func TestWriteJSON(t *testing.T) {
 	r := &Report{
-		GoModule:    "example.com/mod",
-		MutantsTotal: 10,
-		MutantsKilled: 8,
-		TestEfficacy: 100,
+		GoModule:          "example.com/mod",
+		MutantsTotal:      10,
+		MutantsKilled:     8,
+		TestEfficacy:      100,
 		MutatorStatistics: map[string]int{"arithmetic_base": 5},
 	}
 
@@ -308,4 +308,3 @@ func TestGenerateCountsMutantsEquivalent(t *testing.T) {
 		t.Errorf("TestEfficacy=%v, want 100 (1 killed / (1 killed + 0 lived))", r.TestEfficacy)
 	}
 }
-

@@ -482,14 +482,14 @@ func TestUpdate_SortPrecedence(t *testing.T) {
 		orig string
 		repl string
 	}{
-		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "*", "+"},   // smaller Original
-		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "+", "*"},   // ties on Original=+, smaller Replacement
-		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "+", "-"},   // ties on Original=+, larger Replacement
-		{"x.go", 1, 1, 0, "BRANCH_IF", "+", "-"},         // larger Type
-		{"x.go", 1, 1, 1, "ARITHMETIC_BASE", "+", "-"},   // larger StartOffset
-		{"x.go", 1, 2, 0, "ARITHMETIC_BASE", "+", "-"},   // larger Col
-		{"x.go", 2, 1, 0, "ARITHMETIC_BASE", "+", "-"},   // larger Line
-		{"y.go", 0, 0, 0, "ARITHMETIC_BASE", "+", "-"},   // larger RelFile
+		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "*", "+"}, // smaller Original
+		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "+", "*"}, // ties on Original=+, smaller Replacement
+		{"x.go", 1, 1, 0, "ARITHMETIC_BASE", "+", "-"}, // ties on Original=+, larger Replacement
+		{"x.go", 1, 1, 0, "BRANCH_IF", "+", "-"},       // larger Type
+		{"x.go", 1, 1, 1, "ARITHMETIC_BASE", "+", "-"}, // larger StartOffset
+		{"x.go", 1, 2, 0, "ARITHMETIC_BASE", "+", "-"}, // larger Col
+		{"x.go", 2, 1, 0, "ARITHMETIC_BASE", "+", "-"}, // larger Line
+		{"y.go", 0, 0, 0, "ARITHMETIC_BASE", "+", "-"}, // larger RelFile
 	}
 	if len(c.Entries) != len(want) {
 		t.Fatalf("got %d entries, want %d: %+v", len(c.Entries), len(want), c.Entries)
