@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -205,7 +204,10 @@ func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
 		if w.tags != "integration" {
 			t.Errorf("worker[%d].tags = %q, want %q (STATEMENT_REMOVE drops `w.tags = p.exec.Tags`)", i, w.tags, "integration")
 		}
-		if !slices.Equal(w.testFlags, []string{"-short"}) {
+		// Length and element checked separately so a failure says which
+		// half broke: dropping the assignment leaves testFlags nil (len 0),
+		// while a wrong source would keep the length but change the value.
+		if len(w.testFlags) != 1 || w.testFlags[0] != "-short" {
 			t.Errorf("worker[%d].testFlags = %v, want [-short] (STATEMENT_REMOVE drops `w.testFlags = p.exec.TestFlags`)", i, w.testFlags)
 		}
 	}
