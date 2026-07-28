@@ -15,6 +15,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/szhekpisov/gomutants/internal/runner"
 )
 
 // captureOutput swaps the package-level stdout writer with a bytes.Buffer
@@ -517,16 +518,20 @@ func TestRunQuietConflictsWithVerbose(t *testing.T) {
 	}
 }
 
-// TestCheckTestFlags covers both directions of the --test-flags guard:
-// flags gomutants manages are rejected in every spelling a user might
-// reach for, and ordinary test flags pass through untouched. The
-// pass-through cases matter as much as the rejections — an over-eager
-// match would block the exact use case the flag exists for.
-func TestCheckTestFlags(t *testing.T) {
-	rejected := []struct {
-		name  string
-		flags []string
-	}{
+// The --test-flags guard is pinned by three tests rather than one, split
+// along the three things it has to get right: reject every spelling of a
+// managed flag, accept everything else, and name the flag the way the
+// user wrote it. They share the flagCases shape below.
+type flagCases = []struct {
+	name  string
+	flags []string
+}
+
+// TestCheckTestFlagsRejects covers the guard's reason for existing: a
+// managed flag must be caught in every spelling a user might reach for,
+// because each one fails silently rather than loudly.
+func TestCheckTestFlagsRejects(t *testing.T) {
+	rejected := flagCases{
 		{"single dash with value", []string{"-overlay=/tmp/x.json"}},
 		{"double dash", []string{"--overlay=/tmp/x.json"}},
 		{"space-separated value", []string{"-overlay", "/tmp/x.json"}},
@@ -542,10 +547,10 @@ func TestCheckTestFlags(t *testing.T) {
 		// wrong, and indistinguishable from a real survivor.
 		{"args", []string{"-args", "-foo"}},
 		{"args last", []string{"-short", "-args"}},
-		// A non-flag field *before* the managed one. The loop skips
-		// non-flag fields with `continue`; INVERT_LOOP_CTRL turns that
-		// into `break`, which would abandon the scan at "all=-N" and let
-		// -overlay through. Only an ordering like this catches it — the
+		// A non-flag field *before* the managed one, so the scan has to
+		// carry on past it. INVERT_LOOP_CTRL (an early `break` or
+		// `return`) would abandon the loop at "all=-N" and let -overlay
+		// through; only an ordering like this catches that, since the
 		// accept-side `{"-gcflags", "c"}` case ends on the non-flag field.
 		{"managed flag after a non-flag value", []string{"-gcflags", "all=-N", "-overlay=x"}},
 		// -timeout is enforced twice: on the argv and by the context
@@ -565,7 +570,7 @@ func TestCheckTestFlags(t *testing.T) {
 		{"test-prefixed timeout", []string{"-test.timeout=30s"}},
 	}
 	for _, tc := range rejected {
-		t.Run("reject/"+tc.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			err := checkTestFlags(tc.flags)
 			if err == nil {
 				t.Fatalf("checkTestFlags(%v) = nil, want an error", tc.flags)
@@ -575,13 +580,15 @@ func TestCheckTestFlags(t *testing.T) {
 			}
 		})
 	}
+}
 
-	// The message must echo the spelling the user typed. Being told
-	// "-run is managed" after passing `-test.run` reads like the wrong
-	// flag was rejected, and sends the reader looking for a `-run` they
-	// never wrote.
+// TestCheckTestFlagsErrorEchoesSpelling pins the wording: the message must
+// quote the flag as typed. Being told "-run is managed" after passing
+// `-test.run` reads like the wrong flag was rejected, and sends the reader
+// looking for a `-run` they never wrote.
+func TestCheckTestFlagsErrorEchoesSpelling(t *testing.T) {
 	for _, spelled := range []string{"-test.run", "--overlay", "-coverprofile"} {
-		t.Run("spelling/"+spelled, func(t *testing.T) {
+		t.Run(spelled, func(t *testing.T) {
 			err := checkTestFlags([]string{spelled + "=x"})
 			if err == nil {
 				t.Fatalf("checkTestFlags(%q) = nil, want an error", spelled)
@@ -591,11 +598,12 @@ func TestCheckTestFlags(t *testing.T) {
 			}
 		})
 	}
+}
 
-	accepted := []struct {
-		name  string
-		flags []string
-	}{
+// TestCheckTestFlagsAccepts matters as much as the rejections: an
+// over-eager match would block the exact use case --test-flags exists for.
+func TestCheckTestFlagsAccepts(t *testing.T) {
+	accepted := flagCases{
 		{"nil", nil},
 		{"the motivating case", []string{"-rapid.checks=20"}},
 		{"short", []string{"-short"}},
@@ -614,7 +622,7 @@ func TestCheckTestFlags(t *testing.T) {
 		{"name merely starting with test", []string{"-testdata=x", "-testify.m=y"}},
 	}
 	for _, tc := range accepted {
-		t.Run("accept/"+tc.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			if err := checkTestFlags(tc.flags); err != nil {
 				t.Errorf("checkTestFlags(%v) = %v, want nil", tc.flags, err)
 			}
@@ -631,41 +639,42 @@ func TestCheckTestFlags(t *testing.T) {
 // of the efficacy denominator instead of into it. STATEMENT_REMOVE on any
 // assignment here leaves that field zero.
 func TestTimeoutPolicyFor(t *testing.T) {
+	const (
+		global = 42 * time.Second
+		margin = 2.5
+		floor  = 3 * time.Second
+	)
+	// want is the expected policy with only the two derived switches left
+	// to vary; the three pass-through fields are the same every time.
+	// Compared as a whole struct so a STATEMENT_REMOVE on any assignment
+	// in timeoutPolicyFor shows up, without a per-field if apiece.
+	want := func(adaptive, unmeasured bool) runner.TimeoutPolicy {
+		return runner.TimeoutPolicy{
+			Global: global, Margin: margin, Min: floor,
+			Adaptive: adaptive, Unmeasured: unmeasured,
+		}
+	}
 	off := false
 	cases := []struct {
-		name           string
-		cfg            config.Config
-		wantAdaptive   bool
-		wantUnmeasured bool
+		name string
+		cfg  config.Config
+		want runner.TimeoutPolicy
 	}{
-		{"no test flags", config.Config{}, true, false},
-		{"test flags set", config.Config{TestFlags: "-race"}, true, true},
+		{"no test flags", config.Config{}, want(true, false)},
+		{"test flags set", config.Config{TestFlags: "-race"}, want(true, true)},
 		// Whitespace-only is not a flag: the runner appends nothing, so
 		// giving up adaptive sizing here would cost speed for nothing.
-		{"whitespace-only test flags", config.Config{TestFlags: "   "}, true, false},
+		{"whitespace-only test flags", config.Config{TestFlags: "   "}, want(true, false)},
 		// The two switches are independent — a --test-flags run with
 		// adaptive already off must not read as adaptive.
-		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, false, true},
+		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false, true)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.cfg.TimeoutMargin = 2.5
-			tc.cfg.TimeoutMin = 3 * time.Second
-			p := timeoutPolicyFor(&tc.cfg, 42*time.Second)
-			if p.Global != 42*time.Second {
-				t.Errorf("Global = %v, want 42s", p.Global)
-			}
-			if p.Margin != 2.5 {
-				t.Errorf("Margin = %v, want 2.5", p.Margin)
-			}
-			if p.Min != 3*time.Second {
-				t.Errorf("Min = %v, want 3s", p.Min)
-			}
-			if p.Adaptive != tc.wantAdaptive {
-				t.Errorf("Adaptive = %v, want %v", p.Adaptive, tc.wantAdaptive)
-			}
-			if p.Unmeasured != tc.wantUnmeasured {
-				t.Errorf("Unmeasured = %v, want %v (--test-flags = %q)", p.Unmeasured, tc.wantUnmeasured, tc.cfg.TestFlags)
+			tc.cfg.TimeoutMargin = margin
+			tc.cfg.TimeoutMin = floor
+			if got := timeoutPolicyFor(&tc.cfg, global); got != tc.want {
+				t.Errorf("timeoutPolicyFor(--test-flags=%q) = %+v, want %+v", tc.cfg.TestFlags, got, tc.want)
 			}
 		})
 	}
