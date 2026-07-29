@@ -8,7 +8,11 @@ import "log"
 
 type logger struct{}
 
-func (l logger) Debug(v ...any) {}
+func (l logger) Debug(v ...any) {
+	// Intentionally empty: the fixture needs a call site whose selector
+	// renders as `logger.Debug`, not a working logger. A body would only
+	// add mutants that say nothing about --exclude-calls.
+}
 
 // Ratio has the issue's motivating shape: the same arithmetic inside a
 // log.Printf argument list, where no test can assert on it, and in the

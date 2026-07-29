@@ -206,7 +206,7 @@ func TestFilterByCallsSuppressesInsideLoggingCall(t *testing.T) {
 	kept, suppressed := FilterByCalls(fset, res.Mutants, res.Files, mustExcluder(t, "log.Print*"))
 
 	const logLine, rateLine = 6, 7
-	if got := suppressedLines(suppressed)[logLine]; got == 0 {
+	if suppressedLines(suppressed)[logLine] == 0 {
 		t.Fatalf("want mutants suppressed on the log line, got none (of %d suppressed)", len(suppressed))
 	}
 	if got := linesOf(kept)[logLine]; got != 0 {
@@ -214,7 +214,7 @@ func TestFilterByCallsSuppressesInsideLoggingCall(t *testing.T) {
 	}
 	// The neighbouring arithmetic must be untouched — the filter is scoped
 	// to the call, not to logging-adjacent code.
-	if got := linesOf(kept)[rateLine]; got == 0 {
+	if linesOf(kept)[rateLine] == 0 {
 		t.Errorf("want surviving mutants on the non-log line, got none")
 	}
 	if len(kept)+len(suppressed) != len(res.Mutants) {
@@ -281,13 +281,13 @@ func f(a, b int) int {
 	res, fset := discoverFixture(t, src)
 	kept, suppressed := FilterByCalls(fset, res.Mutants, res.Files, mustExcluder(t, "log.Print*"))
 
-	if got := linesOf(kept)[6]; got == 0 {
+	if linesOf(kept)[6] == 0 {
 		t.Error("want the arithmetic above the log call kept, got none")
 	}
 	if got := suppressedLines(suppressed)[6]; got != 0 {
 		t.Errorf("want nothing suppressed above the log call, got %d", got)
 	}
-	if got := suppressedLines(suppressed)[7]; got == 0 {
+	if suppressedLines(suppressed)[7] == 0 {
 		t.Error("want the log statement itself suppressed")
 	}
 }
@@ -372,13 +372,13 @@ func other(v int) {}
 	res, fset := discoverFixture(t, src)
 	kept, suppressed := FilterByCalls(fset, res.Mutants, res.Files, mustExcluder(t, "*.Debug"))
 
-	if got := suppressedLines(suppressed)[11]; got == 0 {
+	if suppressedLines(suppressed)[11] == 0 {
 		t.Error("want the variable-receiver Debug call suppressed")
 	}
-	if got := suppressedLines(suppressed)[12]; got == 0 {
+	if suppressedLines(suppressed)[12] == 0 {
 		t.Error("want the call-result-receiver Debug call suppressed")
 	}
-	if got := linesOf(kept)[13]; got == 0 {
+	if linesOf(kept)[13] == 0 {
 		t.Error("want the non-matching call's arithmetic kept")
 	}
 }
