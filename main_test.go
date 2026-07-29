@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -153,21 +154,24 @@ func TestRunSemanticConfigErrorsExitUsage(t *testing.T) {
 	}
 }
 
+func runCLIExitCodeHelper(t *testing.T, helperEnv string) bool {
+	t.Helper()
+	if os.Getenv(helperEnv) != "1" {
+		return false
+	}
+
+	separator := slices.Index(os.Args, "--")
+	if separator < 0 {
+		t.Fatal("helper invocation missing -- separator")
+	}
+	os.Args = append([]string{"gomutants"}, os.Args[separator+1:]...)
+	main()
+	return true
+}
+
 func TestCLIExitCodes(t *testing.T) {
 	const helperEnv = "GOMUTANTS_TEST_MAIN_HELPER"
-	if os.Getenv(helperEnv) == "1" {
-		separator := -1
-		for i, arg := range os.Args {
-			if arg == "--" {
-				separator = i
-				break
-			}
-		}
-		if separator < 0 {
-			t.Fatal("helper invocation missing -- separator")
-		}
-		os.Args = append([]string{"gomutants"}, os.Args[separator+1:]...)
-		main()
+	if runCLIExitCodeHelper(t, helperEnv) {
 		return
 	}
 
