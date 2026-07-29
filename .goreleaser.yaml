@@ -65,12 +65,11 @@ changelog:
     - title: Documentation
       regexp: "^doc"
       order: 3
+    - title: Dependencies
+      regexp: '^chore(\(deps(-dev)?\))?: bump'
+      order: 4
     - title: Other
       order: 99
-  filters:
-    exclude:
-      - "^test:"
-      - "^chore:"
 
 release:
   draft: true
