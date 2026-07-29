@@ -670,3 +670,191 @@ func TestApplyFlagsDetectEquivalent(t *testing.T) {
 		t.Error("unset flag wrongly overrode the config value")
 	}
 }
+
+// TestDefaultExcludeCallsIsIndependentCopy pins that callers can't grow or
+// rewrite the package-level built-in set through the accessor — every run
+// of a long-lived process must see the same defaults.
+func TestDefaultExcludeCallsIsIndependentCopy(t *testing.T) {
+	first := DefaultExcludeCalls()
+	if len(first) == 0 {
+		t.Fatal("built-in exclude-calls set is empty")
+	}
+	original := slices.Clone(first)
+
+	first[0] = "mutated"
+
+	if second := DefaultExcludeCalls(); !slices.Equal(second, original) {
+		t.Errorf("writing to the returned slice leaked into the built-in set: %v, want %v", second, original)
+	}
+}
+
+// TestDefaultExcludeCallsContents pins the two decisions the default set
+// encodes: stdlib logging is covered out of the box, and the terminating
+// log funcs stay mutable (deleting a log.Fatal IS a behaviour change).
+func TestDefaultExcludeCallsContents(t *testing.T) {
+	got := DefaultExcludeCalls()
+	for _, want := range []string{"log.Print*", "slog.Info*"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("built-in set %v missing %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{"log.Fatal*", "log.Panic*", "*.Info", "*.Error"} {
+		if slices.Contains(got, unwanted) {
+			t.Errorf("built-in set must not contain %q (it is not unkillable-by-nature)", unwanted)
+		}
+	}
+}
+
+// TestExcludeCallsDefaultsEnabled pins the three-state default: nil → true
+// (extend), and the two explicit pointer states. Kills the nil-guard
+// CONDITIONALS_NEGATION / BRANCH_IF in ExcludeCallsDefaultsEnabled.
+func TestExcludeCallsDefaultsEnabled(t *testing.T) {
+	if !(&Config{}).ExcludeCallsDefaultsEnabled() {
+		t.Error("nil ExcludeCallsDefaults should be true (extend by default)")
+	}
+	tr, fa := true, false
+	if !(&Config{ExcludeCallsDefaults: &tr}).ExcludeCallsDefaultsEnabled() {
+		t.Error("true pointer should report enabled")
+	}
+	if (&Config{ExcludeCallsDefaults: &fa}).ExcludeCallsDefaultsEnabled() {
+		t.Error("false pointer should report disabled")
+	}
+}
+
+func TestResolvedExcludeCallsExtendsDefaults(t *testing.T) {
+	cfg := Config{ExcludeCalls: []string{"*.Debug", "mylog.*"}}
+	got := cfg.ResolvedExcludeCalls()
+
+	want := append(DefaultExcludeCalls(), "*.Debug", "mylog.*")
+	if !slices.Equal(got, want) {
+		t.Errorf("ResolvedExcludeCalls() = %v, want %v (built-ins first, then user entries)", got, want)
+	}
+}
+
+func TestResolvedExcludeCallsReplacesWhenDefaultsOff(t *testing.T) {
+	off := false
+	cfg := Config{ExcludeCalls: []string{"mylog.*"}, ExcludeCallsDefaults: &off}
+	got := cfg.ResolvedExcludeCalls()
+
+	if !slices.Equal(got, []string{"mylog.*"}) {
+		t.Errorf("ResolvedExcludeCalls() = %v, want only the user entries", got)
+	}
+}
+
+func TestResolvedExcludeCallsEmptyCases(t *testing.T) {
+	// No user entries: the built-ins alone, so a project with no config
+	// still gets stdlib logging covered.
+	if got := (&Config{}).ResolvedExcludeCalls(); !slices.Equal(got, DefaultExcludeCalls()) {
+		t.Errorf("empty config resolved to %v, want the built-in set", got)
+	}
+	// Built-ins off with no user entries: nothing at all, which the
+	// discover layer turns into a no-op excluder.
+	off := false
+	if got := (&Config{ExcludeCallsDefaults: &off}).ResolvedExcludeCalls(); len(got) != 0 {
+		t.Errorf("defaults off with no user entries resolved to %v, want empty", got)
+	}
+}
+
+// TestResolvedExcludeCallsDoesNotAliasConfig guards the append: resolving
+// twice must not let the first result's spare capacity be overwritten by
+// the second, and must not write through to the config's own slice.
+func TestResolvedExcludeCallsDoesNotAliasConfig(t *testing.T) {
+	cfg := Config{ExcludeCalls: []string{"mylog.*"}}
+	first := cfg.ResolvedExcludeCalls()
+	firstCopy := slices.Clone(first)
+
+	second := cfg.ResolvedExcludeCalls()
+	second[len(second)-1] = "rewritten"
+
+	if !slices.Equal(first, firstCopy) {
+		t.Errorf("second resolve mutated the first result: %v, want %v", first, firstCopy)
+	}
+	if cfg.ExcludeCalls[0] != "mylog.*" {
+		t.Errorf("resolve wrote through to Config.ExcludeCalls: %v", cfg.ExcludeCalls)
+	}
+}
+
+func TestLoadExcludeCalls(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".gomutants.yml")
+	yaml := `exclude-calls:
+  - "*.Debug"
+  - "zap.*"
+exclude-calls-defaults: false
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !slices.Equal(cfg.ExcludeCalls, []string{"*.Debug", "zap.*"}) {
+		t.Errorf("ExcludeCalls=%v, want [*.Debug zap.*]", cfg.ExcludeCalls)
+	}
+	if cfg.ExcludeCallsDefaults == nil {
+		t.Fatal("exclude-calls-defaults: false must unmarshal to a non-nil pointer")
+	}
+	if cfg.ExcludeCallsDefaultsEnabled() {
+		t.Error("exclude-calls-defaults: false must disable the built-ins")
+	}
+	if !slices.Equal(cfg.ResolvedExcludeCalls(), []string{"*.Debug", "zap.*"}) {
+		t.Errorf("ResolvedExcludeCalls()=%v, want the user list alone", cfg.ResolvedExcludeCalls())
+	}
+}
+
+// TestLoadWithoutExcludeCallsKeepsDefaults pins that an existing config
+// file with no exclude-calls keys still gets the built-in set.
+func TestLoadWithoutExcludeCallsKeepsDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(path, []byte("workers: 4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ExcludeCalls != nil {
+		t.Errorf("ExcludeCalls=%v, want nil", cfg.ExcludeCalls)
+	}
+	if !slices.Equal(cfg.ResolvedExcludeCalls(), DefaultExcludeCalls()) {
+		t.Errorf("ResolvedExcludeCalls()=%v, want the built-in set", cfg.ResolvedExcludeCalls())
+	}
+}
+
+func TestApplyFlagsExcludeCalls(t *testing.T) {
+	// CLI replaces the YAML list (like --exclude-files) and is split and
+	// trimmed on commas.
+	cfg := Config{ExcludeCalls: []string{"fromyaml.*"}}
+	cfg.ApplyFlags(Flags{ExcludeCalls: "log.Print* , *.Debug"})
+	if !slices.Equal(cfg.ExcludeCalls, []string{"log.Print*", "*.Debug"}) {
+		t.Errorf("ExcludeCalls=%v, want [log.Print* *.Debug]", cfg.ExcludeCalls)
+	}
+
+	// An unset flag leaves the YAML list intact.
+	cfg2 := Config{ExcludeCalls: []string{"fromyaml.*"}}
+	cfg2.ApplyFlags(Flags{})
+	if !slices.Equal(cfg2.ExcludeCalls, []string{"fromyaml.*"}) {
+		t.Errorf("ExcludeCalls=%v, want the YAML value untouched", cfg2.ExcludeCalls)
+	}
+}
+
+// TestApplyFlagsExcludeCallsDefaults pins the three-state merge: a Set
+// flag overrides, an unset flag leaves the YAML-loaded value intact.
+func TestApplyFlagsExcludeCallsDefaults(t *testing.T) {
+	cfg := Default()
+	cfg.ApplyFlags(Flags{ExcludeCallsDefaults: ExcludeCallsDefaultsFlag{Set: true, Value: false}})
+	if cfg.ExcludeCallsDefaultsEnabled() {
+		t.Error("Set=true,Value=false not merged into config")
+	}
+
+	no := false
+	cfg2 := Config{ExcludeCallsDefaults: &no}
+	cfg2.ApplyFlags(Flags{ExcludeCallsDefaults: ExcludeCallsDefaultsFlag{Set: false, Value: true}})
+	if cfg2.ExcludeCallsDefaultsEnabled() {
+		t.Error("unset flag wrongly overrode the config value")
+	}
+}

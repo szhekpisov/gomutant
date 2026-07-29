@@ -308,3 +308,35 @@ func TestGenerateCountsMutantsEquivalent(t *testing.T) {
 		t.Errorf("TestEfficacy=%v, want 100 (1 killed / (1 killed + 0 lived))", r.TestEfficacy)
 	}
 }
+
+// TestReportMutantsSuppressedByCallsSerialization pins the breakdown
+// field: present when the caller sets it, omitted otherwise so a run
+// without --exclude-calls suppressions keeps producing the exact JSON
+// gremlins consumers already parse.
+func TestReportMutantsSuppressedByCallsSerialization(t *testing.T) {
+	mutants := []mutator.Mutant{
+		{ID: 1, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 1, Col: 1, Status: mutator.StatusKilled},
+	}
+
+	r := Generate(mutants, "mod", time.Second, 5)
+	r.MutantsSuppressedByCalls = 2
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"mutants_suppressed_by_calls":2`) {
+		t.Errorf("expected mutants_suppressed_by_calls:2 in JSON, got: %s", data)
+	}
+	if !strings.Contains(string(data), `"mutants_suppressed":5`) {
+		t.Errorf("the breakdown must not replace the shared bucket, got: %s", data)
+	}
+
+	plain := Generate(mutants, "mod", time.Second, 5)
+	data, err = json.Marshal(plain)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), "mutants_suppressed_by_calls") {
+		t.Errorf("mutants_suppressed_by_calls should be omitted when 0, got: %s", data)
+	}
+}

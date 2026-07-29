@@ -60,8 +60,21 @@ type Config struct {
 	// entirely, producing no mutants. Test files are never mutated and so
 	// are unaffected.
 	ExcludeFiles []string `yaml:"exclude-files"`
-	ChangedSince string   `yaml:"changed-since"`
-	Cache        string   `yaml:"cache"`
+	// ExcludeCalls holds selector globs (`log.Print*`, `*.Debug`) matched
+	// against the rendered selector of every call. Mutants inside a
+	// matching call are suppressed — the Go analogue of PITest's
+	// avoidCallsTo, for operators inside logging and telemetry arguments
+	// that no test can reasonably assert on. Extends
+	// DefaultExcludeCalls unless ExcludeCallsDefaults says otherwise;
+	// read the merged list through ResolvedExcludeCalls.
+	ExcludeCalls []string `yaml:"exclude-calls"`
+	// ExcludeCallsDefaults controls whether the built-in stdlib-logging
+	// set is in effect. Pointer for the same three-state reason as
+	// AdaptiveTimeout; when unset the default is true (extend). Set it
+	// false to narrow or fully replace the built-ins.
+	ExcludeCallsDefaults *bool  `yaml:"exclude-calls-defaults"`
+	ChangedSince         string `yaml:"changed-since"`
+	Cache                string `yaml:"cache"`
 	// CheckpointInterval is how often completed mutant outcomes are
 	// flushed to the cache file mid-run, so a hard kill (OOM, CI timeout,
 	// SIGKILL) loses at most this much progress. 0 disables periodic
@@ -113,6 +126,62 @@ func (c *Config) DetectEquivalentEnabled() bool {
 		return false
 	}
 	return *c.DetectEquivalent
+}
+
+// defaultExcludeCalls is the built-in call-exclusion set: Go's standard
+// library logging, and nothing else. Deliberately conservative, since it
+// applies to every project with no opt-in.
+//
+// Three families are left out on purpose:
+//   - log.Fatal*/log.Panic* — they exit or panic, so deleting one is a
+//     real behavioural change a test can and should catch. Keeping them
+//     mutable is what makes suppressing a whole call expression (rather
+//     than only its argument list) safe.
+//   - slog.New/SetDefault/With — logger construction and configuration,
+//     not emission.
+//   - Method-shaped globs like `*.Info` or `*.Error` — they would reach
+//     err.Error() and any domain method that shares a name. A project
+//     wanting them for its own logger adds them itself.
+//
+// Attribute constructors (slog.String, slog.Int, …) need no entry: they
+// appear as arguments to a matching call, and so already sit inside its
+// suppressed span.
+var defaultExcludeCalls = []string{
+	"log.Print*",
+	"log.Output",
+	"slog.Debug*",
+	"slog.Info*",
+	"slog.Warn*",
+	"slog.Error*",
+	"slog.Log*",
+}
+
+// DefaultExcludeCalls returns a copy of the built-in call-exclusion set,
+// so a caller appending to it can't grow the package-level slice.
+func DefaultExcludeCalls() []string {
+	return slices.Clone(defaultExcludeCalls)
+}
+
+// ExcludeCallsDefaultsEnabled reports whether the built-in stdlib-logging
+// set is in effect. The pointer field allows three states; when unset the
+// default is true — the user list extends the built-ins rather than
+// replacing them.
+func (c *Config) ExcludeCallsDefaultsEnabled() bool {
+	if c.ExcludeCallsDefaults == nil {
+		return true
+	}
+	return *c.ExcludeCallsDefaults
+}
+
+// ResolvedExcludeCalls is the call-exclusion list actually applied: the
+// built-in set followed by the user's entries, or the user's entries
+// alone when the built-ins are switched off. Centralized here so the CLI
+// and any other caller can't disagree about what "extend" means.
+func (c *Config) ResolvedExcludeCalls() []string {
+	if !c.ExcludeCallsDefaultsEnabled() {
+		return slices.Clone(c.ExcludeCalls)
+	}
+	return append(DefaultExcludeCalls(), c.ExcludeCalls...)
 }
 
 // TestFlagFields splits TestFlags into the argv fragments appended to each
@@ -275,6 +344,14 @@ type DetectEquivalentFlag struct {
 	Value bool
 }
 
+// ExcludeCallsDefaultsFlag captures the `--exclude-calls-defaults` CLI
+// flag value. Like AdaptiveTimeoutFlag, the Set bit lets ApplyFlags tell
+// "not provided" from an explicit `--exclude-calls-defaults=false`.
+type ExcludeCallsDefaultsFlag struct {
+	Set   bool
+	Value bool
+}
+
 // CheckpointIntervalFlag captures the `--checkpoint-interval` CLI flag
 // value. Like AdaptiveTimeoutFlag, it carries a Set bit so ApplyFlags can
 // tell "not provided" from an explicit `--checkpoint-interval=0`; a plain
@@ -304,12 +381,17 @@ type Flags struct {
 	Disable            string
 	Only               string
 	ExcludeFiles       string
+	ExcludeCalls       string
 	ChangedSince       string
 	Cache              string
 	DryRun             bool
 	Verbose            bool
 	Quiet              bool
 	Integration        bool
+	// ExcludeCallsDefaults is three-state (see the type), not a plain
+	// bool: unlike the toggles above, its default is on, so "not provided"
+	// has to stay distinguishable from an explicit =false.
+	ExcludeCallsDefaults ExcludeCallsDefaultsFlag
 }
 
 // ApplyFlags merges CLI-provided flag values into c, with CLI winning
@@ -369,6 +451,12 @@ func (c *Config) applyStringFlags(f Flags) {
 	if f.ExcludeFiles != "" {
 		c.ExcludeFiles = splitAndTrim(f.ExcludeFiles)
 	}
+	// Replaces the YAML list, like --exclude-files. The built-in defaults
+	// are a separate layer and still extend the result; turn them off with
+	// --exclude-calls-defaults=false.
+	if f.ExcludeCalls != "" {
+		c.ExcludeCalls = splitAndTrim(f.ExcludeCalls)
+	}
 	if f.ChangedSince != "" {
 		c.ChangedSince = f.ChangedSince
 	}
@@ -393,6 +481,10 @@ func (c *Config) applyToggleFlags(f Flags) {
 	if f.DetectEquivalent.Set {
 		v := f.DetectEquivalent.Value
 		c.DetectEquivalent = &v
+	}
+	if f.ExcludeCallsDefaults.Set {
+		v := f.ExcludeCallsDefaults.Value
+		c.ExcludeCallsDefaults = &v
 	}
 }
 

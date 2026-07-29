@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1749,4 +1750,202 @@ func setupTinyProject(t *testing.T) string {
 		}
 	}
 	return dir
+}
+
+// writeLoggingModule creates a module whose only interesting arithmetic
+// appears twice: once inside a log.Printf call, once outside it. Every
+// --exclude-calls test below turns on the same distinction — what the
+// filter drops versus what it must leave alone.
+func writeLoggingModule(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n",
+		"ratio.go": "package testmod\n\nimport \"log\"\n\n" +
+			"func Ratio(done, total int) int {\n" +
+			"\tlog.Printf(\"progress %d%%\", done*100/total)\n" +
+			"\treturn done * 100 / total\n}\n",
+		"ratio_test.go": "package testmod\n\nimport \"testing\"\n\n" +
+			"func TestRatio(t *testing.T) {\n\tif Ratio(1, 2) != 50 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestRunExcludeCallsDefaultsSuppressLogArithmetic pins the out-of-the-box
+// behaviour the feature exists for: with no configuration at all, mutants
+// inside a stdlib logging call are gone, and the identical arithmetic one
+// line below is untouched.
+func TestRunExcludeCallsDefaultsSuppressLogArithmetic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := writeLoggingModule(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--dry-run", "-w", "1", "testmod"})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if strings.Contains(out, "ratio.go:6:") {
+		t.Errorf("mutants inside the log.Printf call should be suppressed by default; got:\n%s", out)
+	}
+	if !strings.Contains(out, "ratio.go:7:") {
+		t.Errorf("arithmetic outside the log call must survive; got:\n%s", out)
+	}
+}
+
+// TestRunExcludeCallsDefaultsOff pins the escape hatch: with the built-in
+// set switched off and no user list, nothing is suppressed.
+func TestRunExcludeCallsDefaultsOff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := writeLoggingModule(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--dry-run", "--exclude-calls-defaults=false", "-w", "1", "testmod"})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "ratio.go:6:") {
+		t.Errorf("--exclude-calls-defaults=false must leave log-call mutants in place; got:\n%s", out)
+	}
+}
+
+// TestRunExcludeCallsFlagExtendsDefaults pins that a CLI list adds to the
+// built-ins rather than replacing them: the user pattern reaches a call
+// the defaults don't cover, and log.Printf stays covered.
+func TestRunExcludeCallsFlagExtendsDefaults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n",
+		"ratio.go": "package testmod\n\nimport \"log\"\n\n" +
+			"func metric(name string, v int) {}\n\n" +
+			"func Ratio(done, total int) int {\n" +
+			"\tlog.Printf(\"progress %d%%\", done*100/total)\n" +
+			"\tmetric(\"ratio\", done*100/total)\n" +
+			"\treturn done * 100 / total\n}\n",
+		"ratio_test.go": "package testmod\n\nimport \"testing\"\n\n" +
+			"func TestRatio(t *testing.T) {\n\tif Ratio(1, 2) != 50 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--dry-run", "--exclude-calls", "metric", "-w", "1", "testmod"})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if strings.Contains(out, "ratio.go:8:") {
+		t.Errorf("the built-in log.Print* entry must still apply alongside a user list; got:\n%s", out)
+	}
+	if strings.Contains(out, "ratio.go:9:") {
+		t.Errorf("the user's metric pattern should suppress its call; got:\n%s", out)
+	}
+	if !strings.Contains(out, "ratio.go:10:") {
+		t.Errorf("arithmetic outside any excluded call must survive; got:\n%s", out)
+	}
+}
+
+// TestRunRejectsMatchAllExcludeCalls pins the fail-fast: a pattern that
+// would suppress everything is rejected before any go test runs, and the
+// message names the flag.
+func TestRunRejectsMatchAllExcludeCalls(t *testing.T) {
+	dir := writeLoggingModule(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	err := run(context.Background(), []string{"--exclude-calls", "*", "testmod"})
+	if err == nil {
+		t.Fatal("expected an error for a match-everything pattern")
+	}
+	if !strings.Contains(err.Error(), "--exclude-calls") {
+		t.Errorf("error should name the flag, got: %v", err)
+	}
+}
+
+// TestRunExcludeCallsReportsBreakdown pins the reporting contract end to
+// end: call-suppressed mutants land in the shared mutants_suppressed
+// bucket, are broken out under mutants_suppressed_by_calls, and are
+// labelled by source on the summary line.
+func TestRunExcludeCallsReportsBreakdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := writeLoggingModule(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	outPath := filepath.Join(dir, "report.json")
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{
+			"--only", "ARITHMETIC_BASE", "-w", "1", "-o", outPath, "testmod",
+		})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "Suppressed:   2  (exclude-calls)") {
+		t.Errorf("summary should attribute the suppressions to exclude-calls; got:\n%s", out)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	var r struct {
+		MutantsTotal             int `json:"mutants_total"`
+		MutantsSuppressed        int `json:"mutants_suppressed"`
+		MutantsSuppressedByCalls int `json:"mutants_suppressed_by_calls"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("parsing report: %v", err)
+	}
+	if r.MutantsSuppressed != 2 {
+		t.Errorf("mutants_suppressed=%d, want 2", r.MutantsSuppressed)
+	}
+	if r.MutantsSuppressedByCalls != 2 {
+		t.Errorf("mutants_suppressed_by_calls=%d, want 2", r.MutantsSuppressedByCalls)
+	}
+	if r.MutantsTotal != 2 {
+		t.Errorf("mutants_total=%d, want 2 (suppressed mutants leave every other count)", r.MutantsTotal)
+	}
+}
+
+// TestRunRejectsInvalidExcludeCallsDefaults pins the BoolFunc parse path:
+// a non-boolean value must fail with the flag named, not be silently
+// treated as "off".
+func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
+	err := run(context.Background(), []string{"--exclude-calls-defaults=maybe"})
+	if err == nil {
+		t.Fatal("expected error for a non-boolean --exclude-calls-defaults")
+	}
+	if !strings.Contains(err.Error(), "exclude-calls-defaults") {
+		t.Errorf("error should name the flag, got: %v", err)
+	}
 }

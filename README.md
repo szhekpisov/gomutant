@@ -37,6 +37,7 @@
   - [Exit Codes & CI Integration](#exit-codes--ci-integration)
   - [Claude Code Plugin](#claude-code-plugin)
   - [Inline Ignore Directives](#inline-ignore-directives)
+  - [Call-Site Exclusion](#call-site-exclusion)
   - [Configuration File](#configuration-file)
   - [Mutators](#mutators)
   - [All Flags](#all-flags)
@@ -247,6 +248,7 @@ gomutants --threshold-efficacy 80 ./...
 - **Equivalent-mutant detection (opt-in)** — `--detect-equivalent` recompiles each survivor with `-gcflags=-S` and reclassifies it as `EQUIVALENT` when the generated assembly matches the original (Trivial Compiler Equivalence). Such mutants can't be killed by any test, so they drop out of the efficacy denominator instead of failing the gate. Sound: a killable mutant is never marked equivalent.
 - **Cross-package routing (opt-in)** — `--integration` extends per-test routing across package boundaries so a mutant is killed by a covering test in *any* importing package (cross-package/E2E tests), not just its own. See [Cross-Package Mode](#cross-package-mode).
 - **Inline ignore directives** — `// gomutants:disable*` comments suppress specific mutants by line, function, or regex.
+- **Call-site exclusion** — `--exclude-calls` drops mutants inside calls matching a selector glob, so operators in logging arguments stop counting as test gaps. Covers Go's standard-library logging out of the box; the Go analogue of PITest's `avoidCallsTo`. See [Call-Site Exclusion](#call-site-exclusion).
 - **GitHub Action** — surfaces surviving mutants as inline annotations on the PR diff.
 - **Claude Code plugin** — `/gomutants:mutants` slash command runs gomutants on changed code and proposes concrete `*_test.go` cases that would kill each surviving mutant.
 
@@ -368,6 +370,8 @@ The plugin assumes `gomutants` is on `PATH` (`go install github.com/szhekpisov/g
 
 Annotate Go source with `// gomutants:disable*` comments to silence specific mutants. Suppressed mutants are dropped from the run entirely — they don't appear in any status bucket and don't affect `test_efficacy` or `mutations_coverage`. The aggregate count surfaces as `mutants_suppressed` in the JSON report and on the terminal summary.
 
+For a project-wide policy rather than a per-site annotation — "never mutate inside logging calls" — see [Call-Site Exclusion](#call-site-exclusion).
+
 Four forms:
 
 ```go
@@ -410,6 +414,66 @@ QUOTED     = any Go-quoted string ("...", `...`, or 'c') with standard escape ha
 
 </details>
 
+### Call-Site Exclusion
+
+Some mutants are real code changes that no reasonable test can catch. The canonical case is arithmetic inside a logging argument:
+
+```go
+log.Printf("imported %d/%d rows (%.1f%%)", done, total, float64(done)/float64(total)*100)
+```
+
+Every operator there gets an `ARITHMETIC_BASE` mutant. No test asserts the log text, so they LIVE forever, dragging `test_efficacy` down and failing gates for code whose only observable effect is a log line. They aren't equivalent either — the emitted text genuinely differs — so `--detect-equivalent` correctly leaves them in the denominator.
+
+`--exclude-calls` closes the gap between file-level exclusion and per-line directives: mutants inside a matching call are dropped before any test runs, and counted in `mutants_suppressed`.
+
+**This is on by default for Go's standard-library logging** — no setup needed for the common case:
+
+```
+log.Print*   log.Output
+slog.Debug*  slog.Info*  slog.Warn*  slog.Error*  slog.Log*
+```
+
+Add your own logger or telemetry wrappers; your list *extends* the built-ins:
+
+```yaml
+# .gomutants.yml
+exclude-calls:
+  - "*.Debug"          # any receiver's Debug method
+  - "metrics.*"        # a whole package
+  - "tracer.Record"    # one exact call
+```
+
+```bash
+gomutants --exclude-calls 'log.Print*,*.Debug' ./...
+
+# Narrow or replace the built-ins instead of extending them:
+gomutants --exclude-calls 'mylog.*' --exclude-calls-defaults=false ./...
+```
+
+Patterns are **globs, not regexps** — every character is literal except `*`, which matches any run of characters. Matching is anchored, so `log.Print` matches only `log.Print`, and `log.Print*` is what also catches `log.Printf` / `log.Println`.
+
+<details>
+<summary>What a pattern is matched against, and what gets suppressed</summary>
+
+The pattern is matched against the call's selector as written in the source:
+
+| Call | Selector | Matched by |
+|------|----------|------------|
+| `log.Printf(…)` | `log.Printf` | `log.Print*`, `log.*` |
+| `logger.Debug(…)` | `logger.Debug` | `*.Debug` |
+| `s.log.Errorf(…)` | `s.log.Errorf` | `*.Errorf` |
+| `getLogger().Info(…)` | `_.Info` | `*.Info` (the receiver has no name to match) |
+| `println(…)` | `println` | `println` |
+
+- **The whole call expression is suppressed, not just the argument list.** That includes `STATEMENT_REMOVE` of a bare `log.Printf(...)` statement — deleting a log line is as unkillable as mutating what it prints — and anything nested inside the arguments.
+- **`log.Fatal*` and `log.Panic*` are deliberately not in the default set.** They exit or panic, so deleting one is a real behavioural change your tests can and should catch. Same for `slog.New` / `slog.SetDefault` / `slog.With`, which configure rather than emit.
+- **Method-shaped patterns like `*.Info` are not defaults either** — they would reach `err.Error()` and any domain method sharing the name. Opt in per project.
+- **Matching is syntactic, with no type resolution.** An aliased import (`import stdlog "log"`) renders under its alias, so add `stdlog.*` if you use one. A local variable named `log` would also match `log.*`.
+- Suppressed mutants leave every count and both denominators, exactly like directive-suppressed ones. The terminal summary and `mutants_suppressed_by_calls` in the JSON report break out how many came from here rather than from `// gomutants:disable*`.
+- A pattern of only asterisks is rejected: it would suppress nearly every mutant in the module, which is never intended and would otherwise pass silently.
+
+</details>
+
 ### Configuration File
 
 `.gomutants.yml` in the project root:
@@ -431,6 +495,8 @@ cache: ""               # path to incremental-analysis cache; "" = .gomutants-ca
 checkpoint-interval: 10s # how often to flush the cache mid-run; 0s disables (final flush still runs)
 disable: []
 only: []
+exclude-calls: []            # selector globs; extends the built-in stdlib-logging set
+exclude-calls-defaults: true # false = drop the built-ins and use only the list above
 ```
 
 Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.example`](.gomutants.yml.example) for a complete reference.
@@ -500,6 +566,8 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `--disable` | | | Comma-separated mutator types to disable |
 | `--only` | | | Comma-separated mutator types to run (disables all others) |
 | `--exclude-files` | | | Comma-separated regexps; skip mutating production files whose module-relative path matches any. Unanchored (e.g. `vendor/` hits anywhere). Excluded files produce no mutants and are never parsed. |
+| `--exclude-calls` | | | Comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. `log.Print*,*.Debug`). Anchored; `*` is the only metacharacter. Extends the built-in stdlib-logging set. Suppressed mutants are dropped before any test runs. See [Call-Site Exclusion](#call-site-exclusion). |
+| `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
 | `--changed-since` | | | Only test mutants on lines changed vs git ref (e.g. `main`, `HEAD~1`); requires a git repo |
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
@@ -541,6 +609,9 @@ gomutants --disable BRANCH_IF,BRANCH_ELSE ./...
 
 # Skip generated code and vendored deps.
 gomutants --exclude-files 'vendor/,_gen\.go$' ./...
+
+# Teach it about your own logger on top of the built-in stdlib set.
+gomutants --exclude-calls '*.Debug,*.Infof' ./...
 
 # Tune for memory-tight runners.
 gomutants --workers=2 ./...
@@ -655,7 +726,7 @@ Compatible with the gremlins JSON format:
 }
 ```
 
-`mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives and is excluded from every other count.
+`mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 
 `mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
 

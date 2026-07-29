@@ -16,30 +16,36 @@ import (
 // ignored by gremlins consumers). MutantsCached counts mutants whose
 // status was sourced from the incremental-analysis cache.
 // MutantsSuppressed counts mutants dropped by `// gomutants:disable*`
-// directives — these don't appear in Files[].Mutations and are excluded
-// from MutantsTotal and from the TestEfficacy and MutationsCoverage
-// denominators.
+// directives or by --exclude-calls — these don't appear in
+// Files[].Mutations and are excluded from MutantsTotal and from the
+// TestEfficacy and MutationsCoverage denominators.
+// MutantsSuppressedByCalls breaks out the --exclude-calls share of that
+// total.
 // MutantsEquivalent counts surviving mutants proven equivalent to the
 // original by Trivial Compiler Equivalence (--detect-equivalent). They
 // stay in MutantsTotal but count as neither KILLED nor LIVED, so they
 // drop out of the TestEfficacy denominator — an equivalent mutant is not
 // a test gap.
 type Report struct {
-	GoModule          string         `json:"go_module"`
-	Files             []FileReport   `json:"files"`
-	TestEfficacy      float64        `json:"test_efficacy"`
-	MutationsCoverage float64        `json:"mutations_coverage"`
-	MutantsTotal      int            `json:"mutants_total"`
-	MutantsKilled     int            `json:"mutants_killed"`
-	MutantsLived      int            `json:"mutants_lived"`
-	MutantsNotViable  int            `json:"mutants_not_viable"`
-	MutantsNotCovered int            `json:"mutants_not_covered"`
-	MutantsTimedOut   int            `json:"mutants_timed_out,omitempty"`
-	MutantsCached     int            `json:"mutants_cached,omitempty"`
-	MutantsSuppressed int            `json:"mutants_suppressed,omitempty"`
-	MutantsEquivalent int            `json:"mutants_equivalent,omitempty"`
-	ElapsedTime       float64        `json:"elapsed_time"`
-	MutatorStatistics map[string]int `json:"mutator_statistics"`
+	GoModule          string       `json:"go_module"`
+	Files             []FileReport `json:"files"`
+	TestEfficacy      float64      `json:"test_efficacy"`
+	MutationsCoverage float64      `json:"mutations_coverage"`
+	MutantsTotal      int          `json:"mutants_total"`
+	MutantsKilled     int          `json:"mutants_killed"`
+	MutantsLived      int          `json:"mutants_lived"`
+	MutantsNotViable  int          `json:"mutants_not_viable"`
+	MutantsNotCovered int          `json:"mutants_not_covered"`
+	MutantsTimedOut   int          `json:"mutants_timed_out,omitempty"`
+	MutantsCached     int          `json:"mutants_cached,omitempty"`
+	MutantsSuppressed int          `json:"mutants_suppressed,omitempty"`
+	// MutantsSuppressedByCalls is the --exclude-calls share of
+	// MutantsSuppressed, not an additional bucket. Set by the caller after
+	// Generate, since only it knows the split.
+	MutantsSuppressedByCalls int            `json:"mutants_suppressed_by_calls,omitempty"`
+	MutantsEquivalent        int            `json:"mutants_equivalent,omitempty"`
+	ElapsedTime              float64        `json:"elapsed_time"`
+	MutatorStatistics        map[string]int `json:"mutator_statistics"`
 }
 
 // FileReport groups mutations by file.
@@ -59,9 +65,10 @@ type MutationReport struct {
 }
 
 // Generate builds a Report from the list of mutants. suppressedCount
-// is the number of mutants dropped by `// gomutants:disable*` directives
-// before this point — they are not in `mutants` and contribute to no
-// count except `MutantsSuppressed`.
+// is the number of mutants dropped before this point by
+// `// gomutants:disable*` directives or by --exclude-calls — they are not
+// in `mutants` and contribute to no count except `MutantsSuppressed`.
+// Callers that know the split set MutantsSuppressedByCalls afterwards.
 func Generate(mutants []mutator.Mutant, goModule string, elapsed time.Duration, suppressedCount int) *Report {
 	r := &Report{
 		GoModule:          goModule,
