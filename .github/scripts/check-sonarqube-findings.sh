@@ -57,7 +57,7 @@ for ((attempt = 1; attempt <= SONAR_MAX_ATTEMPTS; attempt++)); do
 done
 
 if [[ "${analysis_sha}" != "${HEAD_SHA}" ]]; then
-  echo "::error title=SonarQube analysis missing::SonarQube did not analyze the current PR head ${HEAD_SHA}"
+  echo "::error title=SonarQube analysis missing::SonarQube did not analyze the current PR head ${HEAD_SHA}" >&2
   exit 1
 fi
 
@@ -80,7 +80,7 @@ finding_count="$(jq -er '.total | numbers' <<<"${issues}")"
 details_url="https://sonarcloud.io/project/issues?id=${SONAR_PROJECT_KEY}&pullRequest=${PULL_REQUEST_NUMBER}&issueStatuses=OPEN%2CCONFIRMED&sinceLeakPeriod=true"
 
 if ((finding_count > 0)); then
-  echo "::error title=SonarQube findings::SonarQube reported ${finding_count} new open finding(s): ${details_url}"
+  echo "::error title=SonarQube findings::SonarQube reported ${finding_count} new open finding(s): ${details_url}" >&2
   exit 1
 fi
 
