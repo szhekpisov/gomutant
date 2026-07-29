@@ -230,26 +230,30 @@ func run(ctx context.Context, args []string) error {
 		adaptiveTimeout    config.AdaptiveTimeoutFlag
 		detectEquivalent   config.DetectEquivalentFlag
 		checkpointInterval config.CheckpointIntervalFlag
-		coverPkg           string
-		tags               string
-		testFlags          []string
-		output             string
-		configPath         string
-		disable            string
-		only               string
-		excludeFiles       string
-		changedSince       string
-		cachePath          string
-		annotations        string
-		strykerOutput      string
-		htmlOutput         string
-		thresholdEfficacy  float64
-		thresholdMcover    float64
-		dryRun             bool
-		verbose            bool
-		quiet              bool
-		integration        bool
-		showVersion        bool
+
+		excludeCallsDefaults config.ExcludeCallsDefaultsFlag
+
+		coverPkg          string
+		tags              string
+		testFlags         []string
+		output            string
+		configPath        string
+		disable           string
+		only              string
+		excludeFiles      string
+		excludeCalls      string
+		changedSince      string
+		cachePath         string
+		annotations       string
+		strykerOutput     string
+		htmlOutput        string
+		thresholdEfficacy float64
+		thresholdMcover   float64
+		dryRun            bool
+		verbose           bool
+		quiet             bool
+		integration       bool
+		showVersion       bool
 	)
 
 	fs.IntVar(&workers, "workers", 0, "parallel workers (default: NumCPU)")
@@ -313,6 +317,18 @@ func run(ctx context.Context, args []string) error {
 	fs.StringVar(&disable, "disable", "", "comma-separated mutator types to disable")
 	fs.StringVar(&only, "only", "", "comma-separated mutator types to run (disables all others)")
 	fs.StringVar(&excludeFiles, "exclude-files", "", "comma-separated regexps; skip mutating production files whose module-relative path matches any (e.g. \"vendor/,_gen\\\\.go$\")")
+	fs.StringVar(&excludeCalls, "exclude-calls", "", "comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. \"log.Print*,*.Debug\"). Extends the built-in stdlib-logging set")
+	// BoolFunc (like --adaptive-timeout) so ApplyFlags can tell "not
+	// provided" from an explicit value via the .Set bit — this default is
+	// on, so the explicit =false has to be distinguishable.
+	fs.BoolFunc("exclude-calls-defaults", "apply the built-in --exclude-calls set for Go's standard-library logging (default: true; pass =false to narrow or replace it)", func(s string) error {
+		v, err := strconv.ParseBool(s)
+		if err != nil {
+			return fmt.Errorf("--exclude-calls-defaults: %w", err)
+		}
+		excludeCallsDefaults = config.ExcludeCallsDefaultsFlag{Set: true, Value: v}
+		return nil
+	})
 	fs.StringVar(&changedSince, "changed-since", "", "only test mutants on lines changed vs git ref (e.g. main, HEAD~1)")
 	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source and tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
 	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
@@ -371,12 +387,15 @@ func run(ctx context.Context, args []string) error {
 		Disable:            disable,
 		Only:               only,
 		ExcludeFiles:       excludeFiles,
+		ExcludeCalls:       excludeCalls,
 		ChangedSince:       changedSince,
 		Cache:              cachePath,
 		DryRun:             dryRun,
 		Verbose:            verbose,
 		Quiet:              quiet,
 		Integration:        integration,
+
+		ExcludeCallsDefaults: excludeCallsDefaults,
 	})
 	cfg.ResolveCache()
 
@@ -469,6 +488,13 @@ func run(ctx context.Context, args []string) error {
 	excluder, err := discover.NewExcluder(cfg.ExcludeFiles)
 	if err != nil {
 		return fmt.Errorf("--exclude-files: %w", err)
+	}
+	// Compiled here, next to --exclude-files, rather than at its use site
+	// after discovery: a bad pattern must fail before the baseline and
+	// coverage runs, not several minutes of `go test` later.
+	callExcluder, err := discover.NewCallExcluder(cfg.ResolvedExcludeCalls())
+	if err != nil {
+		return fmt.Errorf("--exclude-calls: %w", err)
 	}
 	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, excluder, projectDir)
 	resolveMsg := fmt.Sprintf("done (%d packages)", len(pkgs))
@@ -608,6 +634,10 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("applying directives: %w", err)
 	}
+	// Directives run first so that where both could apply, the reason
+	// surfaced under --verbose is the one a human wrote at the site.
+	mutants, callSuppressed := discover.FilterByCalls(fset, mutants, discovered.Files, callExcluder)
+	suppressed = append(suppressed, callSuppressed...)
 	if cfg.Verbose {
 		for _, s := range suppressed {
 			reason := s.Reason
@@ -810,6 +840,9 @@ func run(ctx context.Context, args []string) error {
 	// 9. Generate report.
 	totalElapsed := time.Since(coverStart)
 	r := report.Generate(mutants, goModule, totalElapsed, len(suppressed))
+	// Breakdown only; the aggregate stays in MutantsSuppressed so the two
+	// suppression sources share one bucket everywhere else.
+	r.MutantsSuppressedByCalls = len(callSuppressed)
 	term2.Summary(r)
 
 	if err := report.WriteJSON(r, cfg.Output); err != nil {

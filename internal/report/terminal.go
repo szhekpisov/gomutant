@@ -239,13 +239,28 @@ func (t *Terminal) Summary(r *Report) {
 		fmt.Fprintf(t.w, "  Cached:       %d  (skipped)\n", r.MutantsCached)
 	}
 	if r.MutantsSuppressed > 0 {
-		fmt.Fprintf(t.w, "  Suppressed:   %d  (directives)\n", r.MutantsSuppressed)
+		fmt.Fprintf(t.w, "  Suppressed:   %d  (%s)\n", r.MutantsSuppressed, suppressedSources(r))
 	}
 	if r.MutantsEquivalent > 0 {
 		fmt.Fprintf(t.w, "  Equivalent:   %d  (compiler-proven)\n", r.MutantsEquivalent)
 	}
 	fmt.Fprintf(t.w, "  Efficacy:     %.2f%%\n", r.TestEfficacy)
 	fmt.Fprintln(t.w)
+}
+
+// suppressedSources labels the Suppressed line with where the mutants
+// went. One source names itself; both split the count, so a reader can
+// tell how much of the drop came from a project-wide --exclude-calls
+// policy rather than annotations written at the site.
+func suppressedSources(r *Report) string {
+	byDirectives := r.MutantsSuppressed - r.MutantsSuppressedByCalls
+	if r.MutantsSuppressedByCalls == 0 {
+		return "directives"
+	}
+	if byDirectives == 0 {
+		return "exclude-calls"
+	}
+	return fmt.Sprintf("%d directives, %d exclude-calls", byDirectives, r.MutantsSuppressedByCalls)
 }
 
 func pct(n, total int) float64 {

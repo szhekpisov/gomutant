@@ -164,3 +164,134 @@ func loadReport(t *testing.T, path string) *report.Report {
 	}
 	return &r
 }
+
+// The --exclude-calls tests below run over testdata/excludecalls, where
+// the same arithmetic appears both inside and outside excluded calls.
+// Together they cover the three states a project can be in: the built-in
+// set alone, the built-in set plus a project pattern, and the built-ins
+// switched off.
+//
+// Fixture source lines, named so a fixture edit fails loudly here rather
+// than silently weakening an assertion.
+const (
+	fxLogPrintfLine = 21 // log.Printf("...", done*100/total)
+	fxReturnLine    = 22 // return done * 100 / total
+	fxFatalfLine    = 30 // log.Fatalf("negative: %d", n*2)
+	fxDebugLine     = 39 // l.Debug("sum", a+b)
+	fxSubLine       = 40 // return a - b
+)
+
+// runExcludeCallsFixture runs the fixture package with extraArgs and
+// returns the parsed report.
+func runExcludeCallsFixture(t *testing.T, extraArgs ...string) *report.Report {
+	t.Helper()
+	outPath := filepath.Join(t.TempDir(), "report.json")
+	args := append([]string{"-w", "4", "--cache=off", "-o", outPath}, extraArgs...)
+	if err := run(context.Background(), append(args, "./testdata/excludecalls/")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	return loadReport(t, outPath)
+}
+
+// mutatedLines is the set of source lines still present in the report.
+func mutatedLines(r *report.Report) map[int]bool {
+	out := make(map[int]bool)
+	for _, f := range r.Files {
+		for _, m := range f.Mutations {
+			out[m.Line] = true
+		}
+	}
+	return out
+}
+
+// TestIntegrationExcludeCallsDefaults pins the out-of-the-box behaviour:
+// stdlib logging covered with no configuration, and the two families the
+// built-in set deliberately leaves alone still mutated.
+func TestIntegrationExcludeCallsDefaults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	r := runExcludeCallsFixture(t)
+
+	// Five mutants live inside Ratio's log.Printf call: the two arithmetic
+	// operators, both literal steps on 100, and STATEMENT_REMOVE of the
+	// call itself.
+	if r.MutantsSuppressed != 5 {
+		t.Errorf("MutantsSuppressed=%d, want 5", r.MutantsSuppressed)
+	}
+	// The fixture carries no directives, so the whole bucket is ours.
+	if r.MutantsSuppressedByCalls != r.MutantsSuppressed {
+		t.Errorf("MutantsSuppressedByCalls=%d, want all %d suppressions attributed to exclude-calls",
+			r.MutantsSuppressedByCalls, r.MutantsSuppressed)
+	}
+	if r.MutantsTotal != 17 {
+		t.Errorf("MutantsTotal=%d, want 17 (suppressed mutants leave the total)", r.MutantsTotal)
+	}
+
+	lines := mutatedLines(r)
+	if lines[fxLogPrintfLine] {
+		t.Errorf("line %d (log.Printf) should be suppressed by the built-in set", fxLogPrintfLine)
+	}
+	// The identical expression one line down is ordinary code.
+	if !lines[fxReturnLine] {
+		t.Errorf("line %d (return) must still be mutated", fxReturnLine)
+	}
+	// log.Fatal* is deliberately absent from the built-in set.
+	if !lines[fxFatalfLine] {
+		t.Errorf("line %d (log.Fatalf) must still be mutated — deleting it changes behaviour", fxFatalfLine)
+	}
+	// So are method-shaped globs like *.Debug.
+	if !lines[fxDebugLine] {
+		t.Errorf("line %d (l.Debug) must still be mutated without an opt-in pattern", fxDebugLine)
+	}
+}
+
+// TestIntegrationExcludeCallsUserPatternExtends pins that a user list adds
+// to the built-in set rather than replacing it.
+func TestIntegrationExcludeCallsUserPatternExtends(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	r := runExcludeCallsFixture(t, "--exclude-calls", "*.Debug")
+
+	// Two more from l.Debug: the `+` in its argument and STATEMENT_REMOVE
+	// of the call.
+	if r.MutantsSuppressed != 7 {
+		t.Errorf("MutantsSuppressed=%d, want 7", r.MutantsSuppressed)
+	}
+	if r.MutantsTotal != 15 {
+		t.Errorf("MutantsTotal=%d, want 15", r.MutantsTotal)
+	}
+
+	lines := mutatedLines(r)
+	if lines[fxDebugLine] {
+		t.Errorf("line %d (l.Debug) should be suppressed by the user pattern", fxDebugLine)
+	}
+	// The user list must not have replaced the built-in one.
+	if lines[fxLogPrintfLine] {
+		t.Errorf("line %d (log.Printf) should still be suppressed by the built-in set", fxLogPrintfLine)
+	}
+	if !lines[fxSubLine] {
+		t.Errorf("line %d (return) must still be mutated", fxSubLine)
+	}
+}
+
+// TestIntegrationExcludeCallsDefaultsOff pins the escape hatch: with the
+// built-ins off and no user list, every mutant is back in the run.
+func TestIntegrationExcludeCallsDefaultsOff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	r := runExcludeCallsFixture(t, "--exclude-calls-defaults=false")
+
+	if r.MutantsSuppressed != 0 {
+		t.Errorf("MutantsSuppressed=%d, want 0 with the built-ins off", r.MutantsSuppressed)
+	}
+	if r.MutantsTotal != 22 {
+		t.Errorf("MutantsTotal=%d, want 22 (every mutant back in the run)", r.MutantsTotal)
+	}
+	lines := mutatedLines(r)
+	if !lines[fxLogPrintfLine] || !lines[fxDebugLine] {
+		t.Errorf("both call lines must be mutated with the built-ins off, got lines %v", lines)
+	}
+}

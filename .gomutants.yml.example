@@ -103,6 +103,34 @@ output: mutation-report.json
 #   - _gen\.go$
 #   - mocks/
 
+# Suppress mutants inside calls whose selector matches one of these globs
+# — the Go analogue of PITest's avoidCallsTo, for operators in logging and
+# telemetry arguments that no test can reasonably assert on. Matching is
+# anchored and `*` is the only metacharacter, so `log.Print` matches only
+# `log.Print` while `log.Print*` also catches Printf/Println. The whole
+# call expression is suppressed, argument list and all, including
+# STATEMENT_REMOVE of a bare logging statement. Matching is syntactic: an
+# aliased import (`import stdlog "log"`) needs its own entry. Suppressed
+# mutants are dropped before any test runs and counted in
+# mutants_suppressed. --exclude-calls on the CLI (comma-separated)
+# overrides this list.
+#
+# This list EXTENDS the built-in set for Go's standard-library logging:
+#   log.Print*  log.Output
+#   slog.Debug*  slog.Info*  slog.Warn*  slog.Error*  slog.Log*
+# log.Fatal*/log.Panic* are deliberately absent — they exit or panic, so
+# deleting one is a real behavioural change a test should catch. So are
+# method-shaped globs like *.Info, which would reach err.Error() and any
+# domain method sharing the name; add those yourself if you want them.
+# exclude-calls:
+#   - "*.Debug"
+#   - "metrics.*"
+#   - "tracer.Record"
+
+# Set to false to drop the built-in set above and use only the
+# exclude-calls entries you list (or none at all). Default: true.
+# exclude-calls-defaults: true
+
 # Available mutator types (22 total):
 #   Token-level:
 #     ARITHMETIC_BASE             — swap +/-, */%, etc.

@@ -788,3 +788,37 @@ func TestSummaryEquivalentNonZero(t *testing.T) {
 		t.Errorf("expected Equivalent line, got %q", buf.String())
 	}
 }
+
+// TestSummarySuppressedLineSplitsSources pins the label when both
+// suppression sources are in play: the reader has to be able to tell how
+// much of the drop came from a project-wide --exclude-calls policy rather
+// than from annotations written at the site.
+func TestSummarySuppressedLineSplitsSources(t *testing.T) {
+	var buf bytes.Buffer
+	term := NewTerminal(&buf, 0, false, false)
+	r := &Report{
+		MutantsKilled: 5, MutantsLived: 1,
+		MutantsTotal: 6, MutantsSuppressed: 7, MutantsSuppressedByCalls: 2,
+		TestEfficacy: 83.33,
+	}
+	term.Summary(r)
+	if !strings.Contains(buf.String(), "Suppressed:   7  (5 directives, 2 exclude-calls)\n") {
+		t.Errorf("expected split Suppressed line, got %q", buf.String())
+	}
+}
+
+func TestSummarySuppressedLineCallsOnly(t *testing.T) {
+	var buf bytes.Buffer
+	term := NewTerminal(&buf, 0, false, false)
+	r := &Report{
+		MutantsKilled: 5, MutantsLived: 1,
+		// A single suppression also pins the `> 0` guard against widening
+		// to `> 1`, which would hide the line for exactly this count.
+		MutantsTotal: 6, MutantsSuppressed: 1, MutantsSuppressedByCalls: 1,
+		TestEfficacy: 83.33,
+	}
+	term.Summary(r)
+	if !strings.Contains(buf.String(), "Suppressed:   1  (exclude-calls)\n") {
+		t.Errorf("expected exclude-calls-only Suppressed line, got %q", buf.String())
+	}
+}
