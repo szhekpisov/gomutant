@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -44,6 +45,16 @@ func captureStderr(t *testing.T, fn func() error) (string, error) {
 	return buf.String(), err
 }
 
+func requireExitCode(t *testing.T, err error, want int) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("exit code = 0, want %d", want)
+	}
+	if got := exitCodeForError(err); got != want {
+		t.Fatalf("exit code = %d, want %d (error: %v)", got, want, err)
+	}
+}
+
 func TestRunVersion(t *testing.T) {
 	out, err := captureOutput(t, func() error {
 		return run(context.Background(), []string{"--version"})
@@ -77,19 +88,123 @@ func TestRunUnleash(t *testing.T) {
 }
 
 func TestRunInvalidFlag(t *testing.T) {
-	err := run(context.Background(), []string{"--invalid-flag"})
-	if err == nil {
-		t.Fatal("expected error for invalid flag")
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), []string{"--invalid-flag"})
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+}
+
+func TestRunInvalidFlagValuesExitUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"integer", []string{"-w", "auto"}},
+		{"boolean", []string{"--exclude-calls-defaults=maybe"}},
+		{"duration", []string{"--checkpoint-interval=eventually"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := captureStderr(t, func() error {
+				return run(context.Background(), tc.args)
+			})
+			requireExitCode(t, err, exitCodeUsageError)
+		})
+	}
+}
+
+func TestRunHelpExitsSuccessfully(t *testing.T) {
+	output, err := captureStderr(t, func() error {
+		return run(context.Background(), []string{"--help"})
+	})
+	if err != nil {
+		t.Fatalf("run --help: %v", err)
+	}
+	if !strings.Contains(output, "Usage of gomutants:") {
+		t.Errorf("help output missing usage header: %q", output)
 	}
 }
 
 func TestRunNegativeTestCPU(t *testing.T) {
 	err := run(context.Background(), []string{"--test-cpu", "-1"})
-	if err == nil {
-		t.Fatal("expected error for --test-cpu=-1")
-	}
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "test-cpu") {
 		t.Errorf("error should mention test-cpu, got: %v", err)
+	}
+}
+
+func TestRunSemanticConfigErrorsExitUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"conflicting verbosity", []string{"--quiet", "--verbose"}},
+		{"unsupported annotations", []string{"--annotations=gitlab"}},
+		{"integration coverpkg conflict", []string{"--integration", "--coverpkg=./..."}},
+		{"managed test flag", []string{"--test-flags=-overlay=x"}},
+		{"invalid exclude-files pattern", []string{"--exclude-files=["}},
+		{"invalid exclude-calls pattern", []string{"--exclude-calls=*"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := run(context.Background(), tc.args)
+			requireExitCode(t, err, exitCodeUsageError)
+		})
+	}
+}
+
+func TestCLIExitCodes(t *testing.T) {
+	const helperEnv = "GOMUTANTS_TEST_MAIN_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		separator := -1
+		for i, arg := range os.Args {
+			if arg == "--" {
+				separator = i
+				break
+			}
+		}
+		if separator < 0 {
+			t.Fatal("helper invocation missing -- separator")
+		}
+		os.Args = append([]string{"gomutants"}, os.Args[separator+1:]...)
+		main()
+		return
+	}
+
+	projectDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectDir, "go.mod"), []byte("module testmod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"help", []string{"--help"}, 0},
+		{"unknown flag", []string{"--totally-bad-flag", "./pkg"}, exitCodeUsageError},
+		{"invalid flag value", []string{"-w", "auto", "./pkg"}, exitCodeUsageError},
+		{"unbuildable target", []string{"./pkg-that-does-not-exist"}, exitCodeRuntimeError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"-test.run=^TestCLIExitCodes$", "--"}, tc.args...)
+			cmd := exec.Command(os.Args[0], args...)
+			cmd.Dir = projectDir
+			cmd.Env = append(os.Environ(), helperEnv+"=1")
+			output, err := cmd.CombinedOutput()
+			got := 0
+			if err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					t.Fatalf("running helper: %v", err)
+				}
+				got = exitErr.ExitCode()
+			}
+			if got != tc.want {
+				t.Fatalf("exit code = %d, want %d\noutput:\n%s", got, tc.want, output)
+			}
+		})
 	}
 }
 
@@ -361,9 +476,7 @@ func TestRunConfigLoadError(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(orig)
 	err := run(context.Background(), []string{"--config", cfgPath, "--dry-run", "testmod"})
-	if err == nil {
-		t.Fatal("expected run() to return config.Load error")
-	}
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "config") && !strings.Contains(err.Error(), "yaml") {
 		t.Errorf("error should originate from config.Load, got: %v — BRANCH_IF on the err-return body lets config errors fall through to a later step", err)
 	}
@@ -381,9 +494,7 @@ func TestRunResolvePackagesError(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(orig)
 	err := run(context.Background(), []string{"--dry-run", "completely/nonexistent/package/xyz"})
-	if err == nil {
-		t.Fatal("expected run() to error on unresolvable package")
-	}
+	requireExitCode(t, err, exitCodeRuntimeError)
 }
 
 // TestRunCoverageError kills BRANCH_IF on the runner.RunCoverage error check
@@ -410,9 +521,7 @@ func TestRunCoverageError(t *testing.T) {
 		"-o", filepath.Join(dir, "report.json"),
 		"testmod",
 	})
-	if err == nil {
-		t.Fatal("expected run() to return coverage error when baseline tests fail")
-	}
+	requireExitCode(t, err, exitCodeRuntimeError)
 }
 
 func TestRunDryRun(t *testing.T) {
@@ -511,6 +620,7 @@ func TestRunQuietConflictsWithVerbose(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected --quiet --verbose to error")
 	}
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "--quiet and --verbose") {
 		t.Errorf("error should call out the conflicting flags, got: %v", err)
 	}
@@ -691,6 +801,7 @@ func TestRunRejectsManagedTestFlags(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected --test-flags -overlay to error")
 	}
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "-overlay") {
 		t.Errorf("error should name the rejected flag, got: %v", err)
 	}
@@ -710,7 +821,8 @@ func TestRunRejectsManagedTestFlagsFromYAML(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := run(context.Background(), []string{"--config", cfgPath, "testmod"})
-	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "-overlay") {
 		t.Fatalf("YAML-supplied managed flag must be rejected, got err: %v", err)
 	}
 }
@@ -873,7 +985,7 @@ func TestRunThresholdEfficacy(t *testing.T) {
 		t.Fatal("expected --threshold-efficacy=100 to return an error when LIVED > 0")
 	}
 	var ee *exitError
-	if !errors.As(err, &ee) || ee.code != 10 {
+	if !errors.As(err, &ee) || ee.code != exitCodeEfficacy {
 		t.Errorf("expected exitError code 10 (gremlins-compat), got: %v", err)
 	}
 	// Report must be written even when the gate fires — the action depends
@@ -958,7 +1070,7 @@ func TestRunThresholdMcover(t *testing.T) {
 		t.Fatal("expected --threshold-mcover=50 to error when coverage is 0%")
 	}
 	var ee *exitError
-	if !errors.As(err, &ee) || ee.code != 11 {
+	if !errors.As(err, &ee) || ee.code != exitCodeMutantCoverage {
 		t.Errorf("expected exitError code 11 (gremlins-compat), got: %v", err)
 	}
 }
@@ -1201,9 +1313,7 @@ func TestRunMissingGoMod(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(orig)
 	err := run(context.Background(), []string{"--dry-run", "."})
-	if err == nil {
-		t.Fatal("expected error when go.mod is missing")
-	}
+	requireExitCode(t, err, exitCodeRuntimeError)
 	if !strings.Contains(err.Error(), "reading go.mod") {
 		t.Errorf("error should be wrapped 'reading go.mod', got: %v — BRANCH_IF on the err-return lets the go.mod failure fall through to a `go list` error that also mentions go.mod", err)
 	}
@@ -1880,9 +1990,7 @@ func TestRunRejectsMatchAllExcludeCalls(t *testing.T) {
 	defer os.Chdir(orig)
 
 	err := run(context.Background(), []string{"--exclude-calls", "*", "testmod"})
-	if err == nil {
-		t.Fatal("expected an error for a match-everything pattern")
-	}
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "--exclude-calls") {
 		t.Errorf("error should name the flag, got: %v", err)
 	}
@@ -1941,10 +2049,10 @@ func TestRunExcludeCallsReportsBreakdown(t *testing.T) {
 // a non-boolean value must fail with the flag named, not be silently
 // treated as "off".
 func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
-	err := run(context.Background(), []string{"--exclude-calls-defaults=maybe"})
-	if err == nil {
-		t.Fatal("expected error for a non-boolean --exclude-calls-defaults")
-	}
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), []string{"--exclude-calls-defaults=maybe"})
+	})
+	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "exclude-calls-defaults") {
 		t.Errorf("error should name the flag, got: %v", err)
 	}
