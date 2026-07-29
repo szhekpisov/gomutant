@@ -32,7 +32,7 @@ timeout-coefficient: 10
 # flags. Flags gomutants manages (-overlay, -run, -args, -timeout,
 # -coverprofile, -coverpkg, -c, -o, -exec) are rejected, in their -test.*
 # spellings too.
-# test-flags: "-rapid.checks=20"
+# test-flags: "-short"
 
 # JSON report output path (default: mutation-report.json).
 output: mutation-report.json

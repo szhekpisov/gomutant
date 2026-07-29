@@ -715,16 +715,17 @@ target to single-digit seconds. Filed as
 
 None of the targets on this page use property-based testing, so the
 numbers above don't capture its cost — but it is the sharpest known
-cliff. Under [`rapid`](https://pgregory.net/rapid), every mutant on a
-covered line re-runs the whole property (100 checks by default), so a
-package's mutation time scales with checks × mutants rather than with
-mutants alone.
+cliff. Every mutant on a covered line re-runs the whole property, and
+these frameworks commonly default to 100 iterations, so a package's
+mutation time scales with iterations × mutants rather than with mutants
+alone.
 
 `--test-flags` forwards flags to the inner `go test`, which makes the
-iteration count a knob rather than a constant:
+iteration count a knob rather than a constant — via `-short`, or via
+whatever flag the framework exposes for its own iteration count:
 
 ```bash
-gomutants --changed-since main --test-flags '-rapid.checks=20' ./...
+gomutants --changed-since main --test-flags '-short' ./...
 ```
 
 The flags reach the per-mutant runs, the coverage run, and the baseline

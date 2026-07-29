@@ -303,7 +303,7 @@ func run(ctx context.Context, args []string) error {
 	// UnquoteUsage takes the first back-quoted token as the value
 	// placeholder shown in --help. Any other backticks in this string
 	// would be consumed instead, printing e.g. "-test-flags go test".
-	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags='-rapid.checks=20' or --test-flags=-short", func(s string) error {
+	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags=-short", func(s string) error {
 		testFlags = append(testFlags, s)
 		return nil
 	})
