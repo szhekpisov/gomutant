@@ -571,8 +571,13 @@ Four things to know:
 
 - **`go test` only.** The flags reach the per-mutant runs, the coverage run,
   and the baseline run — never `go list` or the build steps. This is why
-  `GOFLAGS=-short` is not a workaround: `-short` is not a valid `go list`
-  flag, so it breaks package resolution before any test runs.
+  `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
+  given flag is known by the current command" (`go help environment`), so
+  you cannot say which invocations a flag reaches: `-short` is silently
+  ignored by `go list` and `go test -c`, while `-race` is honored by them.
+  GOFLAGS also bypasses the managed-flag check below — `GOFLAGS=-run=TestFoo`
+  narrows the coverage run and every per-mutant run with no diagnostic,
+  which `--test-flags -run=TestFoo` rejects outright.
 - **`-short` narrows coverage too, deliberately.** The coverage run sees the
   same flags, so a test that `-short` skips is not recorded as covering. Its
   lines report as `NOT_COVERED` rather than as false survivors — an honest

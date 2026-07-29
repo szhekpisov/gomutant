@@ -42,8 +42,11 @@ type Config struct {
 	Tags string `yaml:"tags"`
 	// TestFlags is forwarded verbatim to the inner `go test` invocations
 	// (per-mutant runs, the coverage run, the baseline run) and to nothing
-	// else — `go list` and `go test -c` reject test-only flags like
-	// `-short`, which is exactly why GOFLAGS is not a usable workaround.
+	// else. That scoping is the point, and is why GOFLAGS is not a usable
+	// workaround: Go honors a GOFLAGS entry only "when the given flag is
+	// known by the current command", so it silently reaches whichever of
+	// `go list`/`go test -c`/`go test` happen to accept it, and it slips
+	// past the managed-flag guard in main.go that rejects e.g. -run.
 	// Whitespace-separated; see TestFlagFields.
 	TestFlags string   `yaml:"test-flags"`
 	Output    string   `yaml:"output"`
