@@ -42,6 +42,7 @@ Notes:
 - Do **not** pass `-dry-run` — real KILLED/LIVED status is required.
 - Do **not** pass `-cache=off`. The default `.gomutants-cache.json` is on, which makes repeat runs in the same session fast.
 - Exit codes 10 / 11 mean the efficacy / coverage thresholds were not met. Both reports still wrote, so continue.
+- Exit code 2 means the invocation or configuration is invalid. Stop and surface the error; do not continue with a stale or missing report.
 - If the run is taking visibly long on `./...`, narrow to the package with the most changed files and tell the user you did so.
 
 ## Step 3 — extract surviving mutants

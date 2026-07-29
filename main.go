@@ -38,6 +38,14 @@ const (
 	devBuildDate = "unknown"
 )
 
+// Process exit codes form part of the CLI contract consumed by CI wrappers.
+const (
+	exitCodeRuntimeError   = 1
+	exitCodeUsageError     = 2
+	exitCodeEfficacy       = 10
+	exitCodeMutantCoverage = 11
+)
+
 // Overridden at release time via -ldflags '-X main.<field>=...'.
 var (
 	version   = devVersion
@@ -158,24 +166,38 @@ func main() {
 
 	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "gomutants: %v\n", err)
-		var ee *exitError
-		if errors.As(err, &ee) {
-			os.Exit(ee.code)
-		}
-		os.Exit(1)
+		os.Exit(exitCodeForError(err))
 	}
 }
 
 // exitError carries a specific exit code through run()'s error return so
-// main can map it to os.Exit. Matches gremlins's exit-code surface (10
-// for efficacy, 11 for mutant coverage) so gremlins-compat scripts keep
-// distinguishing the two failure modes.
+// main can map it to os.Exit. Code 2 distinguishes usage/configuration
+// failures from runtime/build failures, while codes 10 and 11 match
+// gremlins's threshold surface.
 type exitError struct {
 	code int
-	msg  string
+	err  error
 }
 
-func (e *exitError) Error() string { return e.msg }
+func (e *exitError) Error() string { return e.err.Error() }
+
+func (e *exitError) Unwrap() error { return e.err }
+
+func exitCodeForError(err error) int {
+	var ee *exitError
+	if errors.As(err, &ee) {
+		return ee.code
+	}
+	return exitCodeRuntimeError
+}
+
+func usageError(err error) error {
+	return &exitError{code: exitCodeUsageError, err: err}
+}
+
+func usageErrorf(format string, args ...any) error {
+	return usageError(fmt.Errorf(format, args...))
+}
 
 // stdout is the writer for user-facing output. Tests swap this to capture output.
 var stdout io.Writer = os.Stdout
@@ -220,6 +242,7 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	fs := flag.NewFlagSet("gomutants", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 
 	var (
 		workers            int
@@ -345,21 +368,24 @@ func run(ctx context.Context, args []string) error {
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return usageError(err)
 	}
 
 	if testCPU < 0 {
-		return fmt.Errorf("--test-cpu must be >= 0, got %d", testCPU)
+		return usageErrorf("--test-cpu must be >= 0, got %d", testCPU)
 	}
 
 	if quiet && verbose {
-		return fmt.Errorf("--quiet and --verbose cannot be used together")
+		return usageErrorf("--quiet and --verbose cannot be used together")
 	}
 
 	switch annotations {
 	case "", "github":
 	default:
-		return fmt.Errorf("--annotations=%q not recognized (supported: github)", annotations)
+		return usageErrorf("--annotations=%q not recognized (supported: github)", annotations)
 	}
 
 	if showVersion {
@@ -369,7 +395,7 @@ func run(ctx context.Context, args []string) error {
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return err
+		return usageError(err)
 	}
 	cfg.ApplyFlags(config.Flags{
 		Workers:            workers,
@@ -404,13 +430,25 @@ func run(ctx context.Context, args []string) error {
 	// explicit --coverpkg would conflict with that computed value, so refuse
 	// rather than silently pick one.
 	if cfg.Integration && cfg.CoverPkg != "" {
-		return fmt.Errorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
+		return usageErrorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
 	}
 
 	// Checked after ApplyFlags so a value from .gomutants.yml is screened
 	// too, not just the CLI one.
 	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
-		return err
+		return usageError(err)
+	}
+
+	// Compile user-supplied patterns before any project or Go-tool work.
+	// These are configuration errors even when the selected target also
+	// happens to be unbuildable, so configuration must win that race.
+	excluder, err := discover.NewExcluder(cfg.ExcludeFiles)
+	if err != nil {
+		return usageErrorf("--exclude-files: %w", err)
+	}
+	callExcluder, err := discover.NewCallExcluder(cfg.ResolvedExcludeCalls())
+	if err != nil {
+		return usageErrorf("--exclude-calls: %w", err)
 	}
 
 	// Periodic checkpointing rides on the cache file; with --cache=off
@@ -484,17 +522,6 @@ func run(ctx context.Context, args []string) error {
 	pkgs, err := discover.ResolvePackages(ctx, projectDir, packages, cfg.Tags)
 	if err != nil {
 		return err
-	}
-	excluder, err := discover.NewExcluder(cfg.ExcludeFiles)
-	if err != nil {
-		return fmt.Errorf("--exclude-files: %w", err)
-	}
-	// Compiled here, next to --exclude-files, rather than at its use site
-	// after discovery: a bad pattern must fail before the baseline and
-	// coverage runs, not several minutes of `go test` later.
-	callExcluder, err := discover.NewCallExcluder(cfg.ResolvedExcludeCalls())
-	if err != nil {
-		return fmt.Errorf("--exclude-calls: %w", err)
 	}
 	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, excluder, projectDir)
 	resolveMsg := fmt.Sprintf("done (%d packages)", len(pkgs))
@@ -900,8 +927,8 @@ func run(ctx context.Context, args []string) error {
 			fmt.Fprintln(stderr, "gomutants: no testable mutants discovered; --threshold-efficacy not evaluated")
 		} else if r.TestEfficacy < thresholdEfficacy {
 			return &exitError{
-				code: 10,
-				msg:  fmt.Sprintf("test efficacy %.2f%% below --threshold-efficacy=%.2f%% (mutant coverage: %.2f%%)", r.TestEfficacy, thresholdEfficacy, mcover),
+				code: exitCodeEfficacy,
+				err:  fmt.Errorf("test efficacy %.2f%% below --threshold-efficacy=%.2f%% (mutant coverage: %.2f%%)", r.TestEfficacy, thresholdEfficacy, mcover),
 			}
 		}
 	}
@@ -910,8 +937,8 @@ func run(ctx context.Context, args []string) error {
 			fmt.Fprintln(stderr, "gomutants: no covered or testable mutants discovered; --threshold-mcover not evaluated")
 		} else if mcover < thresholdMcover {
 			return &exitError{
-				code: 11,
-				msg:  fmt.Sprintf("mutant coverage %.2f%% below --threshold-mcover=%.2f%% (test efficacy: %.2f%%)", mcover, thresholdMcover, r.TestEfficacy),
+				code: exitCodeMutantCoverage,
+				err:  fmt.Errorf("mutant coverage %.2f%% below --threshold-mcover=%.2f%% (test efficacy: %.2f%%)", mcover, thresholdMcover, r.TestEfficacy),
 			}
 		}
 	}
