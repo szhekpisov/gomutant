@@ -711,6 +711,48 @@ That would drop the single-package targets below ~1 s and the tsdb-4
 target to single-digit seconds. Filed as
 [issue #38](https://github.com/szhekpisov/gomutants/issues/38).
 
+## Property-based suites: `--test-flags`
+
+None of the targets on this page use property-based testing, so the
+numbers above don't capture its cost — but it is the sharpest known
+cliff. Every mutant on a covered line re-runs the whole property, and
+these frameworks commonly default to 100 iterations, so a package's
+mutation time scales with iterations × mutants rather than with mutants
+alone.
+
+`--test-flags` forwards flags to the inner `go test`, which makes the
+iteration count a knob rather than a constant — via `-short`, or via
+whatever flag the framework exposes for its own iteration count:
+
+```bash
+gomutants --changed-since main --test-flags '-short' ./...
+```
+
+The flags reach the per-mutant runs, the coverage run, and the baseline
+run — never `go list` or the build steps, which is what makes this safe
+where `GOFLAGS=-short` is not. The trade is explicit: fewer checks means
+fewer chances to catch a mutant, so this belongs on a fast pre-push gate,
+not on the run whose score you publish. Because the flags are part of the
+cache identity, the two runs keep separate cache generations and neither
+inherits the other's verdicts.
+
+Two things bound the speedup:
+
+- **The per-test timing phase is not covered.** It compiles with
+  `go test -c` and drives the binary through `-test.*`-namespaced
+  flags, so `-short` would need translating. It runs every test once
+  at full cost no matter what `--test-flags` says. On a suite where
+  that phase is a large share of wall clock, the end-to-end win is
+  well short of the per-mutant ratio. Its durations also stop being
+  usable as deadlines once the flags change what runs, so adaptive
+  timeouts stand down and every mutant falls back to the global
+  `baseline × --timeout-coefficient` ceiling — a second-order cost,
+  since a hung mutant now occupies a worker for longer.
+- **Only the mutant loop scales down.** Discovery, the coverage run,
+  and compilation are unchanged, so the usual Amdahl ceiling applies.
+
+Not benchmarked here — no target on this page exercises it.
+
 ## Go 1.26.x compatibility
 
 The cross-comparison rows force `GOTOOLCHAIN=go1.25.7` because gremlins

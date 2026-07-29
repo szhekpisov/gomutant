@@ -44,7 +44,10 @@ import (
 //	v4: GoToolchain joins the metadata gate, and EQUIVALENT is a reusable
 //	    status. Equivalence verdicts depend on the compiler, so a toolchain
 //	    change must discard the cache.
-const SchemaVersion = 4
+//	v5: TestFlags joins the metadata gate. --test-flags changes what the
+//	    inner `go test` actually executes, so a verdict recorded under one
+//	    value must not be replayed under another.
+const SchemaVersion = 5
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
@@ -101,6 +104,20 @@ type Cache struct {
 	// the whole cache. omitempty + the default "" keeps pre-existing
 	// (tag-less) caches reusable for tag-less runs.
 	BuildTags string `json:"build_tags,omitempty"`
+	// TestFlags is the `--test-flags` value the cache was built with, in
+	// canonical form — whitespace collapsed, and sorted where sorting is
+	// behavior-preserving (see config.CanonicalTestFlags), so that two
+	// spellings of the same run share one generation instead of each
+	// paying for a cold start. It joins the metadata-gate identity for
+	// the same reason BuildTags does, but the pressure here is sharper:
+	// the documented workflow is alternating between a cheap gate run
+	// (`--test-flags '-rapid.checks=20'`) and a full scoring run, and
+	// per-mutant verdicts are not comparable across the two. A LIVED
+	// recorded at 20 checks must not be replayed as the verdict for a
+	// 100-check run, nor a KILLED under a full suite for a `-short` one.
+	// omitempty + the default "" keeps flag-less caches reusable for
+	// flag-less runs.
+	TestFlags string `json:"test_flags,omitempty"`
 	// GoToolchain is the project's `go version` string the cache was built
 	// with. It joins the metadata-gate identity because the EQUIVALENT
 	// classification is decided by the compiler's generated code, which can
@@ -312,7 +329,11 @@ func goFilesIn(pkgDirs []string) ([]string, error) {
 // This keeps the helper usable on modules with no recorded checksums
 // (single-module repos with no external deps) without an extra branch
 // at every call site.
-func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags, toolchain, envSnapshot string) (string, error) {
+// testFlags is the user's --test-flags string. It is a hash dimension
+// because those flags reach the coverage run itself: `-short` can skip
+// tests, which changes which lines the profile marks covered, so a profile
+// recorded under one value must never be replayed under another.
+func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags, testFlags, toolchain, envSnapshot string) (string, error) {
 	// 1. Collect every .go file under pkgDirs (deduped + sorted) so the hash
 	// is independent of pkgDir ordering. Extracted into goFilesIn to keep
 	// this method's cognitive complexity in check. h.File is used below so
@@ -353,6 +374,7 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 	// length-prefixed framing so adjacent values can't alias.
 	fmt.Fprintf(hh, "coverpkg:%d:%s|", len(coverPkg), coverPkg)
 	fmt.Fprintf(hh, "tags:%d:%s|", len(tags), tags)
+	fmt.Fprintf(hh, "testflags:%d:%s|", len(testFlags), testFlags)
 	fmt.Fprintf(hh, "toolchain:%d:%s|", len(toolchain), toolchain)
 	fmt.Fprintf(hh, "env:%d:%s|", len(envSnapshot), envSnapshot)
 
@@ -371,19 +393,21 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 // the *only* observable rejection path because the read- and
 // parse-failure branches both produce a zero-value Cache that fails
 // the gate identically (SchemaVersion=0 ≠ caller's SchemaVersion).
-func Load(path, goModule, toolVersion, buildTags, goToolchain string) *Cache {
+func Load(path, goModule, toolVersion, buildTags, testFlags, goToolchain string) *Cache {
 	empty := &Cache{
 		SchemaVersion: SchemaVersion,
 		GoModule:      goModule,
 		ToolVersion:   toolVersion,
 		BuildTags:     buildTags,
+		TestFlags:     testFlags,
 		GoToolchain:   goToolchain,
 	}
 	var c Cache
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &c) // c stays zero-value on parse error → fails metadata gate.
 	}
-	if c.SchemaVersion != SchemaVersion || c.GoModule != goModule || c.ToolVersion != toolVersion || c.BuildTags != buildTags || c.GoToolchain != goToolchain {
+	if c.SchemaVersion != SchemaVersion || c.GoModule != goModule || c.ToolVersion != toolVersion ||
+		c.BuildTags != buildTags || c.TestFlags != testFlags || c.GoToolchain != goToolchain {
 		return empty
 	}
 	return &c

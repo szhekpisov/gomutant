@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,13 +39,22 @@ type Config struct {
 	// command (list, test, test -c) so mutation testing reaches code
 	// guarded by `//go:build` constraints. Go parses the comma-separated
 	// list itself, so we pass the raw string through unchanged.
-	Tags    string   `yaml:"tags"`
-	Output  string   `yaml:"output"`
-	DryRun  bool     `yaml:"dry-run"`
-	Verbose bool     `yaml:"verbose"`
-	Quiet   bool     `yaml:"quiet"`
-	Disable []string `yaml:"disable"`
-	Only    []string `yaml:"only"`
+	Tags string `yaml:"tags"`
+	// TestFlags is forwarded verbatim to the inner `go test` invocations
+	// (per-mutant runs, the coverage run, the baseline run) and to nothing
+	// else. That scoping is the point, and is why GOFLAGS is not a usable
+	// workaround: Go honors a GOFLAGS entry only "when the given flag is
+	// known by the current command", so it silently reaches whichever of
+	// `go list`/`go test -c`/`go test` happen to accept it, and it slips
+	// past the managed-flag guard in main.go that rejects e.g. -run.
+	// Whitespace-separated; see TestFlagFields.
+	TestFlags string   `yaml:"test-flags"`
+	Output    string   `yaml:"output"`
+	DryRun    bool     `yaml:"dry-run"`
+	Verbose   bool     `yaml:"verbose"`
+	Quiet     bool     `yaml:"quiet"`
+	Disable   []string `yaml:"disable"`
+	Only      []string `yaml:"only"`
 	// ExcludeFiles holds regexps matched (unanchored) against each
 	// production file's module-relative path; matching files are skipped
 	// entirely, producing no mutants. Test files are never mutated and so
@@ -103,6 +113,72 @@ func (c *Config) DetectEquivalentEnabled() bool {
 		return false
 	}
 	return *c.DetectEquivalent
+}
+
+// TestFlagFields splits TestFlags into the argv fragments appended to each
+// inner `go test`. Whitespace-separated, so a flag whose value contains a
+// space cannot be expressed — repeat the flag or use its `=` form instead.
+// Centralized here so every consumer (worker, coverage run, baseline run,
+// cache key) splits identically; a per-call-site strings.Fields would let
+// them drift.
+func (c *Config) TestFlagFields() []string {
+	return strings.Fields(c.TestFlags)
+}
+
+// FlagName extracts the flag name from one `go test` argv fragment:
+// leading dashes and any `=value` suffix stripped, plus the `test.`
+// prefix `go test` accepts as an alias for its own flags (`-test.run` and
+// `-run` are the same flag by the time the test binary parses them, and
+// the aliased spelling wins where both appear). ok is false for a field
+// that isn't a flag at all — a value sitting in its own field, as in
+// `-gcflags all=-N`.
+//
+// Exported because two callers must agree on it: the CLI's managed-flag
+// guard, which would otherwise miss `-test.run`, and CanonicalTestFlags
+// below, which uses it to decide whether reordering is safe.
+func FlagName(field string) (string, bool) {
+	if !strings.HasPrefix(field, "-") {
+		return "", false
+	}
+	name, _, _ := strings.Cut(strings.TrimLeft(field, "-"), "=")
+	return strings.TrimPrefix(name, "test."), true
+}
+
+// reorderable reports whether sorting fields is guaranteed not to change
+// what `go test` does. Two things make order load-bearing: a detached
+// value (`-gcflags all=-N` — sorting would strand `all=-N` beside some
+// other flag), and a repeated flag name (`-count=1 -count=2`, where Go's
+// last-occurrence rule makes the tail win). Either way the two orderings
+// are genuinely different runs, so they must keep distinct cache
+// identities rather than collapsing onto one.
+func reorderable(fields []string) bool {
+	seen := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		name, ok := FlagName(f)
+		if !ok || seen[name] {
+			return false
+		}
+		seen[name] = true
+	}
+	return true
+}
+
+// CanonicalTestFlags is TestFlags reduced to the form cache identity is
+// computed from: the split fields rejoined by single spaces, sorted when
+// sorting is provably behavior-preserving (see reorderable). Cache
+// identity must be computed from this, not from the raw string —
+// `"-short"`, `" -short "`, and `"-race -short"` vs `"-short -race"` all
+// run identically, so hashing the raw value would discard a perfectly
+// reusable cache over a difference the runner never sees. This is
+// deliberately *not* the argv form; the runner appends TestFlagFields in
+// the order the user wrote them.
+func (c *Config) CanonicalTestFlags() string {
+	fields := c.TestFlagFields()
+	// Safe to sort in place: strings.Fields hands back a fresh slice.
+	if reorderable(fields) {
+		slices.Sort(fields)
+	}
+	return strings.Join(fields, " ")
 }
 
 // DefaultWorkers returns the default worker count: NumCPU. Floored at 1.
@@ -223,6 +299,7 @@ type Flags struct {
 	CheckpointInterval CheckpointIntervalFlag
 	CoverPkg           string
 	Tags               string
+	TestFlags          string
 	Output             string
 	Disable            string
 	Only               string
@@ -276,6 +353,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.Tags != "" {
 		c.Tags = f.Tags
+	}
+	if f.TestFlags != "" {
+		c.TestFlags = f.TestFlags
 	}
 	if f.Output != "" {
 		c.Output = f.Output

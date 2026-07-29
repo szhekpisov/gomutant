@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/szhekpisov/gomutants/internal/cache"
+	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/szhekpisov/gomutants/internal/runner"
 )
 
 // captureOutput swaps the package-level stdout writer with a bytes.Buffer
@@ -516,6 +518,219 @@ func TestRunQuietConflictsWithVerbose(t *testing.T) {
 	}
 }
 
+// The --test-flags guard is pinned by three tests rather than one, split
+// along the three things it has to get right: reject every spelling of a
+// managed flag, accept everything else, and name the flag the way the
+// user wrote it. They share the flagCases shape below.
+type flagCases = []struct {
+	name  string
+	flags []string
+}
+
+// TestCheckTestFlagsRejects covers the guard's reason for existing: a
+// managed flag must be caught in every spelling a user might reach for,
+// because each one fails silently rather than loudly.
+func TestCheckTestFlagsRejects(t *testing.T) {
+	rejected := flagCases{
+		{"single dash with value", []string{"-overlay=/tmp/x.json"}},
+		{"double dash", []string{"--overlay=/tmp/x.json"}},
+		{"space-separated value", []string{"-overlay", "/tmp/x.json"}},
+		{"bare flag", []string{"-c"}},
+		{"not first", []string{"-short", "-run=TestFoo"}},
+		{"coverprofile", []string{"-coverprofile=/tmp/c.out"}},
+		{"coverpkg", []string{"-coverpkg=./..."}},
+		{"binary output", []string{"-o=/tmp/bin"}},
+		{"exec wrapper", []string{"-exec=wine"}},
+		// -args swallows every argument after it, including the package
+		// pattern gomutants appends. `go test -args -foo ./pkg` tests the
+		// working directory, exits 0, and the mutant records as LIVED —
+		// wrong, and indistinguishable from a real survivor.
+		{"args", []string{"-args", "-foo"}},
+		{"args last", []string{"-short", "-args"}},
+		// A non-flag field *before* the managed one, so the scan has to
+		// carry on past it. INVERT_LOOP_CTRL (an early `break` or
+		// `return`) would abandon the loop at "all=-N" and let -overlay
+		// through; only an ordering like this catches that, since the
+		// accept-side `{"-gcflags", "c"}` case ends on the non-flag field.
+		{"managed flag after a non-flag value", []string{"-gcflags", "all=-N", "-overlay=x"}},
+		// -timeout is enforced twice: on the argv and by the context
+		// deadline in Worker.Test. A longer user value is capped by the
+		// context and still lands as TIMED_OUT, so honoring it on argv
+		// alone would be a lie.
+		{"timeout", []string{"-timeout=30s"}},
+		// `go test` forwards a `-test.`-prefixed flag straight to the test
+		// binary, where it beats the one gomutants set: `go test -run=A
+		// -test.run=B` runs B, and `-test.coverprofile` writes the profile
+		// somewhere RunCoverage never looks. Reading these as flags named
+		// "test.run" / "test.coverprofile" would wave through exactly the
+		// override the un-prefixed names are rejected for.
+		{"test-prefixed run", []string{"-test.run=TestFoo"}},
+		{"test-prefixed run, double dash", []string{"--test.run=TestFoo"}},
+		{"test-prefixed coverprofile", []string{"-test.coverprofile=/tmp/c.out"}},
+		{"test-prefixed timeout", []string{"-test.timeout=30s"}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkTestFlags(tc.flags)
+			if err == nil {
+				t.Fatalf("checkTestFlags(%v) = nil, want an error", tc.flags)
+			}
+			if !strings.Contains(err.Error(), "--test-flags") {
+				t.Errorf("error should name the flag that carried the value, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckTestFlagsErrorEchoesSpelling pins the wording: the message must
+// quote the flag as typed. Being told "-run is managed" after passing
+// `-test.run` reads like the wrong flag was rejected, and sends the reader
+// looking for a `-run` they never wrote.
+func TestCheckTestFlagsErrorEchoesSpelling(t *testing.T) {
+	for _, spelled := range []string{"-test.run", "--overlay", "-coverprofile"} {
+		t.Run(spelled, func(t *testing.T) {
+			err := checkTestFlags([]string{spelled + "=x"})
+			if err == nil {
+				t.Fatalf("checkTestFlags(%q) = nil, want an error", spelled)
+			}
+			if !strings.Contains(err.Error(), spelled) {
+				t.Errorf("error must echo %q as typed, got: %v", spelled, err)
+			}
+		})
+	}
+}
+
+// TestCheckTestFlagsAccepts matters as much as the rejections: an
+// over-eager match would block the exact use case --test-flags exists for.
+func TestCheckTestFlagsAccepts(t *testing.T) {
+	accepted := flagCases{
+		{"nil", nil},
+		{"the motivating case", []string{"-rapid.checks=20"}},
+		{"short", []string{"-short"}},
+		{"race and count", []string{"-race", "-count=2"}},
+		// A managed name appearing as a *value* rather than a flag: the
+		// non-flag skip must let it through, or `-gcflags c` and friends
+		// would be rejected for spelling a managed flag by coincidence.
+		{"managed name as a value", []string{"-gcflags", "c"}},
+		// Prefix-adjacent to managed names: matching is on the whole flag
+		// name, so these must not be caught by a sloppy HasPrefix.
+		{"prefix-adjacent to a managed name", []string{"-count=2", "-cpu=4", "-run.notreal"}},
+		{"parallel", []string{"-parallel=4"}},
+		// Only a leading `test.` is stripped, and only as a whole segment.
+		// Over-trimming here would reject an unrelated third-party flag.
+		{"test-prefixed but unmanaged", []string{"-test.short", "-test.v"}},
+		{"name merely starting with test", []string{"-testdata=x", "-testify.m=y"}},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := checkTestFlags(tc.flags); err != nil {
+				t.Errorf("checkTestFlags(%v) = %v, want nil", tc.flags, err)
+			}
+		})
+	}
+}
+
+// TestTimeoutPolicyFor covers the config→policy mapping, and in
+// particular the one field that isn't a straight read: Unmeasured must
+// track whether --test-flags is in effect. The timing phase never sees
+// those flags, so with them set the recorded durations describe different
+// work than the deadline is being sized for — a `-race` run given a
+// no-race deadline turns survivors into TIMED_OUT, which drops them out
+// of the efficacy denominator instead of into it. STATEMENT_REMOVE on any
+// assignment here leaves that field zero.
+func TestTimeoutPolicyFor(t *testing.T) {
+	const (
+		global = 42 * time.Second
+		margin = 2.5
+		floor  = 3 * time.Second
+	)
+	// want is the expected policy with only the two derived switches left
+	// to vary; the three pass-through fields are the same every time.
+	// Compared as a whole struct so a STATEMENT_REMOVE on any assignment
+	// in timeoutPolicyFor shows up, without a per-field if apiece.
+	want := func(adaptive, unmeasured bool) runner.TimeoutPolicy {
+		return runner.TimeoutPolicy{
+			Global: global, Margin: margin, Min: floor,
+			Adaptive: adaptive, Unmeasured: unmeasured,
+		}
+	}
+	off := false
+	cases := []struct {
+		name string
+		cfg  config.Config
+		want runner.TimeoutPolicy
+	}{
+		{"no test flags", config.Config{}, want(true, false)},
+		{"test flags set", config.Config{TestFlags: "-race"}, want(true, true)},
+		// Whitespace-only is not a flag: the runner appends nothing, so
+		// giving up adaptive sizing here would cost speed for nothing.
+		{"whitespace-only test flags", config.Config{TestFlags: "   "}, want(true, false)},
+		// The two switches are independent — a --test-flags run with
+		// adaptive already off must not read as adaptive.
+		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false, true)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.TimeoutMargin = margin
+			tc.cfg.TimeoutMin = floor
+			if got := timeoutPolicyFor(&tc.cfg, global); got != tc.want {
+				t.Errorf("timeoutPolicyFor(--test-flags=%q) = %+v, want %+v", tc.cfg.TestFlags, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunRejectsManagedTestFlags pins the guard at the run() boundary,
+// not just on the helper: the check must sit after ApplyFlags and abort
+// before any work happens.
+func TestRunRejectsManagedTestFlags(t *testing.T) {
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--test-flags", "-overlay=/tmp/x.json", "testmod"})
+	})
+	if err == nil {
+		t.Fatal("expected --test-flags -overlay to error")
+	}
+	if !strings.Contains(err.Error(), "-overlay") {
+		t.Errorf("error should name the rejected flag, got: %v", err)
+	}
+	if out != "" {
+		t.Errorf("the check must short-circuit before any stdout, got %q", out)
+	}
+}
+
+// TestRunRejectsManagedTestFlagsFromYAML pins the *placement* of the
+// guard: it runs after ApplyFlags, so a value that arrived from
+// .gomutants.yml is screened too. Hoisting the check above the merge
+// would pass this project straight through.
+func TestRunRejectsManagedTestFlagsFromYAML(t *testing.T) {
+	dir := setupTinyProject(t)
+	cfgPath := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(cfgPath, []byte("test-flags: \"-overlay=x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{"--config", cfgPath, "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("YAML-supplied managed flag must be rejected, got err: %v", err)
+	}
+}
+
+// TestRunTestFlagsRepeatAccumulate pins the fs.Func accumulation: a second
+// --test-flags must add to the first, not replace it. Verified through the
+// config the CLI layer builds, since that is what every consumer reads.
+func TestRunTestFlagsRepeatAccumulate(t *testing.T) {
+	// A managed flag in the *second* occurrence only errors if that
+	// occurrence survived the join — a last-one-wins bug would drop the
+	// first, and an overwrite bug would drop the second.
+	err := run(context.Background(), []string{"--test-flags", "-short", "--test-flags", "-overlay=x", "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("second --test-flags value must survive the join, got err: %v", err)
+	}
+	err = run(context.Background(), []string{"--test-flags", "-overlay=x", "--test-flags", "-short", "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "-overlay") {
+		t.Fatalf("first --test-flags value must survive the join, got err: %v", err)
+	}
+}
+
 // TestRunQuietSuppressesProgressKeepsSummary mirrors TestRunFullPipeline's
 // fixture so any drift in non-quiet output is caught by that test, not this one.
 func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
@@ -864,7 +1079,7 @@ func TestRunCoverageErrorMessage(t *testing.T) {
 
 	origCov := runCoverageFunc
 	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string) (string, error) {
+	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
 		return "", errors.New("inject coverage failure: marker_xyz")
 	}
 
@@ -887,7 +1102,7 @@ func TestRunMeasureBaselineErrorMessage(t *testing.T) {
 
 	origM := measureBaselineFunc
 	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string) (time.Duration, error) {
+	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
 		return 0, errors.New("inject baseline failure: marker_pdq")
 	}
 
@@ -1363,7 +1578,7 @@ func TestRun_CoverageCacheHit_SkipsRunCoverage(t *testing.T) {
 	// Second run: any call to runCoverageFunc would surface as an error.
 	origRC := runCoverageFunc
 	defer func() { runCoverageFunc = origRC }()
-	runCoverageFunc = func(context.Context, string, []string, string, string, string) (string, error) {
+	runCoverageFunc = func(context.Context, string, []string, string, string, string, []string) (string, error) {
 		return "", errors.New("runCoverageFunc must NOT be called on a cache hit")
 	}
 
@@ -1406,9 +1621,9 @@ func TestRun_CoverageCacheMiss_RunsCoverage(t *testing.T) {
 	called := false
 	origRC := runCoverageFunc
 	defer func() { runCoverageFunc = origRC }()
-	runCoverageFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string) (string, error) {
+	runCoverageFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string, testFlags []string) (string, error) {
 		called = true
-		return origRC(ctx, projectDir, packages, coverPkg, tags, tmpDir)
+		return origRC(ctx, projectDir, packages, coverPkg, tags, tmpDir, testFlags)
 	}
 
 	// Pin the toolchain string so the hand-written cache below passes the

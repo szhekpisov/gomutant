@@ -94,9 +94,9 @@ func TestParseLine(t *testing.T) {
 		{"file.go:bad 1 1", true, "", 0},
 		{"file.go:10.2,15.3 bad 1", true, "", 0},
 		{"file.go:10.2,15.3 1 bad", true, "", 0},
-		{"file.go:10.2 1 1", true, "", 0},      // no comma in range
-		{"file.go:bad.2,15.3 1 1", true, "", 0}, // bad start line
-		{"file.go:10.2,bad.3 1 1", true, "", 0}, // bad end line
+		{"file.go:10.2 1 1", true, "", 0},                   // no comma in range
+		{"file.go:bad.2,15.3 1 1", true, "", 0},             // bad start line
+		{"file.go:10.2,bad.3 1 1", true, "", 0},             // bad end line
 		{"file.go:only-two-fields 1", true, "", 0},          // wrong field count (2)
 		{"file.go:too many fields here 1 2 3", true, "", 0}, // wrong field count (5)
 	}

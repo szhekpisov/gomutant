@@ -44,6 +44,23 @@ type TimeoutPolicy struct {
 	// Adaptive is the master switch. When false, For() always returns
 	// Global; the per-mutant tm/m arguments are ignored.
 	Adaptive bool
+
+	// Unmeasured reports that the TestMap's per-test timings were recorded
+	// under different conditions than the runs they would now size, which
+	// makes them unusable as a deadline no matter how large Margin is.
+	// Set when --test-flags is in effect: those flags reach the per-mutant
+	// `go test` but not the timing phase, which compiles with `go test -c`
+	// and drives the binary through `-test.*`-namespaced flags.
+	//
+	// The direction matters. Work-reducing flags (-short) would only leave
+	// the adaptive value generous, but work-increasing ones (-race,
+	// -count=N) make it too tight, and the failure is silent: the mutant
+	// lands TIMED_OUT, which sits outside the killed/lived efficacy
+	// denominator, so a survivor disappears from the score instead of
+	// showing up in it. When set, For() falls back to Global — sound,
+	// because Global derives from the baseline, and the baseline *is*
+	// measured with --test-flags applied.
+	Unmeasured bool
 }
 
 // For returns the per-mutant timeout for `m`, consulting `tm` for
@@ -56,13 +73,21 @@ type TimeoutPolicy struct {
 //     Used when no per-test set is known — typically when the mutated
 //     line isn't in any covered block, so the runner falls back to
 //     running the whole package.
-//  3. Global. Last resort: no measurements available at all.
+//  3. Global. Last resort: no measurements available at all, or the ones
+//     we have don't describe this run (Unmeasured).
 //
 // The output is clamped: max(scaled, Min), then min(that, Global).
 // Both clamps fail safe — too-tight measurements widen to Min, and a
 // pathological multiplication can never escape Global.
 func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration {
 	if !p.Adaptive {
+		return p.Global
+	}
+
+	// Kept as its own early return rather than folded into the guard
+	// above: the two carry different reasons (opted out vs. no usable
+	// measurement) and each has to stay independently observable.
+	if p.Unmeasured {
 		return p.Global
 	}
 

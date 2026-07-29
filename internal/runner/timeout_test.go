@@ -51,6 +51,36 @@ func TestTimeoutPolicyForAdaptiveDisabledIgnoresTestMap(t *testing.T) {
 	}
 }
 
+// TestTimeoutPolicyForUnmeasuredIgnoresTestMap pins the --test-flags
+// fallback: timings recorded without the run's flags can't size its
+// deadlines, so Unmeasured must return Global even with a fully populated
+// map and Adaptive on. Kills BRANCH_IF on the `if p.Unmeasured` return —
+// dropping it hands a `-race` run a deadline measured without -race,
+// which turns survivors into TIMED_OUT and quietly removes them from the
+// efficacy denominator.
+func TestTimeoutPolicyForUnmeasuredIgnoresTestMap(t *testing.T) {
+	tm := newTestMapWithDurations(t,
+		map[[2]string]time.Duration{
+			{"p", "TestA"}: 100 * time.Millisecond,
+		},
+		map[string][]coverage.TestRef{
+			"f.go:1": {{Pkg: "p", Name: "TestA"}},
+		},
+	)
+	m := mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true, Unmeasured: true}
+	if got := p.For(tm, m); got != 30*time.Second {
+		t.Errorf("Unmeasured must return Global; got %v", got)
+	}
+	// The same policy without the flag must still size adaptively —
+	// otherwise the assertion above would pass on a For() that ignores
+	// the TestMap unconditionally.
+	p.Unmeasured = false
+	if got := p.For(tm, m); got != time.Second {
+		t.Errorf("Unmeasured=false must size from the TestMap (100ms × 3, clamped to Min 1s); got %v", got)
+	}
+}
+
 func TestTimeoutPolicyForUsesPerTestSum(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{

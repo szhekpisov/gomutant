@@ -83,8 +83,8 @@ var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 // lets us hit the unhappy paths in NewWorker / Worker.Test (write failure,
 // fork/exec failure) without contriving filesystem or PATH state.
 var (
-	writeFileFunc       = os.WriteFile
-	execCommandContext  = exec.CommandContext
+	writeFileFunc      = os.WriteFile
+	execCommandContext = exec.CommandContext
 )
 
 // shortFlagFromEnv reports whether the inner `go test` should be invoked
@@ -107,7 +107,7 @@ type Worker struct {
 	policy      TimeoutPolicy
 	sourceCache map[string][]byte // Read-only, shared across workers.
 	projectDir  string            // Working directory for go test.
-	testMap     *coverage.TestMap  // Per-test coverage map (may be nil).
+	testMap     *coverage.TestMap // Per-test coverage map (may be nil).
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
 	// Limits compile + test runtime parallelism per child so N parallel workers
@@ -125,6 +125,20 @@ type Worker struct {
 	// `-tags=<value>` so mutants in build-tag-gated files compile and run.
 	// Set by the pool after construction, mirroring testCPU.
 	tags string
+
+	// testFlags are the user's --test-flags, appended verbatim to every
+	// inner `go test` argv. Empty appends nothing. They land after the
+	// flags we set ourselves, so where both spell the same flag the user's
+	// value wins — Go's flag parsing takes the last occurrence.
+	//
+	// That "last one wins" rule is argv-level only, and it is not a
+	// general override guarantee: -timeout is also enforced out-of-band by
+	// the context deadline in Worker.Test, so lengthening it via argv
+	// alone would not work. Flags in that class, along with the ones
+	// gomutants depends on (-overlay, -run, -args, …), are rejected at the
+	// CLI boundary and cannot reach here. Set by the pool after
+	// construction, mirroring tags.
+	testFlags []string
 }
 
 // NewWorker creates a worker with stable temp file paths.
@@ -349,6 +363,8 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 	if short {
 		args = append(args, "-short")
 	}
+	// User flags go last so they override anything above them.
+	args = append(args, w.testFlags...)
 	return args
 }
 

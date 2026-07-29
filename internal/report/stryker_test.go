@@ -176,7 +176,7 @@ func TestWriteStryker_MultiLineMutant(t *testing.T) {
 	}
 
 	// The body spans byte offsets covering "{...\n}" (multi-line).
-	startOff := 5         // '{'
+	startOff := 5          // '{'
 	endOff := len(src) - 1 // '}' is at len-2; EndOffset is exclusive.
 
 	mutants := []mutator.Mutant{

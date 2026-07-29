@@ -65,8 +65,8 @@ func TestWorkerTestMissingSource(t *testing.T) {
 	}
 
 	m := mutator.Mutant{
-		ID:   1,
-		File: "/nonexistent/file.go",
+		ID:     1,
+		File:   "/nonexistent/file.go",
 		Status: mutator.StatusPending,
 	}
 
@@ -810,6 +810,63 @@ func TestBuildTestArgsTags(t *testing.T) {
 	}
 }
 
+// TestBuildTestArgsTestFlags kills STATEMENT_REMOVE on the
+// `append(args, w.testFlags...)` line and pins the ordering contract:
+// user flags land after every flag we set ourselves (so a user value for
+// a flag we also pass wins under Go's last-occurrence rule) but still
+// ahead of the package argument.
+func TestBuildTestArgsTestFlags(t *testing.T) {
+	m := mutator.Mutant{Pkg: "mymod"}
+
+	wOn := &Worker{
+		testFlags:   []string{"-rapid.checks=20", "-race"},
+		policy:      TimeoutPolicy{Global: time.Second},
+		overlayPath: "/tmp/o.json",
+	}
+	args := wOn.buildTestArgs(m, true, time.Second)
+	for _, want := range []string{"-rapid.checks=20", "-race"} {
+		if !containsStr(args, want) {
+			t.Errorf("testFlags set: args %v missing %q", args, want)
+		}
+	}
+	// Order: after -short (the last flag baseTestArgs sets), before the
+	// package. A prepend would put them ahead of -timeout/-overlay, where a
+	// user override could no longer win.
+	shortIdx := indexOfStr(args, "-short")
+	flagIdx := indexOfStr(args, "-rapid.checks=20")
+	if shortIdx < 0 || flagIdx < shortIdx {
+		t.Errorf("user flags must follow -short; -short at %d, -rapid.checks at %d in %v", shortIdx, flagIdx, args)
+	}
+	if args[len(args)-1] != "mymod" {
+		t.Errorf("package must stay last, got %q in %v", args[len(args)-1], args)
+	}
+
+	wOff := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
+	argsOff := wOff.buildTestArgs(m, false, time.Second)
+	if containsStr(argsOff, "-rapid.checks=20") {
+		t.Errorf("testFlags unset: args %v must not gain user flags", argsOff)
+	}
+}
+
+// TestTestInvocationsTestFlags pins that the cross-package (integration)
+// builder forwards user flags too — it composes baseTestArgs per covering
+// package, so a regression there would silently drop the flags on exactly
+// the runs that are most expensive.
+func TestTestInvocationsTestFlags(t *testing.T) {
+	w := &Worker{
+		testFlags:   []string{"-short"},
+		policy:      TimeoutPolicy{Global: time.Second},
+		overlayPath: "/tmp/o.json",
+	}
+	invs := w.testInvocations(mutator.Mutant{Pkg: "mymod"}, false, time.Second)
+	if len(invs) != 1 {
+		t.Fatalf("want 1 invocation with no testMap, got %d: %v", len(invs), invs)
+	}
+	if !containsStr(invs[0], "-short") {
+		t.Errorf("invocation %v missing forwarded -short", invs[0])
+	}
+}
+
 // TestBuildTestArgsPackageArgLast kills STATEMENT_REMOVE on
 // `args = append(args, m.Pkg)`: removing that line leaves the command
 // without a package target. Asserting that the package shows up as the
@@ -940,6 +997,18 @@ func containsStr(xs []string, target string) bool {
 	}
 	return false
 }
+
+// indexOfStr returns the position of target in xs, or -1. Used where a
+// test asserts relative argv ordering, not just membership.
+func indexOfStr(xs []string, target string) int {
+	for i, x := range xs {
+		if x == target {
+			return i
+		}
+	}
+	return -1
+}
+
 func anyHasPrefix(xs []string, prefix string) bool {
 	for _, x := range xs {
 		if strings.HasPrefix(x, prefix) {

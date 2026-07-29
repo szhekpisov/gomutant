@@ -199,7 +199,7 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	if err := Save(c, path); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if len(got.Entries) != 1 || got.Entries[0] != c.Entries[0] {
 		t.Fatalf("round-trip mismatch: %+v", got.Entries)
 	}
@@ -222,7 +222,7 @@ func TestSaveLoad_RoundTripCoverageFields(t *testing.T) {
 	if err := Save(c, path); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if got.CoverageKey != "deadbeefcafe" {
 		t.Errorf("CoverageKey not preserved: got %q", got.CoverageKey)
 	}
@@ -232,7 +232,7 @@ func TestSaveLoad_RoundTripCoverageFields(t *testing.T) {
 }
 
 func TestLoad_EmptyPath(t *testing.T) {
-	c := Load("", testModule, testVersion, "", "")
+	c := Load("", testModule, testVersion, "", "", "")
 	if c == nil || len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache, got %+v", c)
 	}
@@ -243,7 +243,7 @@ func TestLoad_EmptyPath(t *testing.T) {
 
 func TestLoad_Missing(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "nonexistent.json")
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache for missing file, got %d entries", len(c.Entries))
 	}
@@ -252,7 +252,7 @@ func TestLoad_Missing(t *testing.T) {
 func TestLoad_GarbageJSON(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, "{not json")
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for garbage")
 	}
@@ -261,7 +261,7 @@ func TestLoad_GarbageJSON(t *testing.T) {
 func TestLoad_SchemaVersionMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, `{"schema_version":99,"go_module":"`+testModule+`","tool_version":"`+testVersion+`","entries":[{"rel_file":"x.go","status":"KILLED"}]}`)
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for schema mismatch")
 	}
@@ -269,24 +269,24 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 4 must load under the current
-// constant. (Pins SchemaVersion == 4; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 5 must load under the current
+// constant. (Pins SchemaVersion == 5; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 4 {
+	if SchemaVersion != 5 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":4,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":5,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-4 cache must load under SchemaVersion=4, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-5 cache must load under SchemaVersion=5, got %d entries", len(c.Entries))
 	}
 }
 
 func TestLoad_ModuleMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"other/mod","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for module mismatch")
 	}
@@ -295,45 +295,134 @@ func TestLoad_ModuleMismatch(t *testing.T) {
 func TestLoad_ToolVersionMismatch(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"0.0.9","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatal("expected empty cache for tool-version mismatch")
 	}
 }
 
-// TestLoad_BuildTagsMismatch pins the build-tags dimension of the metadata
-// gate: a cache built with one --tags value must be discarded when loaded
-// for a different value, because a tag change can flip mutant outcomes
-// without touching source/test hashes. Kills CONDITIONALS_NEGATION and the
-// STATEMENT_REMOVE / logical mutants on the `c.BuildTags != buildTags`
-// clause in Load.
-func TestLoad_BuildTagsMismatch(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","build_tags":"integration","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
+// loadGateDims enumerates the free-form string dimensions of Load's
+// metadata gate. All three behave identically — a mismatch discards the
+// whole cache, a match reuses it, and an absent field reads as "" — so
+// they are exercised by one table rather than three near-identical tests.
+// Each entry carries the *reason* its dimension gates, since that is the
+// part a reader cannot recover from the mechanics.
+var loadGateDims = []struct {
+	name    string // dimension name, for failure messages
+	jsonKey string // the cache-file field it round-trips through
+	why     string // why a change here must discard cached verdicts
+	stored  string // value baked into the fixture
+	other   string // a different value, to force a mismatch
+	// load calls Load with value in this dimension's argument position,
+	// leaving the others empty. get reads the same dimension back off the
+	// returned Cache.
+	load func(path, value string) *Cache
+	get  func(c *Cache) string
+}{
+	{
+		name: "build tags", jsonKey: "build_tags",
+		why:    "a tag change pulls in different compiled-in code, flipping outcomes without touching source or test hashes",
+		stored: "integration", other: "e2e",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, v, "", "") },
+		get:  func(c *Cache) string { return c.BuildTags },
+	},
+	{
+		name: "test flags", jsonKey: "test_flags",
+		why:    "the documented workflow alternates a cheap --test-flags gate run with a full scoring run, and a LIVED earned at 20 rapid checks is not the verdict for a 100-check run",
+		stored: "-rapid.checks=20", other: "-short",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, "", v, "") },
+		get:  func(c *Cache) string { return c.TestFlags },
+	},
+	{
+		name: "go toolchain", jsonKey: "go_toolchain",
+		why:    "EQUIVALENT verdicts are decided by the compiler's generated code, which changes between toolchains",
+		stored: "go1.26.1", other: "go1.27.0",
+		load: func(p, v string) *Cache { return Load(p, testModule, testVersion, "", "", v) },
+		get:  func(c *Cache) string { return c.GoToolchain },
+	},
+}
 
-	// Different tags → discard.
-	if c := Load(p, testModule, testVersion, "e2e", ""); len(c.Entries) != 0 {
-		t.Fatalf("expected empty cache for build-tags mismatch, got %d entries", len(c.Entries))
+// writeGateFixture writes a one-entry cache file whose metadata matches the
+// test module/version, optionally carrying jsonKey:value. Passing an empty
+// jsonKey omits the field entirely, which is how a cache written before the
+// dimension existed looks on disk.
+func writeGateFixture(t *testing.T, jsonKey, value string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "cache.json")
+	field := ""
+	if jsonKey != "" {
+		field = fmt.Sprintf(`"%s":"%s",`, jsonKey, value)
 	}
-	// No tags requested → still a mismatch against the tagged cache.
-	if c := Load(p, testModule, testVersion, "", ""); len(c.Entries) != 0 {
-		t.Fatalf("expected empty cache when requesting no tags against a tagged cache, got %d entries", len(c.Entries))
-	}
-	// Same tags → reuse.
-	if c := Load(p, testModule, testVersion, "integration", ""); len(c.Entries) != 1 {
-		t.Fatalf("expected entries preserved on matching build tags, got %d", len(c.Entries))
+	mustWrite(t, p, fmt.Sprintf(
+		`{"schema_version":%d,"go_module":"%s","tool_version":"%s",%s"entries":[{"rel_file":"x.go","status":"KILLED"}]}`,
+		SchemaVersion, testModule, testVersion, field))
+	return p
+}
+
+// TestLoad_MetadataGateDimensions pins every string dimension of the gate
+// in both directions. Kills CONDITIONALS_NEGATION and the STATEMENT_REMOVE /
+// logical mutants on each `c.X != x` clause in Load: dropping a clause makes
+// the mismatch rows reuse a stale cache, and negating one makes the matching
+// row throw a good cache away.
+func TestLoad_MetadataGateDimensions(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, dim.jsonKey, dim.stored)
+
+			// A different value → discard. This is the direction that
+			// matters: reusing here yields a wrong result, for the
+			// reason the dimension records in `why`.
+			if c := dim.load(p, dim.other); len(c.Entries) != 0 {
+				t.Errorf("%s=%q must discard a cache built with %q, got %d entries (%s)",
+					dim.name, dim.other, dim.stored, len(c.Entries), dim.why)
+			}
+			// Requesting the default against a non-default cache is
+			// still a mismatch — "" must not be treated as a wildcard.
+			if c := dim.load(p, ""); len(c.Entries) != 0 {
+				t.Errorf("unset %s must discard a cache built with %q, got %d entries",
+					dim.name, dim.stored, len(c.Entries))
+			}
+			// The same value → reuse. Without this the gate could pass
+			// the rows above by rejecting unconditionally.
+			if c := dim.load(p, dim.stored); len(c.Entries) != 1 {
+				t.Errorf("matching %s=%q must reuse the cache, got %d entries",
+					dim.name, dim.stored, len(c.Entries))
+			}
+		})
 	}
 }
 
-// TestLoad_BuildTagsBackCompat ensures a pre-existing cache with no
-// build_tags field (the value before --tags existed) stays reusable for a
-// tag-less run — the default "" must compare equal so we don't gratuitously
-// invalidate every existing user's cache.
-func TestLoad_BuildTagsBackCompat(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-	if c := Load(p, testModule, testVersion, "", ""); len(c.Entries) != 1 {
-		t.Fatalf("a tag-less cache must stay reusable for a tag-less run, got %d entries", len(c.Entries))
+// TestLoad_MetadataGateBackCompat pins that a cache file written before a
+// dimension existed stays reusable for a run that doesn't use it. The
+// absent field unmarshals to "" and must compare equal to an unset
+// argument, so adding a dimension costs nothing to the common case of
+// never setting it.
+func TestLoad_MetadataGateBackCompat(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, "", "") // field omitted entirely
+			if c := dim.load(p, ""); len(c.Entries) != 1 {
+				t.Errorf("a cache with no %s field must stay reusable for an unset run, got %d entries",
+					dim.jsonKey, len(c.Entries))
+			}
+		})
+	}
+}
+
+// TestLoad_MetadataGateStampsRequested pins that the empty cache handed
+// back on a gate miss carries the *requested* value, not the rejected
+// file's. Otherwise the run would recompute every verdict and then save it
+// stamped with the old value, so the next matching run would miss again
+// and the cache would never converge.
+func TestLoad_MetadataGateStampsRequested(t *testing.T) {
+	for _, dim := range loadGateDims {
+		t.Run(dim.name, func(t *testing.T) {
+			p := writeGateFixture(t, dim.jsonKey, dim.stored)
+			c := dim.load(p, dim.other)
+			if got := dim.get(c); got != dim.other {
+				t.Errorf("discarded cache stamped %s=%q, want the requested %q", dim.name, got, dim.other)
+			}
+		})
 	}
 }
 
@@ -346,7 +435,7 @@ func TestLoad_V2CacheRejectedAfterV3Bump(t *testing.T) {
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":2,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
-	c := Load(p, testModule, testVersion, "", "")
+	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
 		t.Fatalf("expected empty cache (v2 rejected by v%d Load); got %d entries", SchemaVersion, len(c.Entries))
 	}
@@ -416,7 +505,7 @@ func TestSave_RewriteIsAtomic(t *testing.T) {
 		t.Fatalf("save 2: %v", err)
 	}
 
-	got := Load(path, testModule, testVersion, "", "")
+	got := Load(path, testModule, testVersion, "", "", "")
 	if len(got.Entries) != 1 || got.Entries[0].RelFile != "b.go" {
 		t.Fatalf("rewrite did not replace cleanly: %+v", got.Entries)
 	}
@@ -878,11 +967,11 @@ func setupCoverageProject(t *testing.T) (projectDir string, pkgDir string) {
 func TestHashCoverageInputs_StableAcrossCalls(t *testing.T) {
 	dir, pkg := setupCoverageProject(t)
 	// Two fresh hashers — the memo can't shortcut the result.
-	h1, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "toolchain-x", "env-x")
+	h1, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "toolchain-x", "env-x")
 	if err != nil {
 		t.Fatalf("hash1: %v", err)
 	}
-	h2, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "toolchain-x", "env-x")
+	h2, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "toolchain-x", "env-x")
 	if err != nil {
 		t.Fatalf("hash2: %v", err)
 	}
@@ -898,14 +987,23 @@ func TestHashCoverageInputs_StableAcrossCalls(t *testing.T) {
 // collapse one of these dimensions; the table forces every Fprintf to be
 // observable.
 func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
+	// coverageInputs bundles the dimensions HashCoverageInputs fingerprints.
+	// A struct rather than a positional parameter list: there are seven
+	// same-typed strings, so a transposed pair would silently still compile
+	// and the test would keep passing against the wrong dimension. Named
+	// fields also keep the helper below within the parameter-count limit.
+	type coverageInputs struct {
+		pkgDir, projectDir, coverPkg, tags, testFlags, toolchain, env string
+	}
 	// hash runs HashCoverageInputs and fails the test on error. Extracted so
 	// the baseline and each of the table cases below is a single call rather
 	// than repeating the hash-and-check boilerplate (which the duplication
 	// detector flags). Cases hash a single dir (pkgDir == projectDir); the
 	// baseline hashes the subpackage dir against the project root.
-	hash := func(t *testing.T, pkgDir, projectDir, coverPkg, tags, toolchain, env string) string {
+	hash := func(t *testing.T, in coverageInputs) string {
 		t.Helper()
-		h, err := NewHasher(nil).HashCoverageInputs([]string{pkgDir}, projectDir, coverPkg, tags, toolchain, env)
+		h, err := NewHasher(nil).HashCoverageInputs(
+			[]string{in.pkgDir}, in.projectDir, in.coverPkg, in.tags, in.testFlags, in.toolchain, in.env)
 		if err != nil {
 			t.Fatalf("hash: %v", err)
 		}
@@ -913,7 +1011,13 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 	}
 	baseline := func(t *testing.T) (string, string) {
 		dir, pkg := setupCoverageProject(t)
-		return dir, hash(t, pkg, dir, "./...", "", "go1.26", "GOEXPERIMENT=|")
+		return dir, hash(t, coverageInputs{
+			pkgDir:     pkg,
+			projectDir: dir,
+			coverPkg:   "./...",
+			toolchain:  "go1.26",
+			env:        "GOEXPERIMENT=|",
+		})
 	}
 
 	// Each row changes exactly one HashCoverageInputs input relative to the
@@ -927,9 +1031,9 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 		baseEnv       = "GOEXPERIMENT=|"
 	)
 	tests := []struct {
-		name                           string
-		write                          func(t *testing.T, dir string)
-		coverPkg, tags, toolchain, env string
+		name                                      string
+		write                                     func(t *testing.T, dir string)
+		coverPkg, tags, testFlags, toolchain, env string
 	}{
 		{name: "prod file content", write: func(t *testing.T, dir string) {
 			mustWrite(t, filepath.Join(dir, "x.go"), "package testmod\nfunc Add(a, b int) int { return b + a }\n")
@@ -945,6 +1049,9 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 		}},
 		{name: "coverPkg", coverPkg: "testmod/sub"},
 		{name: "tags", tags: "integration"},
+		// --test-flags reach the coverage run itself, so a profile taken
+		// under -short must not be replayed for a full run (or vice versa).
+		{name: "test flags", testFlags: "-short"},
 		{name: "toolchain", toolchain: "go1.27"},
 		{name: "env snapshot", env: "GOEXPERIMENT=loopvar|"},
 	}
@@ -955,11 +1062,15 @@ func TestHashCoverageInputs_DetectsEachInputChange(t *testing.T) {
 			if tc.write != nil {
 				tc.write(t, dir)
 			}
-			got := hash(t, dir, dir,
-				cmp.Or(tc.coverPkg, baseCoverPkg),
-				tc.tags,
-				cmp.Or(tc.toolchain, baseToolchain),
-				cmp.Or(tc.env, baseEnv))
+			got := hash(t, coverageInputs{
+				pkgDir:     dir,
+				projectDir: dir,
+				coverPkg:   cmp.Or(tc.coverPkg, baseCoverPkg),
+				tags:       tc.tags,
+				testFlags:  tc.testFlags,
+				toolchain:  cmp.Or(tc.toolchain, baseToolchain),
+				env:        cmp.Or(tc.env, baseEnv),
+			})
 			if got == base {
 				t.Errorf("hash unchanged after mutating %s — STATEMENT_REMOVE on the corresponding Fprintf collapses this dimension", tc.name)
 			}
@@ -977,7 +1088,7 @@ func TestHashCoverageInputs_GoSumOptional(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "go.sum")); err != nil {
 		t.Fatalf("rm go.sum: %v", err)
 	}
-	if _, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env"); err != nil {
+	if _, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env"); err != nil {
 		t.Errorf("hash with missing go.sum should succeed, got: %v", err)
 	}
 }
@@ -990,7 +1101,7 @@ func TestHashCoverageInputs_MissingGoModFails(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "go.mod")); err != nil {
 		t.Fatalf("rm go.mod: %v", err)
 	}
-	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err == nil {
 		t.Fatal("expected error when go.mod is missing")
 	}
@@ -1004,7 +1115,7 @@ func TestHashCoverageInputs_MissingGoModFails(t *testing.T) {
 func TestHashCoverageInputs_MissingPkgDirFails(t *testing.T) {
 	dir, _ := setupCoverageProject(t)
 	bogus := filepath.Join(dir, "no-such-pkg")
-	_, err := NewHasher(nil).HashCoverageInputs([]string{bogus}, dir, "", "", "tc", "env")
+	_, err := NewHasher(nil).HashCoverageInputs([]string{bogus}, dir, "", "", "", "tc", "env")
 	if err == nil {
 		t.Fatal("expected error for missing pkgDir")
 	}
@@ -1026,7 +1137,7 @@ func TestHashCoverageInputs_UnreadableProdFile(t *testing.T) {
 	// Restore so t.TempDir() cleanup can remove the file.
 	defer func() { _ = os.Chmod(bad, 0o644) }()
 
-	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err == nil {
 		t.Fatal("expected error from unreadable .go file")
 	}
@@ -1040,7 +1151,7 @@ func TestHashCoverageInputs_UnreadableProdFile(t *testing.T) {
 // errors and HashCoverageInputs propagates that error.
 func TestHashCoverageInputs_IgnoresSubdirs(t *testing.T) {
 	dir, pkg := setupCoverageProject(t)
-	base, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	base, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("baseline: %v", err)
 	}
@@ -1049,7 +1160,7 @@ func TestHashCoverageInputs_IgnoresSubdirs(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(pkg, "vendor_tools.go"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	after, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	after, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("after: %v — IsDir branch removed, hasher tried to read a directory as a file", err)
 	}
@@ -1078,11 +1189,11 @@ func TestHashCoverageInputs_SortStableAcrossPkgDirOrder(t *testing.T) {
 	mustWrite(t, filepath.Join(pkgA, "alpha.go"), "package a\n")
 	mustWrite(t, filepath.Join(pkgB, "beta.go"), "package b\n")
 
-	hAB, err := NewHasher(nil).HashCoverageInputs([]string{pkgA, pkgB}, root, "", "", "tc", "env")
+	hAB, err := NewHasher(nil).HashCoverageInputs([]string{pkgA, pkgB}, root, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("AB: %v", err)
 	}
-	hBA, err := NewHasher(nil).HashCoverageInputs([]string{pkgB, pkgA}, root, "", "", "tc", "env")
+	hBA, err := NewHasher(nil).HashCoverageInputs([]string{pkgB, pkgA}, root, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("BA: %v", err)
 	}
@@ -1109,11 +1220,11 @@ func TestHashCoverageInputs_DeduplicatesPkgDirs(t *testing.T) {
 	}
 	mustWrite(t, filepath.Join(other, "z.go"), "package other\n")
 
-	once, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	once, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("once: %v", err)
 	}
-	twice, err := NewHasher(nil).HashCoverageInputs([]string{pkg, pkg}, dir, "", "", "tc", "env")
+	twice, err := NewHasher(nil).HashCoverageInputs([]string{pkg, pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("twice: %v", err)
 	}
@@ -1122,14 +1233,14 @@ func TestHashCoverageInputs_DeduplicatesPkgDirs(t *testing.T) {
 	}
 
 	// Reference: pkg + other, no duplicates.
-	canonical, err := NewHasher(nil).HashCoverageInputs([]string{pkg, other}, dir, "", "", "tc", "env")
+	canonical, err := NewHasher(nil).HashCoverageInputs([]string{pkg, other}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("canonical: %v", err)
 	}
 	// Same set, but with a duplicate pkg entry mid-list. With `continue`
 	// the loop keeps going and appends `other`. With `break` (mutant) the
 	// loop exits at the dup, `other` is dropped, and the hash differs.
-	dupThenNew, err := NewHasher(nil).HashCoverageInputs([]string{pkg, pkg, other}, dir, "", "", "tc", "env")
+	dupThenNew, err := NewHasher(nil).HashCoverageInputs([]string{pkg, pkg, other}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("dupThenNew: %v", err)
 	}
@@ -1150,7 +1261,7 @@ func TestHashCoverageInputs_GoSumReadErrorSurfaced(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "go.sum"), 0o755); err != nil {
 		t.Fatalf("mkdir go.sum: %v", err)
 	}
-	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	_, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err == nil {
 		t.Fatal("expected error when go.sum is unreadable (is-a-directory)")
 	}
@@ -1165,35 +1276,18 @@ func TestHashCoverageInputs_GoSumReadErrorSurfaced(t *testing.T) {
 // -coverprofile` produces).
 func TestHashCoverageInputs_IgnoresNonGoFiles(t *testing.T) {
 	dir, pkg := setupCoverageProject(t)
-	base, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	base, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("baseline: %v", err)
 	}
 	mustWrite(t, filepath.Join(pkg, "README.md"), "hello")
 	mustWrite(t, filepath.Join(pkg, "data.json"), `{"x": 1}`)
-	after, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "tc", "env")
+	after, err := NewHasher(nil).HashCoverageInputs([]string{pkg}, dir, "", "", "", "tc", "env")
 	if err != nil {
 		t.Fatalf("after: %v", err)
 	}
 	if base != after {
 		t.Errorf("non-.go files leaked into hash: base=%s after=%s", base, after)
-	}
-}
-
-// TestLoad_GoToolchainMismatch pins the go_toolchain dimension of the
-// metadata gate: equivalence verdicts are decided by the compiler, so a
-// cache built under one toolchain must be discarded for a different one
-// and reused for a matching one. Kills the EXPRESSION_REMOVE on the
-// `c.GoToolchain != goToolchain` clause in Load.
-func TestLoad_GoToolchainMismatch(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":%d,"go_module":"%s","tool_version":"%s","go_toolchain":"go1.26.1","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, SchemaVersion, testModule, testVersion))
-
-	if c := Load(p, testModule, testVersion, "", "go1.27.0"); len(c.Entries) != 0 {
-		t.Fatalf("expected discard on go_toolchain mismatch, got %d entries", len(c.Entries))
-	}
-	if c := Load(p, testModule, testVersion, "", "go1.26.1"); len(c.Entries) != 1 {
-		t.Fatalf("expected reuse on matching go_toolchain, got %d entries", len(c.Entries))
 	}
 }
 

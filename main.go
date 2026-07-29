@@ -232,6 +232,7 @@ func run(ctx context.Context, args []string) error {
 		checkpointInterval config.CheckpointIntervalFlag
 		coverPkg           string
 		tags               string
+		testFlags          []string
 		output             string
 		configPath         string
 		disable            string
@@ -295,6 +296,17 @@ func run(ctx context.Context, args []string) error {
 	})
 	fs.StringVar(&coverPkg, "coverpkg", "", "coverage package pattern")
 	fs.StringVar(&tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
+	// fs.Func rather than StringVar so repeated --test-flags accumulate
+	// instead of the last one silently winning; a user building the value
+	// up across a wrapper script and a CI invocation expects both to apply.
+	// The back-quoted `flags` is deliberate and must come first: flag's
+	// UnquoteUsage takes the first back-quoted token as the value
+	// placeholder shown in --help. Any other backticks in this string
+	// would be consumed instead, printing e.g. "-test-flags go test".
+	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags=-short", func(s string) error {
+		testFlags = append(testFlags, s)
+		return nil
+	})
 	fs.StringVar(&output, "output", "", "JSON report path")
 	fs.StringVar(&output, "o", "", "JSON report path (shorthand)")
 	fs.StringVar(&configPath, "config", ".gomutants.yml", "config file path")
@@ -354,6 +366,7 @@ func run(ctx context.Context, args []string) error {
 		CheckpointInterval: checkpointInterval,
 		CoverPkg:           coverPkg,
 		Tags:               tags,
+		TestFlags:          strings.Join(testFlags, " "),
 		Output:             output,
 		Disable:            disable,
 		Only:               only,
@@ -373,6 +386,12 @@ func run(ctx context.Context, args []string) error {
 	// rather than silently pick one.
 	if cfg.Integration && cfg.CoverPkg != "" {
 		return fmt.Errorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
+	}
+
+	// Checked after ApplyFlags so a value from .gomutants.yml is screened
+	// too, not just the CLI one.
+	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
+		return err
 	}
 
 	// Periodic checkpointing rides on the cache file; with --cache=off
@@ -417,7 +436,7 @@ func run(ctx context.Context, args []string) error {
 	)
 	if cfg.Cache != "" {
 		goToolchain = goVersionFunc(ctx)
-		loadedCache = cacheLoadFunc(cfg.Cache, goModule, cacheToolVersion(), cfg.Tags, goToolchain)
+		loadedCache = cacheLoadFunc(cfg.Cache, goModule, cacheToolVersion(), cfg.Tags, cfg.CanonicalTestFlags(), goToolchain)
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
 		// the in-memory source map exists (after step 6), so
@@ -512,7 +531,7 @@ func run(ctx context.Context, args []string) error {
 		}
 		if derr == nil {
 			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), goToolchain)
-			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, toolchain, captureCoverageEnv()); herr == nil {
+			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, cfg.CanonicalTestFlags(), toolchain, captureCoverageEnv()); herr == nil {
 				coverageKey = k
 			}
 		}
@@ -526,7 +545,7 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	if profile == nil {
-		profilePath, rerr := runCoverageFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir)
+		profilePath, rerr := runCoverageFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.TestFlagFields())
 		if rerr != nil {
 			return rerr
 		}
@@ -552,7 +571,7 @@ func run(ctx context.Context, args []string) error {
 
 	// 4. Measure baseline test duration.
 	term.Phase("Measuring baseline...")
-	baseline, err := measureBaselineFunc(ctx, projectDir, coveragePatterns, cfg.Tags)
+	baseline, err := measureBaselineFunc(ctx, projectDir, coveragePatterns, cfg.Tags, cfg.TestFlagFields())
 	if err != nil {
 		return err
 	}
@@ -713,12 +732,7 @@ func run(ctx context.Context, args []string) error {
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
 	// baseline×coefficient ceiling. testTimeout stays the absolute cap.
-	policy := runner.TimeoutPolicy{
-		Global:   testTimeout,
-		Margin:   cfg.TimeoutMargin,
-		Min:      cfg.TimeoutMin,
-		Adaptive: cfg.AdaptiveTimeoutEnabled(),
-	}
+	policy := timeoutPolicyFor(&cfg, testTimeout)
 	term2 := report.NewTerminal(stdout, pendingCount, cfg.Verbose, cfg.Quiet)
 	// Idle "(compiling)" heartbeat so the TTY doesn't sit silent during
 	// the first per-package go-test compile (no OnResult until the first
@@ -763,7 +777,7 @@ func run(ctx context.Context, args []string) error {
 		lastCheckpoint = time.Now()
 	}
 
-	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags}, policy, tmpDir, srcCache, projectDir, testMap)
+	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags, TestFlags: cfg.TestFlagFields()}, policy, tmpDir, srcCache, projectDir, testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	lastCheckpoint = time.Now()
@@ -887,6 +901,82 @@ func runGoVersion(ctx context.Context) string {
 		return "go-version-unavailable"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// timeoutPolicyFor builds the per-mutant deadline policy. global is the
+// baseline×coefficient ceiling, which stays the absolute cap in every
+// mode.
+//
+// Unmeasured is the one field that isn't a straight config read:
+// --test-flags reaches the per-mutant `go test` but not the timing phase
+// that fills the TestMap, so with flags in effect those durations describe
+// different work than the deadline is being set for, and adaptive sizing
+// has to stand down (see TimeoutPolicy.Unmeasured). Derived from the split
+// fields rather than the raw string so a whitespace-only value doesn't
+// needlessly give up adaptive sizing.
+func timeoutPolicyFor(cfg *config.Config, global time.Duration) runner.TimeoutPolicy {
+	return runner.TimeoutPolicy{
+		Global:     global,
+		Margin:     cfg.TimeoutMargin,
+		Min:        cfg.TimeoutMin,
+		Adaptive:   cfg.AdaptiveTimeoutEnabled(),
+		Unmeasured: len(cfg.TestFlagFields()) > 0,
+	}
+}
+
+// managedTestFlags are inner `go test` flags gomutants sets for itself,
+// mapped to the reason a user value can't be honored. Passing one through
+// --test-flags would not fail loudly, it would quietly produce a wrong
+// run: a replaced -overlay means no mutant is ever applied and every one
+// of them "survives", which reads as a legitimate result. Rejecting at
+// parse time is the only point where the user still finds out.
+var managedTestFlags = map[string]string{
+	"overlay":      "each mutant is applied through gomutants' own overlay",
+	"run":          "the test filter comes from the per-test coverage map",
+	"coverprofile": "gomutants owns the coverage profile path; see --coverpkg",
+	"coverpkg":     "use gomutants' own --coverpkg flag",
+	"c":            "gomutants runs tests here, it does not build binaries",
+	"o":            "gomutants runs tests here, it does not build binaries",
+	"exec":         "gomutants invokes the test binary itself",
+	// -args consumes every remaining argument, and gomutants appends the
+	// package pattern (and -run filter) after the user's flags. The inner
+	// `go test` would then test the working directory instead of the
+	// mutant's package, exit 0, and record the mutant as LIVED — the same
+	// silently-wrong outcome -overlay is rejected for.
+	"args": "gomutants appends the package argument after your flags, which -args would swallow",
+	// gomutants computes -timeout from the adaptive-timeout policy and
+	// caps every run with a context deadline of the same length, so a
+	// longer user value is silently overridden (the mutant still lands as
+	// TIMED_OUT) rather than honored.
+	"timeout": "the per-mutant deadline is computed by gomutants; see --timeout-coefficient, --timeout-margin, and --timeout-min",
+}
+
+// checkTestFlags rejects --test-flags entries that collide with a flag
+// gomutants manages. Matching is on the flag name via config.FlagName, so
+// `-overlay=x`, `-overlay x`, `--overlay`, and the `-test.`-prefixed
+// spelling are all caught, while a non-flag field never matches.
+//
+// The `-test.` spelling has to be covered because `go test` forwards it
+// straight to the test binary, where it wins over the flag gomutants set:
+// `go test -run=A -test.run=B` runs B, and `-test.coverprofile` writes
+// the profile somewhere other than where RunCoverage looks for it. Those
+// are the same silent wrongness the un-prefixed names are rejected for.
+func checkTestFlags(flags []string) error {
+	for _, f := range flags {
+		// FlagName yields "" for a field that isn't a flag at all (a
+		// detached value, as in `-gcflags all=-N`), and "" is never a
+		// managed name — so a value that happens to spell one can't trip
+		// the check, with no separate skip branch to keep in sync.
+		name, _ := config.FlagName(f)
+		if reason, ok := managedTestFlags[name]; ok {
+			// Echo the spelling the user typed, not the canonical name:
+			// being told "-run is managed" after passing `-test.run` reads
+			// like the wrong flag was rejected.
+			spelled, _, _ := strings.Cut(f, "=")
+			return fmt.Errorf("--test-flags: %s is managed by gomutants and cannot be overridden (%s)", spelled, reason)
+		}
+	}
+	return nil
 }
 
 // captureCoverageEnv returns an allowlisted snapshot of go-related env

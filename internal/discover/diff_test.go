@@ -513,7 +513,7 @@ func TestLooksLikeBadRevision(t *testing.T) {
 		"fatal: unknown revision 'x'":                    true,
 		"fatal: bad revision 'x'":                        true,
 		"fatal: ambiguous argument: not in working tree": false,
-		"":                                               false,
+		"": false,
 	}
 	for in, want := range cases {
 		if got := looksLikeBadRevision(in); got != want {
@@ -673,8 +673,8 @@ func TestFilterByDiffContinuesAfterEmptyRel(t *testing.T) {
 		"good.go": {{Start: 1, End: 1}},
 	}
 	mutants := []mutator.Mutant{
-		{ID: 1, File: "/abs/bad.go", Line: 1},        // Rel fails → rel=""
-		{ID: 2, File: "rel-root/good.go", Line: 1},   // Rel succeeds → "good.go"
+		{ID: 1, File: "/abs/bad.go", Line: 1},      // Rel fails → rel=""
+		{ID: 2, File: "rel-root/good.go", Line: 1}, // Rel succeeds → "good.go"
 	}
 	got := FilterByDiff(mutants, ranges, "rel-root")
 	if len(got) != 1 || got[0].ID != 2 {

@@ -186,12 +186,13 @@ func TestPoolCreateWorkersAppliesGOMAXPROCS(t *testing.T) {
 }
 
 // TestPoolCreateWorkersPropagatesExecOpts kills STATEMENT_REMOVE on the
-// `w.testCPU = p.exec.TestCPU` and `w.tags = p.exec.Tags` assignments in
-// createWorkers. With either elided the worker keeps the zero value, so the
-// configured --test-cpu / --tags never reaches the per-mutant `go test`
-// even though the pool was given a value.
+// `w.testCPU = p.exec.TestCPU`, `w.tags = p.exec.Tags`, and
+// `w.testFlags = p.exec.TestFlags` assignments in createWorkers. With any
+// of them elided the worker keeps the zero value, so the configured
+// --test-cpu / --tags / --test-flags never reaches the per-mutant
+// `go test` even though the pool was given a value.
 func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
-	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration"}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
+	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration", TestFlags: []string{"-short"}}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
 	workers := p.createWorkers()
 	if len(workers) == 0 {
 		t.Fatal("expected workers; createWorkers returned none")
@@ -202,6 +203,12 @@ func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
 		}
 		if w.tags != "integration" {
 			t.Errorf("worker[%d].tags = %q, want %q (STATEMENT_REMOVE drops `w.tags = p.exec.Tags`)", i, w.tags, "integration")
+		}
+		// Length and element checked separately so a failure says which
+		// half broke: dropping the assignment leaves testFlags nil (len 0),
+		// while a wrong source would keep the length but change the value.
+		if len(w.testFlags) != 1 || w.testFlags[0] != "-short" {
+			t.Errorf("worker[%d].testFlags = %v, want [-short] (STATEMENT_REMOVE drops `w.testFlags = p.exec.TestFlags`)", i, w.testFlags)
 		}
 	}
 }
@@ -408,7 +415,7 @@ func TestRunCoverageStdoutGoesToStderr(t *testing.T) {
 		// RunCoverage returns an error because the test fails; we don't
 		// care about the error itself, only the test output that should
 		// have been routed to os.Stderr.
-		_, _ = RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir())
+		_, _ = RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), nil)
 	})
 	if !strings.Contains(captured, marker) {
 		t.Errorf("marker %q not found in stderr capture; STATEMENT_REMOVE on `cmd.Stdout = os.Stderr` discards test output. Captured: %q", marker, captured)
@@ -704,7 +711,7 @@ func TestPoolRunCancelledFeederExitsViaCtxDone(t *testing.T) {
 
 func TestMeasureBaseline(t *testing.T) {
 	dir := setupTestProject(t)
-	duration, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "")
+	duration, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "", nil)
 	if err != nil {
 		t.Fatalf("MeasureBaseline: %v", err)
 	}
@@ -714,7 +721,7 @@ func TestMeasureBaseline(t *testing.T) {
 }
 
 func TestMeasureBaselineFailure(t *testing.T) {
-	_, err := MeasureBaseline(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "")
+	_, err := MeasureBaseline(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "", nil)
 	if err == nil {
 		t.Fatal("expected error for nonexistent package")
 	}
@@ -728,7 +735,7 @@ func TestMeasureBaselineFailure(t *testing.T) {
 func TestRunCoverage(t *testing.T) {
 	dir := setupTestProject(t)
 	tmpDir := t.TempDir()
-	profilePath, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", tmpDir)
+	profilePath, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", tmpDir, nil)
 	if err != nil {
 		t.Fatalf("RunCoverage: %v", err)
 	}
@@ -746,14 +753,14 @@ func TestRunCoverage(t *testing.T) {
 func TestRunCoverageWithCoverpkg(t *testing.T) {
 	dir := setupTestProject(t)
 	tmpDir := t.TempDir()
-	_, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "testmod", "", tmpDir)
+	_, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "testmod", "", tmpDir, nil)
 	if err != nil {
 		t.Fatalf("RunCoverage with coverpkg: %v", err)
 	}
 }
 
 func TestRunCoverageFailure(t *testing.T) {
-	_, err := RunCoverage(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "", "", t.TempDir())
+	_, err := RunCoverage(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "", "", t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("expected error for nonexistent package")
 	}
@@ -776,7 +783,7 @@ func TestRunCoverageFailure(t *testing.T) {
 func TestRunCoverageCoverPkgApplied(t *testing.T) {
 	dir := setupTestProject(t)
 	tmpDir := t.TempDir()
-	profilePath, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "completely/nonexistent/zzz", "", tmpDir)
+	profilePath, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "completely/nonexistent/zzz", "", tmpDir, nil)
 	if err != nil {
 		t.Fatalf("RunCoverage: %v", err)
 	}
@@ -819,11 +826,61 @@ func setupTaggedTestProject(t *testing.T) string {
 func TestMeasureBaselineForwardsTags(t *testing.T) {
 	dir := setupTaggedTestProject(t)
 
-	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, ""); err != nil {
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "", nil); err != nil {
 		t.Fatalf("no tags: tagged test must be excluded, got error: %v", err)
 	}
-	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "mytag"); err == nil {
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "mytag", nil); err == nil {
 		t.Fatal("tags=mytag: tagged failing test must run and fail, but baseline succeeded")
+	}
+}
+
+// setupShortSensitiveProject writes a module whose test fails only when
+// `-short` is in effect. That inverted polarity is what makes forwarding
+// observable: the flag reaching the inner `go test` is the difference
+// between a passing and a failing run, with no timing heuristics involved.
+func setupShortSensitiveProject(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	shortTest := "package testmod\n\nimport \"testing\"\n\nfunc TestShortSensitive(t *testing.T) {\n\tif testing.Short() {\n\t\tt.Fatal(\"ran in short mode\")\n\t}\n}\n"
+	for name, content := range map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"add.go":      "package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n",
+		"add_test.go": shortTest,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestMeasureBaselineForwardsTestFlags kills STATEMENT_REMOVE on
+// `args = append(args, testFlags...)` in MeasureBaseline. The baseline must
+// measure the same work the per-mutant runs do; if the flags are dropped
+// here, a --test-flags=-short run is sized against a full-cost baseline.
+func TestMeasureBaselineForwardsTestFlags(t *testing.T) {
+	dir := setupShortSensitiveProject(t)
+
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "", nil); err != nil {
+		t.Fatalf("no test flags: suite must pass, got error: %v", err)
+	}
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "", []string{"-short"}); err == nil {
+		t.Fatal("testFlags=[-short]: the short-sensitive test must run and fail, but baseline succeeded")
+	}
+}
+
+// TestRunCoverageForwardsTestFlags is the RunCoverage analogue. Forwarding
+// here is what keeps the profile honest: a test skipped under -short must
+// not be recorded as covering, or every mutant on its lines is reported as
+// a survivor rather than NOT_COVERED.
+func TestRunCoverageForwardsTestFlags(t *testing.T) {
+	dir := setupShortSensitiveProject(t)
+
+	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), nil); err != nil {
+		t.Fatalf("no test flags: suite must pass, got error: %v", err)
+	}
+	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), []string{"-short"}); err == nil {
+		t.Fatal("testFlags=[-short]: the short-sensitive test must run and fail, but coverage run succeeded")
 	}
 }
 
@@ -832,10 +889,10 @@ func TestMeasureBaselineForwardsTags(t *testing.T) {
 func TestRunCoverageForwardsTags(t *testing.T) {
 	dir := setupTaggedTestProject(t)
 
-	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir()); err != nil {
+	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), nil); err != nil {
 		t.Fatalf("no tags: tagged test must be excluded, got error: %v", err)
 	}
-	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "mytag", t.TempDir()); err == nil {
+	if _, err := RunCoverage(context.Background(), dir, []string{"testmod"}, "", "mytag", t.TempDir(), nil); err == nil {
 		t.Fatal("tags=mytag: tagged failing test must run and fail, but coverage run succeeded")
 	}
 }

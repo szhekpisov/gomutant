@@ -375,7 +375,6 @@ func TestResolvePackagesError(t *testing.T) {
 	}
 }
 
-
 func TestDiscoverMultiPackage(t *testing.T) {
 	dir := t.TempDir()
 	// Two packages with the same import path prefix.
