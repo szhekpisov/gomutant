@@ -10,9 +10,12 @@ clone — there is no release-from-the-UI path and no scheduled release job.
 | Stable | `v0.5.1` | Normal release, becomes the repo's **Latest** |
 | Release candidate | `v0.5.1-rc0` | **Pre-release**, never becomes Latest |
 
-Anything else is rejected by the *Validate semver tag* step in
-`.github/workflows/release.yml` — no `-rc.1`, no `-alpha` / `-beta`. The
-accepted pattern is `^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$`.
+Only these forms produce releases. Tags matching the workflow's `v*.*.*`
+trigger but not the accepted pattern (for example, `v1.0.0-alpha`) fail the
+*Validate semver tag* step. Tags outside that trigger (for example, `v0.6` or
+`v1.0-alpha`) do not start the workflow. There is no `-rc.1`, `-alpha`, or
+`-beta` support; the accepted pattern is
+`^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$`.
 
 ## What the pipeline does for you
 

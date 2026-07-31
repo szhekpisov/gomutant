@@ -98,14 +98,15 @@ jobs:
           fi
 
           # `git tag --list 'v*.*.*'` is fnmatch, so rc tags slip through the
-          # glob; the grep -E is what actually drops them. Filtering before the
-          # sort also sidesteps git's versionsort prerelease ordering gotcha.
-          # The trailing `|| true` is required: under pipefail, grep exiting 1
-          # on no match (the very first release) would kill the step.
-          prev="$(git tag --list 'v*.*.*' --merged "$TAG" --sort=-v:refname \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | grep -vxF "$TAG" \
-            | head -n 1 || true)"
+          # glob. Sort the full set, then filter rc tags before selecting the
+          # first result; removing entries preserves the stable tags' version
+          # order and keeps git's prerelease ordering from affecting the result.
+          # Keep the git invocation separate so repository/ref errors fail the
+          # step; awk legitimately returns empty for the first stable release.
+          tags="$(git tag --list 'v*.*.*' --merged "$TAG" --sort=-v:refname)"
+          prev="$(awk -v tag="$TAG" \
+            '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != tag { print; exit }' \
+            <<< "$tags")"
 
           if [ -z "$prev" ]; then
             echo "No previous stable tag before ${TAG}; using GoReleaser's default"
