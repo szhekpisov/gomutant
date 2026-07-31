@@ -121,7 +121,7 @@ See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT
 ### Go Install
 
 ```bash
-go install github.com/szhekpisov/gomutants@564651b902e1c9a9bf5da154126532e276e4cee5 # v0.2.3
+go install github.com/szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
 ```
 
 Make sure `$GOPATH/bin` is in your `PATH`:
@@ -140,7 +140,7 @@ gomutants is published as a composite action:
 - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   with:
     fetch-depth: 0  # required so --changed-since can reach the base ref
-- uses: szhekpisov/gomutants@564651b902e1c9a9bf5da154126532e276e4cee5 # v0.2.3
+- uses: szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
   with:
     args: --changed-since origin/${{ github.base_ref }} ./...
 ```
