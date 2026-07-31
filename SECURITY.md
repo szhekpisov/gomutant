@@ -4,7 +4,8 @@
 
 gomutants follows semantic versioning. Security fixes are applied to the latest
 released minor version on the `main` branch. Older minor versions do not receive
-backports.
+backports. Release candidates (`-rcN`) are for pre-release validation only and
+are not supported — report issues found in them, but run stable tags in CI.
 
 | Version | Supported          |
 | ------- | ------------------ |

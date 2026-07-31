@@ -19,39 +19,54 @@ func TestVersionFlagWithLdflags(t *testing.T) {
 	}
 
 	const (
-		wantVersion   = "1.2.3"
 		wantCommit    = "abc123def4567890"
 		wantBuildDate = "2026-05-10T12:00:00Z"
 	)
 
-	binPath := filepath.Join(t.TempDir(), "gomutants_ldflags")
-	if runtime.GOOS == "windows" {
-		binPath += ".exe"
+	// Release candidates reach main.version through the same -X path as
+	// stable tags (goreleaser's {{.Version}} is the tag minus the leading
+	// "v", prerelease suffix intact), so --version must render "1.2.3-rc0"
+	// verbatim — nothing may parse or truncate at the "-".
+	tests := []struct {
+		name    string
+		version string
+	}{
+		{"stable", "1.2.3"},
+		{"release candidate", "1.2.3-rc0"},
 	}
 
-	ldflags := strings.Join([]string{
-		"-X main.version=" + wantVersion,
-		"-X main.commit=" + wantCommit,
-		"-X main.buildDate=" + wantBuildDate,
-	}, " ")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			binPath := filepath.Join(t.TempDir(), "gomutants_ldflags")
+			if runtime.GOOS == "windows" {
+				binPath += ".exe"
+			}
 
-	build := exec.Command("go", "build", "-ldflags", ldflags, "-o", binPath, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
+			ldflags := strings.Join([]string{
+				"-X main.version=" + tc.version,
+				"-X main.commit=" + wantCommit,
+				"-X main.buildDate=" + wantBuildDate,
+			}, " ")
 
-	out, err := exec.Command(binPath, "--version").CombinedOutput()
-	if err != nil {
-		t.Fatalf("--version: %v\n%s", err, out)
-	}
-	got := string(out)
+			build := exec.Command("go", "build", "-ldflags", ldflags, "-o", binPath, ".")
+			if out, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("go build: %v\n%s", err, out)
+			}
 
-	for _, want := range []string{wantVersion, wantCommit, wantBuildDate} {
-		if !strings.Contains(got, want) {
-			t.Errorf("--version output missing %q\nfull output: %s", want, got)
-		}
-	}
-	if !strings.HasPrefix(got, "gomutants v"+wantVersion+" (commit: "+wantCommit+", built: "+wantBuildDate+")") {
-		t.Errorf("--version format mismatch\ngot:  %s", got)
+			out, err := exec.Command(binPath, "--version").CombinedOutput()
+			if err != nil {
+				t.Fatalf("--version: %v\n%s", err, out)
+			}
+			got := string(out)
+
+			for _, want := range []string{tc.version, wantCommit, wantBuildDate} {
+				if !strings.Contains(got, want) {
+					t.Errorf("--version output missing %q\nfull output: %s", want, got)
+				}
+			}
+			if !strings.HasPrefix(got, "gomutants v"+tc.version+" (commit: "+wantCommit+", built: "+wantBuildDate+")") {
+				t.Errorf("--version format mismatch\ngot:  %s", got)
+			}
+		})
 	}
 }
