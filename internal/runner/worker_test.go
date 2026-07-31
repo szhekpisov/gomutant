@@ -938,15 +938,23 @@ func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
 	if len(invs) != 2 {
 		t.Fatalf("want one invocation per covering package, got %d: %v", len(invs), invs)
 	}
-	for _, args := range invs {
+	// Zip against the packages the router is expected to emit, in order, so
+	// the package argument is identified by name rather than inferred from
+	// the user flag's position — a regression that moved the flags would
+	// otherwise be checked against whatever element happened to precede them.
+	wantPkgs := []string{"mymod", "mymod/other"}
+	for i, args := range invs {
 		if args[len(args)-1] != "-custom.iterations=5" {
 			t.Errorf("user flag must trail, got last arg %q in %v", args[len(args)-1], args)
 		}
-		runIdx, userIdx := indexOfPrefix(args, "-run="), indexOfStr(args, "-custom.iterations=5")
-		pkgIdx := userIdx - 1 // the package sits immediately before the user flags
+		if got := args[len(args)-2]; got != wantPkgs[i] {
+			t.Errorf("want package %q immediately before the user flags, got %q in %v",
+				wantPkgs[i], got, args)
+		}
+		runIdx, pkgIdx := indexOfPrefix(args, "-run="), indexOfStr(args, wantPkgs[i])
 		if runIdx < 0 || runIdx >= pkgIdx {
-			t.Errorf("want -run before the package argument, got -run at %d, package at %d in %v",
-				runIdx, pkgIdx, args)
+			t.Errorf("want -run before the package argument, got -run at %d, %s at %d in %v",
+				runIdx, wantPkgs[i], pkgIdx, args)
 		}
 	}
 }

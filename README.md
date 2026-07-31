@@ -691,10 +691,9 @@ interact while they are parsed.
 
 Before an `-args` boundary, flags gomutants manages itself (`-overlay`,
 `-run`, `-timeout`, `-coverprofile`, `-coverpkg`, `-c`, `-o`, `-exec`) are
-rejected rather than silently honored. Each would fail quietly rather than
-loudly: a replaced
-`-overlay` means no mutant is ever applied and every one "survives". The
-`-test.`-prefixed spellings are rejected too — `go test` hands `-test.run`
+rejected rather than silently honored. These conflicts can fail quietly; for
+example, replacing `-overlay` means no mutant is ever applied and every one
+"survives". The `-test.`-prefixed spellings are rejected too — `go test` hands `-test.run`
 straight to the test binary, where it beats the `-run` filter gomutants
 computed.
 

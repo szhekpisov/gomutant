@@ -330,7 +330,7 @@ func run(ctx context.Context, args []string) error {
 	// UnquoteUsage takes the first back-quoted token as the value
 	// placeholder shown in --help. Any other backticks in this string
 	// would be consumed instead, printing e.g. "-test-flags go test".
-	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags=-short", func(s string) error {
+	fs.Func("test-flags", "`flags` forwarded verbatim to the inner go test runs (per-mutant, coverage, baseline) and to nothing else; whitespace-separated, repeatable. Placed after the package argument; use -args within flags for test-binary names that collide with go test flags (see README). Use to trade mutation fidelity for speed on property-based suites, e.g. --test-flags=-short", func(s string) error {
 		testFlags = append(testFlags, s)
 		return nil
 	})
@@ -1038,17 +1038,17 @@ func checkTestFlags(flags []string) error {
 			afterArgs = true
 			continue
 		}
-		// FlagName yields "" for a field that isn't a flag at all (a
-		// detached value, as in `-gcflags all=-N`), and "" is never a
-		// managed name — so a value that happens to spell one can't trip
-		// the check, with no separate skip branch to keep in sync.
-		name, _ := config.FlagName(f)
 		if afterArgs {
 			spelled, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
 			if !strings.HasPrefix(spelled, "test.") {
 				continue
 			}
 		}
+		// FlagName yields "" for a field that isn't a flag at all (a
+		// detached value, as in `-gcflags all=-N`), and "" is never a
+		// managed name — so a value that happens to spell one can't trip
+		// the check, with no separate skip branch to keep in sync.
+		name, _ := config.FlagName(f)
 		if reason, ok := managedTestFlags[name]; ok {
 			// Echo the spelling the user typed, not the canonical name:
 			// being told "-run is managed" after passing `-test.run` reads
@@ -1068,20 +1068,30 @@ func isFlagBoundary(f string) bool {
 }
 
 // boundaryConsumed reports whether the boundary token at index i may have
-// been read by the go command as the *value* of the field before it
-// rather than as a boundary at all. `go test pkg -bench -args -overlay=x`
+// been read as the *value* of the field before it rather than as a
+// boundary at all.
+//
+// Which parser does the consuming depends on where the token sits. Before
+// any -args, it is the go command: `go test pkg -bench -args -overlay=x`
 // binds "-args" to -bench, so -overlay is still parsed by the go command
 // and silently replaces the mutation overlay — the precise failure the
 // guard exists to prevent, waved through by a relaxation that assumed a
-// boundary was there. The `--` terminator is swallowed the same way.
+// boundary was there. After an -args the go command claims nothing more,
+// but the test binary's own flag parser takes over and behaves the same
+// way: flag.parseOne assigns the next argument to a value-taking flag
+// without inspecting it, so in `-args -x -- -test.run=X` a non-boolean -x
+// swallows the "--" and -test.run stays live against the binary. Either
+// spelling of the boundary is swallowed by either parser.
 //
 // Deciding this exactly would take the set of go test and build flags
-// that accept a value, which changes between Go releases and would rot
-// here. The test is syntactic instead: a preceding field that is a flag
-// carrying no inline `=` value is one that might consume the next field,
-// so the guard declines to relax behind it.
+// that accept a value — plus, past -args, the flags of a test binary that
+// has not been compiled yet. The first changes between Go releases and
+// would rot here; the second is not knowable at this point at all. The
+// test is syntactic instead: a preceding field that is a flag carrying no
+// inline `=` value is one that might consume the next field, so the guard
+// declines to relax behind it.
 //
-// The imprecision is one-directional. `-race -args -run=custom` is safe
+// The imprecision only ever errs strict. `-race -args -run=custom` is safe
 // in fact — -race is boolean and consumes nothing — but reads as
 // ambiguous here and is rejected; spelling the value inline
 // (`-race=true -args -run=custom`) restores the boundary. Only the eight
