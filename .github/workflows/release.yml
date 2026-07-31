@@ -15,8 +15,8 @@ jobs:
       - name: Validate semver tag
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Tag '${TAG}' does not match strict semver format vMAJOR.MINOR.PATCH"
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' does not match vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rcN"
             exit 1
           fi
           echo "Tag '${TAG}' is valid semver"
@@ -80,6 +80,42 @@ jobs:
       - name: Install syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
 
+      # A stable release's notes must span back to the previous STABLE tag.
+      # GoReleaser's default is `git describe --tags --abbrev=0 tags/<tag>^`,
+      # which is reachability-based and stops at the intervening rc tags.
+      # RC tags keep the default so each rc shows only its own delta.
+      # --merged restricts candidates to ancestors of the tag being released,
+      # so a patch cut on an older line can't pick up a tag from another branch.
+      - name: Resolve previous stable tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG" == *-rc* ]]; then
+            echo "RC tag ${TAG}: keeping GoReleaser's default previous-tag detection"
+            exit 0
+          fi
+
+          # `git tag --list 'v*.*.*'` is fnmatch, so rc tags slip through the
+          # glob. Sort the full set, then filter rc tags before selecting the
+          # first result; removing entries preserves the stable tags' version
+          # order and keeps git's prerelease ordering from affecting the result.
+          # Keep the git invocation separate so repository/ref errors fail the
+          # step; awk legitimately returns empty for the first stable release.
+          tags="$(git tag --list 'v*.*.*' --merged "$TAG" --sort=-v:refname)"
+          prev="$(awk -v tag="$TAG" \
+            '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != tag { print; exit }' \
+            <<< "$tags")"
+
+          if [ -z "$prev" ]; then
+            echo "No previous stable tag before ${TAG}; using GoReleaser's default"
+            exit 0
+          fi
+
+          echo "Previous stable tag for ${TAG}: ${prev}"
+          echo "GORELEASER_PREVIOUS_TAG=${prev}" >> "$GITHUB_ENV"
+
       - name: Run GoReleaser
         id: goreleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
@@ -87,6 +123,9 @@ jobs:
           version: "~> v2"
           args: release --clean
         env:
+          # Promotion can put the stable and rc tags on the same commit. Pin
+          # the triggering tag so GoReleaser does not select the rc by sort order.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate subject hashes for SLSA provenance
@@ -136,4 +175,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+        # --latest is forced only for stable tags. GitHub already refuses to
+        # mark a prerelease as "Latest", but sending make_latest=false
+        # explicitly for rc tags makes that guarantee ours, not theirs.
+        run: |
+          set -euo pipefail
+          latest=true
+          if [[ "$TAG" == *-rc* ]]; then latest=false; fi
+          gh release edit "$TAG" --draft=false --latest="$latest" --repo "$GITHUB_REPOSITORY"

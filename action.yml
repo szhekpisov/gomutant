@@ -13,11 +13,13 @@ inputs:
     required: true
   version:
     description: |
-      gomutants version to install. A release tag (e.g. "v0.5.0") or
-      "latest" downloads a pre-built binary from the GitHub release and
-      verifies its signed build attestation via `gh attestation verify`.
-      Any other value (branch, SHA, etc.) falls back to `go install`
-      without signature verification.
+      gomutants version to install. A release tag — stable ("v0.5.0") or
+      a release candidate ("v0.5.1-rc0") — downloads a pre-built binary
+      from the GitHub release and verifies its signed build attestation
+      via `gh attestation verify`. "latest" does the same, resolving to
+      the newest stable release; it never selects a release candidate,
+      so request those by tag. Any other value (branch, SHA, etc.) falls
+      back to `go install` without signature verification.
     required: false
     default: latest
   threshold-efficacy:
@@ -70,9 +72,10 @@ runs:
         VERSION: ${{ inputs.version }}
         REPO: szhekpisov/gomutants
         GH_TOKEN: ${{ github.token }}
-      # For a release tag (or "latest") we download the prebuilt binary
-      # and verify its signed build attestation, so the action runs the
-      # exact artifact produced by .github/workflows/release.yml. For any
+      # For a release tag — stable or -rcN — (or "latest") we download the
+      # prebuilt binary and verify its signed build attestation, so the
+      # action runs the exact artifact produced by
+      # .github/workflows/release.yml. For any
       # other version (branch, SHA) we fall back to `go install` with a
       # warning — no signed binary exists for non-release refs. The
       # smoke-test workflow pre-installs from source and passes
@@ -86,11 +89,14 @@ runs:
         fi
 
         if [ "$VERSION" = "latest" ]; then
-          VERSION=$(gh release view --repo "$REPO" --json tagName --jq .tagName)
+          # /releases/latest is the only GitHub endpoint that guarantees
+          # "most recent non-prerelease, non-draft release", so `latest`
+          # never picks up an -rcN tag. Ask for an rc explicitly by tag.
+          VERSION=$(gh api "repos/$REPO/releases/latest" --jq .tag_name)
           echo "Resolved latest -> $VERSION"
         fi
 
-        if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
           echo "::warning::Version '$VERSION' is not a release tag; falling back to 'go install' without signature verification"
           go install "github.com/szhekpisov/gomutants@$VERSION"
           exit 0

@@ -150,7 +150,7 @@ Each LIVED mutant on a changed line is emitted as a `::warning file=...,line=...
 | Input | Default | Description |
 |---|---|---|
 | `args` | _required_ | Arguments forwarded to `gomutants`. The action appends `--annotations=github` automatically. |
-| `version` | `latest` | gomutants version to install. With `version: latest` the action keeps a pre-installed binary on PATH; with any pinned tag/branch/SHA it always re-installs so what runs matches what was requested. |
+| `version` | `latest` | gomutants version to install. `latest` resolves to the newest **stable** release; release candidates (`v0.5.1-rc0`) must be requested by tag. With `version: latest` the action keeps a pre-installed binary on PATH; with any pinned tag/branch/SHA it always re-installs so what runs matches what was requested. |
 | `threshold-efficacy` | `100` | Minimum test efficacy `%` (`KILLED/(KILLED+LIVED)`). Below threshold → exit 10. Default `100` fails the step on any LIVED mutant; set to `""` to disable. |
 | `threshold-mcover` | _empty_ | Minimum mutant coverage `%` (`(KILLED+LIVED)/(KILLED+LIVED+NOT_COVERED)`). Below threshold → exit 11. Empty disables. |
 | `working-directory` | `.` | Directory containing `go.mod`. |
@@ -163,7 +163,7 @@ See [`action.yml`](action.yml) for the full composite definition.
 Binaries for Linux and macOS (amd64 and arm64) are attached to every [release](https://github.com/szhekpisov/gomutants/releases):
 
 ```bash
-VERSION=0.2.2  # check the releases page for the latest
+VERSION=0.5.0  # check the releases page for the latest stable
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -fL "https://github.com/szhekpisov/gomutants/releases/download/v${VERSION}/gomutants_${VERSION}_${OS}_${ARCH}.tar.gz" \
@@ -769,7 +769,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 
 ## Security & Code Quality
 
-**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants) (badge above).
+**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. Release candidates (`v0.5.1-rc0`) go through the identical signing, SBOM, and provenance pipeline and are marked as pre-releases. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants) (badge above).
 
 **Continuous checks.** Every push and PR is scanned by:
 
@@ -784,6 +784,8 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 ## Contributing
 
 Found a bug or have a feature request? [Open an issue](https://github.com/szhekpisov/gomutants/issues/new).
+
+Maintainers: see [RELEASING.md](RELEASING.md) for the release process.
 
 <details>
 <summary>Development setup</summary>

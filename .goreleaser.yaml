@@ -73,6 +73,11 @@ changelog:
 
 release:
   draft: true
+  # auto marks the GitHub release as a prerelease when the tag carries a
+  # semver prerelease part (v0.5.1-rc0 -> "rc0"). GitHub refuses to
+  # designate a prerelease as the repo's "Latest", which is what keeps
+  # action.yml's `version: latest` pointing at the last stable tag.
+  prerelease: auto
   name_template: "v{{.Version}}"
 
 snapshot:
