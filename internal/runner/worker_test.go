@@ -813,8 +813,16 @@ func TestBuildTestArgsTags(t *testing.T) {
 // TestBuildTestArgsTestFlags kills STATEMENT_REMOVE on the
 // `append(args, w.testFlags...)` line and pins the ordering contract:
 // user flags land after every flag we set ourselves (so a user value for
-// a flag we also pass wins under Go's last-occurrence rule) but still
-// ahead of the package argument.
+// a flag we also pass wins under Go's last-occurrence rule) *and* after
+// the package argument.
+//
+// Trailing the package is issue #75. `go test` stops claiming arguments at
+// the first flag it does not recognize and forwards the rest to the test
+// binary, so `-rapid.checks=20` placed ahead of the package would consume
+// it — the working directory gets tested, the run exits 0, and every
+// mutant is recorded LIVED. Go reads the last occurrence of a repeated
+// flag regardless of where the package sits, so the override rule the
+// original ordering protected survives the move.
 func TestBuildTestArgsTestFlags(t *testing.T) {
 	m := mutator.Mutant{Pkg: "mymod"}
 
@@ -829,22 +837,57 @@ func TestBuildTestArgsTestFlags(t *testing.T) {
 			t.Errorf("testFlags set: args %v missing %q", args, want)
 		}
 	}
-	// Order: after -short (the last flag baseTestArgs sets), before the
-	// package. A prepend would put them ahead of -timeout/-overlay, where a
-	// user override could no longer win.
+	// Order: after -short (the last flag baseTestArgs sets), so a prepend
+	// that put them ahead of -timeout/-overlay is caught.
 	shortIdx := indexOfStr(args, "-short")
 	flagIdx := indexOfStr(args, "-rapid.checks=20")
 	if shortIdx < 0 || flagIdx < shortIdx {
 		t.Errorf("user flags must follow -short; -short at %d, -rapid.checks at %d in %v", shortIdx, flagIdx, args)
 	}
-	if args[len(args)-1] != "mymod" {
-		t.Errorf("package must stay last, got %q in %v", args[len(args)-1], args)
+	// And after the package: anything else lets a test-binary flag eat it.
+	pkgIdx := indexOfStr(args, "mymod")
+	if pkgIdx < 0 || flagIdx < pkgIdx {
+		t.Errorf("user flags must follow the package argument; mymod at %d, -rapid.checks at %d in %v", pkgIdx, flagIdx, args)
+	}
+	// User flags stay contiguous at the tail, in the order given.
+	if got := args[len(args)-2:]; got[0] != "-rapid.checks=20" || got[1] != "-race" {
+		t.Errorf("user flags must trail in order, got %v in %v", got, args)
 	}
 
 	wOff := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
 	argsOff := wOff.buildTestArgs(m, false, time.Second)
 	if containsStr(argsOff, "-rapid.checks=20") {
 		t.Errorf("testFlags unset: args %v must not gain user flags", argsOff)
+	}
+}
+
+// TestBuildTestArgsRunFilterPrecedesPackage pins the other half of the
+// issue #75 ordering: the `-run` filter has to sit ahead of the package
+// argument, inside the region `go test` still parses for itself. Behind a
+// user test-binary flag it would be forwarded to the test binary, which
+// spells the flag `-test.run` and rejects `-run` outright — so the mutant
+// run would die on argument parsing rather than run its covering tests.
+func TestBuildTestArgsRunFilterPrecedesPackage(t *testing.T) {
+	w := &Worker{
+		testFlags:   []string{"-custom.iterations=5"},
+		policy:      TimeoutPolicy{Global: time.Second},
+		overlayPath: "/tmp/o.json",
+		testMap: coverage.NewTestMapForTesting(nil, map[string][]coverage.TestRef{
+			"add.go:3": {{Pkg: "mymod", Name: "TestAdd"}},
+		}),
+	}
+	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
+	args := w.buildTestArgs(m, false, time.Second)
+
+	runIdx := indexOfPrefix(args, "-run=")
+	pkgIdx := indexOfStr(args, "mymod")
+	userIdx := indexOfStr(args, "-custom.iterations=5")
+	if runIdx < 0 {
+		t.Fatalf("no -run filter in %v — test map routing did not apply", args)
+	}
+	if !(runIdx < pkgIdx && pkgIdx < userIdx) {
+		t.Errorf("want -run < package < user flags, got -run at %d, mymod at %d, user flag at %d in %v",
+			runIdx, pkgIdx, userIdx, args)
 	}
 }
 
@@ -867,10 +910,46 @@ func TestTestInvocationsTestFlags(t *testing.T) {
 	}
 }
 
+// TestTestInvocationsTestFlagsTrailPackage extends the issue #75 ordering
+// to the cross-package builder, which appends user flags on its own rather
+// than inheriting them from baseTestArgs. Each routed invocation carries a
+// package argument, so each one can swallow it independently.
+func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
+	w := &Worker{
+		testFlags:   []string{"-custom.iterations=5"},
+		policy:      TimeoutPolicy{Global: time.Second},
+		overlayPath: "/tmp/o.json",
+		testMap: coverage.NewTestMapForTesting(nil, map[string][]coverage.TestRef{
+			"add.go:3": {
+				{Pkg: "mymod", Name: "TestAdd"},
+				{Pkg: "mymod/other", Name: "TestIntegration"},
+			},
+		}),
+	}
+	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
+	invs := w.testInvocations(m, false, time.Second)
+	if len(invs) != 2 {
+		t.Fatalf("want one invocation per covering package, got %d: %v", len(invs), invs)
+	}
+	for _, args := range invs {
+		if args[len(args)-1] != "-custom.iterations=5" {
+			t.Errorf("user flag must trail, got last arg %q in %v", args[len(args)-1], args)
+		}
+		runIdx, userIdx := indexOfPrefix(args, "-run="), indexOfStr(args, "-custom.iterations=5")
+		pkgIdx := userIdx - 1 // the package sits immediately before the user flags
+		if runIdx < 0 || runIdx >= pkgIdx {
+			t.Errorf("want -run before the package argument, got -run at %d, package at %d in %v",
+				runIdx, pkgIdx, args)
+		}
+	}
+}
+
 // TestBuildTestArgsPackageArgLast kills STATEMENT_REMOVE on
 // `args = append(args, m.Pkg)`: removing that line leaves the command
-// without a package target. Asserting that the package shows up as the
-// final positional arg catches both the removal and any reordering.
+// without a package target. With no user flags set the package is the
+// final arg, so asserting on the tail catches both the removal and any
+// reordering. (TestBuildTestArgsTestFlags covers where the package lands
+// once --test-flags push it off the end.)
 func TestBuildTestArgsPackageArgLast(t *testing.T) {
 	w := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
 	m := mutator.Mutant{Pkg: "example.com/mod/sub"}
@@ -1003,6 +1082,17 @@ func containsStr(xs []string, target string) bool {
 func indexOfStr(xs []string, target string) int {
 	for i, x := range xs {
 		if x == target {
+			return i
+		}
+	}
+	return -1
+}
+
+// indexOfPrefix is indexOfStr for args whose value isn't known to the
+// caller, such as the generated `-run=^(TestAdd)$` filter.
+func indexOfPrefix(xs []string, prefix string) int {
+	for i, x := range xs {
+		if strings.HasPrefix(x, prefix) {
 			return i
 		}
 	}

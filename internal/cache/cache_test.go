@@ -269,17 +269,17 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 5 must load under the current
-// constant. (Pins SchemaVersion == 5; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 6 must load under the current
+// constant. (Pins SchemaVersion == 6; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 5 {
+	if SchemaVersion != 6 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":5,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":6,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-5 cache must load under SchemaVersion=5, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-6 cache must load under SchemaVersion=6, got %d entries", len(c.Entries))
 	}
 }
 

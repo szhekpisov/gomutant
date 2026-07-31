@@ -998,12 +998,6 @@ var managedTestFlags = map[string]string{
 	"c":            "gomutants runs tests here, it does not build binaries",
 	"o":            "gomutants runs tests here, it does not build binaries",
 	"exec":         "gomutants invokes the test binary itself",
-	// -args consumes every remaining argument, and gomutants appends the
-	// package pattern (and -run filter) after the user's flags. The inner
-	// `go test` would then test the working directory instead of the
-	// mutant's package, exit 0, and record the mutant as LIVED — the same
-	// silently-wrong outcome -overlay is rejected for.
-	"args": "gomutants appends the package argument after your flags, which -args would swallow",
 	// gomutants computes -timeout from the adaptive-timeout policy and
 	// caps every run with a context deadline of the same length, so a
 	// longer user value is silently overridden (the mutant still lands as
@@ -1021,13 +1015,35 @@ var managedTestFlags = map[string]string{
 // `go test -run=A -test.run=B` runs B, and `-test.coverprofile` writes
 // the profile somewhere other than where RunCoverage looks for it. Those
 // are the same silent wrongness the un-prefixed names are rejected for.
+// A standalone -args/--args is different: because gomutants has already
+// placed the package and its own flags before the user fields, it safely
+// switches the remaining fields to test-binary parsing. Unprefixed names
+// after it may intentionally belong to the test binary, while managed
+// -test.* spellings can still override gomutants and remain rejected.
 func checkTestFlags(flags []string) error {
+	afterArgs := false
 	for _, f := range flags {
+		if f == "--" {
+			// go test forwards the terminator and everything after it. The
+			// test binary's flag parser then treats the remainder as positional,
+			// so none of it can override a managed flag.
+			return nil
+		}
+		if !afterArgs && (f == "-args" || f == "--args") {
+			afterArgs = true
+			continue
+		}
 		// FlagName yields "" for a field that isn't a flag at all (a
 		// detached value, as in `-gcflags all=-N`), and "" is never a
 		// managed name — so a value that happens to spell one can't trip
 		// the check, with no separate skip branch to keep in sync.
 		name, _ := config.FlagName(f)
+		if afterArgs {
+			spelled, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
+			if !strings.HasPrefix(spelled, "test.") {
+				continue
+			}
+		}
 		if reason, ok := managedTestFlags[name]; ok {
 			// Echo the spelling the user typed, not the canonical name:
 			// being told "-run is managed" after passing `-test.run` reads

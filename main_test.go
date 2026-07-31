@@ -634,17 +634,19 @@ func TestRunQuietConflictsWithVerbose(t *testing.T) {
 }
 
 // The --test-flags guard is pinned by three tests rather than one, split
-// along the three things it has to get right: reject every spelling of a
-// managed flag, accept everything else, and name the flag the way the
-// user wrote it. They share the flagCases shape below.
+// along the three things it has to get right: reject every spelling that
+// can override a managed flag, accept everything else (including raw
+// test-binary fields after -args), and name the flag the way the user wrote
+// it. They share the flagCases shape below.
 type flagCases = []struct {
 	name  string
 	flags []string
 }
 
 // TestCheckTestFlagsRejects covers the guard's reason for existing: a
-// managed flag must be caught in every spelling a user might reach for,
-// because each one fails silently rather than loudly.
+// managed flag must be caught in every spelling that reaches the go command
+// or its generated test flags, because each one fails silently rather than
+// loudly.
 func TestCheckTestFlagsRejects(t *testing.T) {
 	rejected := flagCases{
 		{"single dash with value", []string{"-overlay=/tmp/x.json"}},
@@ -656,12 +658,6 @@ func TestCheckTestFlagsRejects(t *testing.T) {
 		{"coverpkg", []string{"-coverpkg=./..."}},
 		{"binary output", []string{"-o=/tmp/bin"}},
 		{"exec wrapper", []string{"-exec=wine"}},
-		// -args swallows every argument after it, including the package
-		// pattern gomutants appends. `go test -args -foo ./pkg` tests the
-		// working directory, exits 0, and the mutant records as LIVED —
-		// wrong, and indistinguishable from a real survivor.
-		{"args", []string{"-args", "-foo"}},
-		{"args last", []string{"-short", "-args"}},
 		// A non-flag field *before* the managed one, so the scan has to
 		// carry on past it. INVERT_LOOP_CTRL (an early `break` or
 		// `return`) would abandon the loop at "all=-N" and let -overlay
@@ -683,6 +679,10 @@ func TestCheckTestFlagsRejects(t *testing.T) {
 		{"test-prefixed run, double dash", []string{"--test.run=TestFoo"}},
 		{"test-prefixed coverprofile", []string{"-test.coverprofile=/tmp/c.out"}},
 		{"test-prefixed timeout", []string{"-test.timeout=30s"}},
+		// -args makes unprefixed fields belong to the test binary, but the
+		// direct binary spelling still overrides gomutants' generated flag.
+		{"test-prefixed run after args", []string{"-args", "-test.run=TestFoo"}},
+		{"test-prefixed coverprofile after args", []string{"--args", "-test.coverprofile=/tmp/c.out"}},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
@@ -723,6 +723,16 @@ func TestCheckTestFlagsAccepts(t *testing.T) {
 		{"the motivating case", []string{"-rapid.checks=20"}},
 		{"short", []string{"-short"}},
 		{"race and count", []string{"-race", "-count=2"}},
+		// Once the package has already been parsed, -args is the only way to
+		// pass a test-binary flag whose name also belongs to the go command.
+		{"args with colliding go flag", []string{"-args", "-x"}},
+		{"double-dash args with colliding test flag", []string{"-race", "--args", "-short"}},
+		// Managed-looking unprefixed names after -args belong to a custom test
+		// binary flag and cannot override gomutants' already-parsed settings.
+		{"custom managed-looking flag after args", []string{"-args", "-run=custom"}},
+		// The flag terminator makes all remaining fields positional arguments
+		// to the test binary, so they cannot override gomutants either.
+		{"terminator", []string{"--", "-test.run=positional"}},
 		// A managed name appearing as a *value* rather than a flag: the
 		// non-flag skip must let it through, or `-gcflags c` and friends
 		// would be rejected for spelling a managed flag by coincidence.

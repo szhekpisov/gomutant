@@ -205,13 +205,19 @@ func mutantLess(a, b mutator.Mutant) bool {
 // testFlags are the user's --test-flags, forwarded here too so the baseline
 // measures the same work the per-mutant runs will do — otherwise a
 // `-short`-ed mutation run would be sized against a full-cost baseline.
+//
+// They land *after* the package arguments: `go test` stops claiming
+// arguments at the first flag it does not recognize and hands the rest to
+// the test binary, so a test-binary flag (`-rapid.checks=N`) placed ahead
+// of the packages would swallow them and test the working directory
+// instead. See buildTestArgs for the same ordering on the mutant runs.
 func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
 	args := []string{"test", "-count=1"}
 	if tags != "" {
 		args = append(args, "-tags="+tags)
 	}
-	args = append(args, testFlags...)
 	args = append(args, packages...)
+	args = append(args, testFlags...)
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
 
@@ -231,6 +237,10 @@ func MeasureBaseline(ctx context.Context, projectDir string, packages []string, 
 // profile consistent with what the per-mutant runs execute: a test that
 // `-short` skips must not be recorded as covering, or every mutant on its
 // lines would be reported as a survivor instead of NOT_COVERED.
+//
+// As in MeasureBaseline, the flags land after the package arguments so a
+// test-binary flag cannot swallow them — which here would profile the
+// working directory and report every mutant NOT_COVERED.
 func RunCoverage(ctx context.Context, projectDir string, packages []string, coverPkg, tags string, tmpDir string, testFlags []string) (string, error) {
 	profilePath := filepath.Join(tmpDir, "coverage.out")
 
@@ -241,8 +251,8 @@ func RunCoverage(ctx context.Context, projectDir string, packages []string, cove
 	if tags != "" {
 		args = append(args, "-tags="+tags)
 	}
-	args = append(args, testFlags...)
 	args = append(args, packages...)
+	args = append(args, testFlags...)
 
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir

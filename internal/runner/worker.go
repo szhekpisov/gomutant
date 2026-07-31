@@ -127,15 +127,17 @@ type Worker struct {
 	tags string
 
 	// testFlags are the user's --test-flags, appended verbatim to every
-	// inner `go test` argv. Empty appends nothing. They land after the
-	// flags we set ourselves, so where both spell the same flag the user's
-	// value wins — Go's flag parsing takes the last occurrence.
+	// inner `go test` argv. Empty appends nothing. They land last of all —
+	// after the flags we set ourselves *and* after the package argument, so
+	// where both spell the same flag the user's value wins (Go's flag
+	// parsing takes the last occurrence) and a flag `go test` does not
+	// recognize cannot swallow the package we meant to test.
 	//
 	// That "last one wins" rule is argv-level only, and it is not a
 	// general override guarantee: -timeout is also enforced out-of-band by
 	// the context deadline in Worker.Test, so lengthening it via argv
 	// alone would not work. Flags in that class, along with the ones
-	// gomutants depends on (-overlay, -run, -args, …), are rejected at the
+	// gomutants depends on (-overlay, -run, …), are rejected at the
 	// CLI boundary and cannot reach here. Set by the pool after
 	// construction, mirroring tags.
 	testFlags []string
@@ -335,10 +337,11 @@ func (w *Worker) makeTestCmd(ctx context.Context, args []string) (*exec.Cmd, *ca
 }
 
 // baseTestArgs builds the flag-only prefix shared by every `go test`
-// invocation for a mutant — everything except the `-run` filter and the
-// trailing package argument. Split out so both the single-package builder
-// and the per-package integration builder share one source of truth for
-// the flag wiring (and so each flag stays unit-testable).
+// invocation for a mutant — everything except the `-run` filter, the
+// package argument, and the user's --test-flags that follow it. Split out
+// so both the single-package builder and the per-package integration
+// builder share one source of truth for the flag wiring (and so each flag
+// stays unit-testable).
 //
 // `timeout` is the resolved per-mutant deadline (computed by the caller
 // from TimeoutPolicy), threaded into both the outer context and the
@@ -363,8 +366,6 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 	if short {
 		args = append(args, "-short")
 	}
-	// User flags go last so they override anything above them.
-	args = append(args, w.testFlags...)
 	return args
 }
 
@@ -373,6 +374,14 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 // when no cross-package routing applies (the common path). Kept as a
 // distinct builder so callers can verify the -short, -run, and package arg
 // wiring without spinning up a subprocess.
+//
+// The user's --test-flags go last, after the package: `go test` stops
+// claiming arguments at the first flag it does not recognize and forwards
+// the rest to the test binary, so a test-binary flag ahead of the package
+// would swallow both it and the `-run` filter, leaving the working
+// directory to be tested and every mutant reported LIVED. Trailing
+// placement also preserves the override rule — Go takes the last
+// occurrence of a repeated flag, so a user value still beats ours.
 func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Duration) []string {
 	args := w.baseTestArgs(short, timeout)
 	// Use per-test coverage map to run only relevant tests.
@@ -382,7 +391,7 @@ func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Durati
 		}
 	}
 	args = append(args, m.Pkg)
-	return args
+	return append(args, w.testFlags...)
 }
 
 // testInvocations returns the ordered set of `go test` argv lists to run for
@@ -418,6 +427,9 @@ func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Dura
 	for _, pkg := range orderRoutePackages(groups, m.Pkg) {
 		args := append(slices.Clone(base),
 			fmt.Sprintf("-run=%s", coverage.RunPattern(groups[pkg])), pkg)
+		// User flags trail the package here for the same reason as in
+		// buildTestArgs.
+		args = append(args, w.testFlags...)
 		invs = append(invs, args)
 	}
 	return invs
