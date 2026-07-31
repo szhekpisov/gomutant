@@ -892,7 +892,7 @@ func TestBuildTestArgsRunFilterPrecedesPackage(t *testing.T) {
 	if runIdx < 0 {
 		t.Fatalf("no -run filter in %v — test map routing did not apply", args)
 	}
-	if !(runIdx < pkgIdx && pkgIdx < userIdx) {
+	if runIdx >= pkgIdx || pkgIdx >= userIdx {
 		t.Errorf("want -run < package < user flags, got -run at %d, mymod at %d, user flag at %d in %v",
 			runIdx, pkgIdx, userIdx, args)
 	}
