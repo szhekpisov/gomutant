@@ -131,7 +131,8 @@ type Worker struct {
 	// after the flags we set ourselves *and* after the package argument, so
 	// where both spell the same flag the user's value wins (Go's flag
 	// parsing takes the last occurrence) and a flag `go test` does not
-	// recognize cannot swallow the package we meant to test.
+	// recognize cannot demote the package we meant to test into a
+	// positional argument for the test binary.
 	//
 	// That "last one wins" rule is argv-level only, and it is not a
 	// general override guarantee: -timeout is also enforced out-of-band by
@@ -375,13 +376,15 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 // distinct builder so callers can verify the -short, -run, and package arg
 // wiring without spinning up a subprocess.
 //
-// The user's --test-flags go last, after the package: `go test` stops
-// claiming arguments at the first flag it does not recognize and forwards
-// the rest to the test binary, so a test-binary flag ahead of the package
-// would swallow both it and the `-run` filter, leaving the working
-// directory to be tested and every mutant reported LIVED. Trailing
-// placement also preserves the override rule — Go takes the last
-// occurrence of a repeated flag, so a user value still beats ours.
+// The user's --test-flags go last, after the package. `go test` goes on
+// parsing its own flags past one it does not recognize, but that first
+// unrecognized flag marks the package list as already seen, so a package
+// name after it is forwarded to the test binary as a positional argument
+// and `go test` falls back to `.`. A test-binary flag ahead of the
+// package therefore leaves the working directory to be tested and every
+// mutant reported LIVED. Trailing placement also preserves the override
+// rule — Go takes the last occurrence of a repeated flag, so a user value
+// still beats ours.
 func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Duration) []string {
 	args := w.baseTestArgs(short, timeout)
 	// Use per-test coverage map to run only relevant tests.

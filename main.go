@@ -1015,21 +1015,26 @@ var managedTestFlags = map[string]string{
 // `go test -run=A -test.run=B` runs B, and `-test.coverprofile` writes
 // the profile somewhere other than where RunCoverage looks for it. Those
 // are the same silent wrongness the un-prefixed names are rejected for.
-// A standalone -args/--args is different: because gomutants has already
-// placed the package and its own flags before the user fields, it safely
-// switches the remaining fields to test-binary parsing. Unprefixed names
-// after it may intentionally belong to the test binary, while managed
-// -test.* spellings can still override gomutants and remain rejected.
+//
+// -args and the `--` terminator relax the scan, because gomutants has
+// already placed the package and its own flags ahead of the user fields:
+// past a boundary the go command claims nothing more, so an unprefixed
+// name there belongs to the test binary and can override nothing. They
+// relax it by different amounts. -args forwards the rest verbatim, so a
+// managed `-test.*` spelling still lands in the test binary and beats the
+// flag gomutants set — those stay rejected. `--` is forwarded too, but
+// the test binary's own flag parser stops at it and treats everything
+// after as positional, so nothing behind it can override anything.
+//
+// Neither relaxation applies to a boundary the go command may never have
+// read as one; see boundaryConsumed.
 func checkTestFlags(flags []string) error {
 	afterArgs := false
-	for _, f := range flags {
-		if f == "--" {
-			// go test forwards the terminator and everything after it. The
-			// test binary's flag parser then treats the remainder as positional,
-			// so none of it can override a managed flag.
-			return nil
-		}
-		if !afterArgs && (f == "-args" || f == "--args") {
+	for i, f := range flags {
+		if isFlagBoundary(f) && !boundaryConsumed(flags, i) {
+			if f == "--" {
+				return nil
+			}
 			afterArgs = true
 			continue
 		}
@@ -1053,6 +1058,43 @@ func checkTestFlags(flags []string) error {
 		}
 	}
 	return nil
+}
+
+// isFlagBoundary reports whether a field is one of the tokens that ends
+// the go command's own argument claiming: -args (either spelling) or the
+// `--` terminator.
+func isFlagBoundary(f string) bool {
+	return f == "-args" || f == "--args" || f == "--"
+}
+
+// boundaryConsumed reports whether the boundary token at index i may have
+// been read by the go command as the *value* of the field before it
+// rather than as a boundary at all. `go test pkg -bench -args -overlay=x`
+// binds "-args" to -bench, so -overlay is still parsed by the go command
+// and silently replaces the mutation overlay — the precise failure the
+// guard exists to prevent, waved through by a relaxation that assumed a
+// boundary was there. The `--` terminator is swallowed the same way.
+//
+// Deciding this exactly would take the set of go test and build flags
+// that accept a value, which changes between Go releases and would rot
+// here. The test is syntactic instead: a preceding field that is a flag
+// carrying no inline `=` value is one that might consume the next field,
+// so the guard declines to relax behind it.
+//
+// The imprecision is one-directional. `-race -args -run=custom` is safe
+// in fact — -race is boolean and consumes nothing — but reads as
+// ambiguous here and is rejected; spelling the value inline
+// (`-race=true -args -run=custom`) restores the boundary. Only the eight
+// managed names are affected, so the documented `-args` uses, which pass
+// names gomutants does not manage, are untouched either way.
+// Over-rejecting costs a diagnostic the user can act on; under-rejecting
+// costs a whole run reported wrong.
+func boundaryConsumed(fields []string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev := fields[i-1]
+	return strings.HasPrefix(prev, "-") && !strings.Contains(prev, "=")
 }
 
 // captureCoverageEnv returns an allowlisted snapshot of go-related env

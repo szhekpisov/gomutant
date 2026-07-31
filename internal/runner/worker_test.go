@@ -816,10 +816,11 @@ func TestBuildTestArgsTags(t *testing.T) {
 // a flag we also pass wins under Go's last-occurrence rule) *and* after
 // the package argument.
 //
-// Trailing the package is issue #75. `go test` stops claiming arguments at
-// the first flag it does not recognize and forwards the rest to the test
-// binary, so `-rapid.checks=20` placed ahead of the package would consume
-// it — the working directory gets tested, the run exits 0, and every
+// Trailing the package is issue #75. The first flag `go test` does not
+// recognize marks the package list as already seen, so a package name
+// after it is forwarded to the test binary as a positional argument and
+// `go test` falls back to `.`. With `-rapid.checks=20` ahead of the
+// package, the working directory gets tested, the run exits 0, and every
 // mutant is recorded LIVED. Go reads the last occurrence of a repeated
 // flag regardless of where the package sits, so the override rule the
 // original ordering protected survives the move.
@@ -862,11 +863,17 @@ func TestBuildTestArgsTestFlags(t *testing.T) {
 }
 
 // TestBuildTestArgsRunFilterPrecedesPackage pins the other half of the
-// issue #75 ordering: the `-run` filter has to sit ahead of the package
-// argument, inside the region `go test` still parses for itself. Behind a
-// user test-binary flag it would be forwarded to the test binary, which
-// spells the flag `-test.run` and rejects `-run` outright — so the mutant
-// run would die on argument parsing rather than run its covering tests.
+// issue #75 ordering: the `-run` filter sits ahead of the package
+// argument, so nothing in --test-flags can come between them.
+//
+// `-run` is not at risk from an unrecognized user flag on its own — the
+// go command keeps claiming its own flags past one it does not know, and
+// only positional arguments after that point are demoted. It *is* at risk
+// from a user `-args`, which ends the go command's claiming outright and
+// would forward `-run` to the test binary, where the flag is spelled
+// `-test.run` and the bare name is rejected. Keeping the filter ahead of
+// the package puts it ahead of every user field, so neither case reaches
+// it.
 func TestBuildTestArgsRunFilterPrecedesPackage(t *testing.T) {
 	w := &Worker{
 		testFlags:   []string{"-custom.iterations=5"},

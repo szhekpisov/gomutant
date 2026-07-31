@@ -902,13 +902,15 @@ func TestRunCoverageForwardsTags(t *testing.T) {
 // whose test declares a flag of its own. subFails picks whether that test
 // passes or fails.
 //
-// The root package is the whole point. `go test` stops claiming arguments
-// at the first flag it does not recognize and hands the rest to the test
-// binary, so a test-binary flag placed ahead of the package argument eats
-// it and `.` is tested instead — and because `.` is a buildable package
-// with no tests, that exits 0. No diagnostic, wrong package. Without the
-// root package the same bug fails loudly ("no Go files in ..."), which is
-// the variant that would have been caught already.
+// The root package is the whole point. The first flag `go test` does not
+// recognize marks the package list as already seen, so a package name
+// after it is forwarded to the test binary as a positional argument and
+// the package list falls back to `.`. A test-binary flag placed ahead of
+// the package argument therefore tests `.` — and because `.` is a
+// buildable package with no tests, that exits 0. No diagnostic, wrong
+// package. Without the root package the same bug fails loudly ("no Go
+// files in ..."), which is the variant that would have been caught
+// already.
 func setupTestBinaryFlagProject(t *testing.T, subFails bool) string {
 	t.Helper()
 	dir := t.TempDir()

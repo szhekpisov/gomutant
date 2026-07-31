@@ -683,6 +683,15 @@ func TestCheckTestFlagsRejects(t *testing.T) {
 		// direct binary spelling still overrides gomutants' generated flag.
 		{"test-prefixed run after args", []string{"-args", "-test.run=TestFoo"}},
 		{"test-prefixed coverprofile after args", []string{"--args", "-test.coverprofile=/tmp/c.out"}},
+		// A boundary token is only a boundary if the go command read it as
+		// one. `go test pkg -bench -args -overlay=x` binds "-args" to -bench,
+		// so -overlay is parsed by the go command after all and replaces the
+		// mutation overlay: no mutant is applied and every one "survives".
+		// Relaxing behind a boundary that was never there would wave through
+		// exactly what this guard exists to stop, so an ambiguous preceding
+		// flag keeps the scan strict.
+		{"managed flag behind a consumable args", []string{"-bench", "-args", "-overlay=/tmp/x.json"}},
+		{"managed flag behind a consumable terminator", []string{"-bench", "--", "-overlay=/tmp/x.json"}},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
@@ -725,11 +734,20 @@ func TestCheckTestFlagsAccepts(t *testing.T) {
 		{"race and count", []string{"-race", "-count=2"}},
 		// Once the package has already been parsed, -args is the only way to
 		// pass a test-binary flag whose name also belongs to the go command.
+		// Neither name here is one gomutants manages, so both are accepted
+		// whether or not the boundary itself was read as one.
 		{"args with colliding go flag", []string{"-args", "-x"}},
 		{"double-dash args with colliding test flag", []string{"-race", "--args", "-short"}},
 		// Managed-looking unprefixed names after -args belong to a custom test
 		// binary flag and cannot override gomutants' already-parsed settings.
+		// This is the relaxation the boundary buys, so the boundary has to be
+		// unambiguous: nothing precedes it here that could have consumed it.
 		{"custom managed-looking flag after args", []string{"-args", "-run=custom"}},
+		// The same relaxation behind a preceding flag, which only stays
+		// available because the inline value makes it plain that -bench did
+		// not consume the -args. Without the `=` this is rejected; that pair
+		// is what pins the syntactic test rather than a blanket allow.
+		{"inline value keeps the args boundary", []string{"-bench=.", "-args", "-run=custom"}},
 		// The flag terminator makes all remaining fields positional arguments
 		// to the test binary, so they cannot override gomutants either.
 		{"terminator", []string{"--", "-test.run=positional"}},
