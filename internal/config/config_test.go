@@ -372,11 +372,10 @@ func TestTestFlagFields(t *testing.T) {
 }
 
 // TestCanonicalTestFlags pins the form cache identity is computed from.
-// Two normalizations, for the same reason: values that describe the same
-// run must land on the same cache generation. Whitespace never reaches
-// the runner at all, and neither does flag order in the ordinary case, so
-// hashing either would discard a perfectly reusable cache. The unset case
-// must stay "" so a flag-less run matches a flag-less cache.
+// Whitespace never reaches the runner and can be normalized, but order is
+// preserved because arbitrary test-binary flags may interact while they
+// are parsed. The unset case must stay "" so a flag-less run matches a
+// flag-less cache.
 func TestCanonicalTestFlags(t *testing.T) {
 	cases := []struct {
 		name string
@@ -387,17 +386,15 @@ func TestCanonicalTestFlags(t *testing.T) {
 		{"whitespace only", "   ", ""},
 		{"already canonical", "-short", "-short"},
 		{"leading and trailing space", "  -short  ", "-short"},
-		{"collapses runs and sorts", "-short    -race", "-race -short"},
-		{"tabs and newlines", "-short\t-race\n-count=2", "-count=2 -race -short"},
-		// Not reorderable: a detached value has to stay beside the flag it
-		// belongs to, so the whole list keeps the user's order and only
-		// whitespace is normalized. Sorting here would strand "all=-N".
+		{"collapses runs and preserves order", "-short    -race", "-short -race"},
+		{"tabs and newlines", "-short\t-race\n-count=2", "-short -race -count=2"},
+		// A detached value has to stay beside the flag it belongs to.
 		{"detached value", "-gcflags  all=-N   -short", "-gcflags all=-N -short"},
-		// Not reorderable: Go takes the last occurrence, so these two
-		// orderings are different runs and must keep different identities.
+		// Go takes the last occurrence, so these two orderings are different
+		// runs and must keep different identities.
 		{"repeated flag keeps order", "-count=2 -count=1", "-count=2 -count=1"},
 		{"repeated flag other order", "-count=1 -count=2", "-count=1 -count=2"},
-		// The `-test.` alias names the same flag, so it counts as a repeat.
+		// The `-test.` alias names the same flag, so its order also matters.
 		{"aliased repeat keeps order", "-short -test.short", "-short -test.short"},
 	}
 	for _, tc := range cases {
@@ -418,15 +415,16 @@ func TestCanonicalTestFlags(t *testing.T) {
 		t.Errorf("whitespace-only differences must canonicalize equal, got %q vs %q",
 			spaced.CanonicalTestFlags(), tight.CanonicalTestFlags())
 	}
-	// Order-only differences likewise: `-race -short` and `-short -race`
-	// invoke identical runs, and before sorting they cost a full re-run.
-	if reordered := (&Config{TestFlags: "-race -short"}).CanonicalTestFlags(); reordered != tight.CanonicalTestFlags() {
-		t.Errorf("order-only differences must canonicalize equal, got %q vs %q",
-			reordered, tight.CanonicalTestFlags())
+	// Distinct custom flag names can still share state. Conservatively keep
+	// every ordering separate instead of assuming that names commute: a test
+	// binary can register both of these names against the same variable.
+	cheapThenFull := (&Config{TestFlags: "-cheap=20 -full=100"}).CanonicalTestFlags()
+	fullThenCheap := (&Config{TestFlags: "-full=100 -cheap=20"}).CanonicalTestFlags()
+	if cheapThenFull == fullThenCheap {
+		t.Errorf("order-only differences must keep distinct cache identities, both gave %q", cheapThenFull)
 	}
-	// ...but only where reordering is provably safe. A last-one-wins pair
-	// must not collapse, or `-count=1 -count=2` would replay the verdicts
-	// of a run that used the opposite value.
+	// A last-one-wins pair must not collapse either, or `-count=1 -count=2`
+	// would replay the verdicts of a run that used the opposite value.
 	lastWins := (&Config{TestFlags: "-count=1 -count=2"}).CanonicalTestFlags()
 	firstWins := (&Config{TestFlags: "-count=2 -count=1"}).CanonicalTestFlags()
 	if lastWins == firstWins {
@@ -437,8 +435,8 @@ func TestCanonicalTestFlags(t *testing.T) {
 	}
 }
 
-// TestFlagName pins the parse both the CLI's managed-flag guard and
-// CanonicalTestFlags depend on. The `test.` case is the load-bearing one:
+// TestFlagName pins the parse the CLI's managed-flag guard depends on. The
+// `test.` case is the load-bearing one:
 // `go test` forwards `-test.run` to the test binary, where it beats the
 // `-run` gomutants set, so a guard that reads it as a flag named
 // "test.run" would wave through exactly the override it exists to stop.

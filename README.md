@@ -121,7 +121,7 @@ See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT
 ### Go Install
 
 ```bash
-go install github.com/szhekpisov/gomutants@564651b902e1c9a9bf5da154126532e276e4cee5 # v0.2.3
+go install github.com/szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
 ```
 
 Make sure `$GOPATH/bin` is in your `PATH`:
@@ -140,7 +140,7 @@ gomutants is published as a composite action:
 - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   with:
     fetch-depth: 0  # required so --changed-since can reach the base ref
-- uses: szhekpisov/gomutants@564651b902e1c9a9bf5da154126532e276e4cee5 # v0.2.3
+- uses: szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
   with:
     args: --changed-since origin/${{ github.base_ref }} ./...
 ```
@@ -660,8 +660,9 @@ Four things to know:
   value keeps its own cache generation: switching back and forth re-runs from
   cold rather than resuming. That is the intended trade — a mutant that
   survived 20 property iterations says nothing about whether it survives 100.
-  Whitespace and flag order don't count as a change: `-race -short` and
-  `-short -race` share one generation, since they invoke the same run.
+  Whitespace-only differences don't count as a change. Flag order does:
+  arbitrary test-binary flags can interact while they are parsed, so the
+  cache conservatively keeps `-race -short` and `-short -race` separate.
 - **The per-test timing phase does not see the flags,** so adaptive timeouts
   stand down. That phase compiles with `go test -c` and runs the binary
   directly with `-test.*`-namespaced flags, where `-short` would need
@@ -676,14 +677,43 @@ Four things to know:
   cost regardless, so a suite dominated by it improves less than the
   per-mutant arithmetic suggests.
 
-Flags gomutants manages itself (`-overlay`, `-run`, `-args`, `-timeout`,
-`-coverprofile`, `-coverpkg`, `-c`, `-o`, `-exec`) are rejected rather than
-silently honored. Each would fail quietly rather than loudly: a replaced
-`-overlay` means no mutant is ever applied and every one "survives", and
-`-args` swallows the package argument appended after your flags, so the run
-tests the wrong package and reports the same way. The `-test.`-prefixed
-spellings are rejected too — `go test` hands `-test.run` straight to the
-test binary, where it beats the `-run` filter gomutants computed.
+Your flags are placed **after** the package argument, which is what lets
+flags belonging to the *test binary* rather than to `go test` work at all.
+`go test` goes on claiming its own flags past one it does not recognise,
+but that first unrecognised flag marks the package list as already seen —
+so a package named after it is forwarded to the test binary as a
+positional argument and the package list falls back to `.`. With
+`-rapid.checks=100` ahead of the package, the working directory would be
+tested instead. Your order is preserved both on argv and in the cache
+identity. Go reads the last occurrence of a repeated flag wherever the
+package sits, and distinct custom flags can also share state or otherwise
+interact while they are parsed.
+
+Before an `-args` boundary, flags gomutants manages itself (`-overlay`,
+`-run`, `-timeout`, `-coverprofile`, `-coverpkg`, `-c`, `-o`, `-exec`) are
+rejected rather than silently honored. These conflicts can fail quietly; for
+example, replacing `-overlay` means no mutant is ever applied and every one
+"survives". The `-test.`-prefixed spellings are rejected too — `go test` hands `-test.run`
+straight to the test binary, where it beats the `-run` filter gomutants
+computed.
+
+`-args` is supported for the rarer case where a custom test-binary flag has
+the same name as a flag owned by the Go command. Put Go-owned flags before it
+and raw test-binary flags after it, for example
+`--test-flags '-race -args -x'`. Gomutants' package and managed flags are
+already ahead of this boundary, so `-args` cannot swallow them. A managed
+`-test.*` spelling after `-args` is still rejected because it would override
+the corresponding flag in the test binary itself.
+
+One wrinkle, and it only bites if you pass a *managed* name after the
+boundary. `go test -bench -args …` binds `-args` to `-bench` as its value,
+so the fields after it are read by the Go command after all — and an
+`-overlay` among them would silently replace the mutation overlay. Rather
+than track which Go flags take values, gomutants declines to treat `-args`
+or `--` as a boundary when the field before it is a flag with no inline
+`=` value. Write that value inline (`-bench=. -args -run=custom`) if you
+need the relaxation there. Names gomutants does not manage are unaffected,
+so `--test-flags '-race -args -x'` works either way.
 
 ## How It Works
 

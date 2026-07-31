@@ -47,7 +47,10 @@ import (
 //	v5: TestFlags joins the metadata gate. --test-flags changes what the
 //	    inner `go test` actually executes, so a verdict recorded under one
 //	    value must not be replayed under another.
-const SchemaVersion = 5
+//	v6: TestFlags cache identity preserves argv order. v5 sorted distinct
+//	    flag names, but arbitrary test-binary flags can interact even when
+//	    their names differ, so old keys can describe a different run.
+const SchemaVersion = 6
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
@@ -105,10 +108,9 @@ type Cache struct {
 	// (tag-less) caches reusable for tag-less runs.
 	BuildTags string `json:"build_tags,omitempty"`
 	// TestFlags is the `--test-flags` value the cache was built with, in
-	// canonical form — whitespace collapsed, and sorted where sorting is
-	// behavior-preserving (see config.CanonicalTestFlags), so that two
-	// spellings of the same run share one generation instead of each
-	// paying for a cold start. It joins the metadata-gate identity for
+	// canonical form — whitespace collapsed but argv order preserved (see
+	// config.CanonicalTestFlags), so behaviorally distinct orderings cannot
+	// share a generation. It joins the metadata-gate identity for
 	// the same reason BuildTags does, but the pressure here is sharper:
 	// the documented workflow is alternating between a cheap gate run
 	// (`--test-flags '-rapid.checks=20'`) and a full scoring run, and

@@ -896,3 +896,115 @@ func TestRunCoverageForwardsTags(t *testing.T) {
 		t.Fatal("tags=mytag: tagged failing test must run and fail, but coverage run succeeded")
 	}
 }
+
+// setupTestBinaryFlagProject writes the layout from issue #75: a module
+// root that is a valid package with *no test files*, and a `sub` package
+// whose test declares a flag of its own. subFails picks whether that test
+// passes or fails.
+//
+// The root package is the whole point. The first flag `go test` does not
+// recognize marks the package list as already seen, so a package name
+// after it is forwarded to the test binary as a positional argument and
+// the package list falls back to `.`. A test-binary flag placed ahead of
+// the package argument therefore tests `.` — and because `.` is a
+// buildable package with no tests, that exits 0. No diagnostic, wrong
+// package. Without the root package the same bug fails loudly ("no Go
+// files in ..."), which is the variant that would have been caught
+// already.
+func setupTestBinaryFlagProject(t *testing.T, subFails bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	body := "if Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}"
+	if subFails {
+		body = "t.Fatal(\"sub test ran\")"
+	}
+	subTest := "package sub\n\nimport (\n\t\"flag\"\n\t\"testing\"\n)\n\n" +
+		"var iterations = flag.Int(\"custom.iterations\", 100, \"a test-binary flag\")\n\n" +
+		"var customShort = flag.Bool(\"short\", false, \"a flag whose name collides with go test\")\n\n" +
+		"func TestAdd(t *testing.T) {\n\t_ = *iterations\n" +
+		"\tif *customShort {\n\t\tt.Fatal(\"custom -short reached the test binary\")\n\t}\n\t" + body + "\n}\n"
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"go.mod":          "module testmod\n\ngo 1.26\n",
+		"root.go":         "package testmod\n\nfunc Root() int {\n\treturn 1\n}\n",
+		"sub/sub.go":      "package sub\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n",
+		"sub/sub_test.go": subTest,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestRunCoverageProfilesTargetPackageWithTestBinaryFlags is the issue #75
+// regression: `args = append(args, packages...)` must precede
+// `args = append(args, testFlags...)`, or a test-binary flag swallows the
+// package argument.
+//
+// The assertion has to be on the profile's *contents*, not on the error:
+// the pre-fix run exits 0 and writes a perfectly well-formed profile — for
+// the wrong package. That silence is the bug. Swapping the two appends back
+// yields a profile holding root.go and no sub/sub.go, which is what every
+// downstream mutant sees as NOT_COVERED.
+func TestRunCoverageProfilesTargetPackageWithTestBinaryFlags(t *testing.T) {
+	dir := setupTestBinaryFlagProject(t, false)
+
+	path, err := RunCoverage(context.Background(), dir, []string{"testmod/sub"},
+		"", "", t.TempDir(), []string{"-custom.iterations=5"})
+	if err != nil {
+		t.Fatalf("coverage run failed: %v", err)
+	}
+	profile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading profile: %v", err)
+	}
+	if !strings.Contains(string(profile), "testmod/sub/sub.go") {
+		t.Errorf("profile has no testmod/sub/sub.go — the test-binary flag swallowed "+
+			"the package argument and the module root was profiled instead.\nprofile:\n%s", profile)
+	}
+}
+
+// TestMeasureBaselineRunsTargetPackageWithTestBinaryFlags is the
+// MeasureBaseline half of the same regression, with the inverted polarity
+// setupShortSensitiveProject uses: the sub package's test fails, so an
+// error proves it ran. Pre-fix this returns nil — the module root was
+// tested, has no test files, and exits 0 — which is exactly the silent
+// wrongness being pinned.
+//
+// The root-package control is what makes the error discriminating. On its
+// own "baseline failed" would also be satisfied by the flag breaking the
+// run outright; targeting the root with the same flag has to keep
+// succeeding, so the only difference left between the two calls is which
+// package the argument actually selected.
+func TestMeasureBaselineRunsTargetPackageWithTestBinaryFlags(t *testing.T) {
+	dir := setupTestBinaryFlagProject(t, true)
+	flags := []string{"-custom.iterations=5"}
+
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod"}, "", flags); err != nil {
+		t.Fatalf("root package has no tests and must pass, got error: %v", err)
+	}
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod/sub"}, "", flags); err == nil {
+		t.Fatal("baseline succeeded: the failing sub test never ran, so the " +
+			"test-binary flag swallowed the package argument and the module root was tested")
+	}
+}
+
+// TestMeasureBaselineArgsForwardsCollidingTestBinaryFlag covers why -args
+// remains useful after moving user fields behind the package. The go command
+// owns the unprefixed -short spelling, while a compiled test binary can
+// independently register its own -short flag (testing's built-in is named
+// -test.short). Without -args the go command consumes and rewrites the flag;
+// after -args it reaches the custom flag verbatim.
+func TestMeasureBaselineArgsForwardsCollidingTestBinaryFlag(t *testing.T) {
+	dir := setupTestBinaryFlagProject(t, false)
+
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod/sub"}, "", []string{"-short"}); err != nil {
+		t.Fatalf("go test's -short must not set the custom test-binary flag: %v", err)
+	}
+	if _, err := MeasureBaseline(context.Background(), dir, []string{"testmod/sub"}, "", []string{"-args", "-short"}); err == nil {
+		t.Fatal("baseline succeeded: -args did not forward the colliding custom -short flag to the test binary")
+	}
+}

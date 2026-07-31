@@ -13,7 +13,7 @@ inputs:
     required: true
   version:
     description: |
-      gomutants version to install. A release tag (e.g. "v0.2.1") or
+      gomutants version to install. A release tag (e.g. "v0.5.0") or
       "latest" downloads a pre-built binary from the GitHub release and
       verifies its signed build attestation via `gh attestation verify`.
       Any other value (branch, SHA, etc.) falls back to `go install`
