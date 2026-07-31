@@ -122,6 +122,9 @@ jobs:
           version: "~> v2"
           args: release --clean
         env:
+          # Promotion can put the stable and rc tags on the same commit. Pin
+          # the triggering tag so GoReleaser does not select the rc by sort order.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate subject hashes for SLSA provenance
