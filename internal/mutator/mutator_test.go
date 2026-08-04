@@ -1611,6 +1611,13 @@ func g() [3]int { return [3]int{} }
 func h() MyIface { return nil }
 `, 0)
 
+	// A declined slot must not stop the rest of the return from being
+	// examined: slot 0 is already zero and is skipped, slot 1 still mutates.
+	assertReplacements(t, mutator.ReturnZero, `package p
+type Block struct{ A int }
+func a() (Block, time.Duration) { return Block{}, 5 }
+`, []replacementCase{{"5", "*new(time.Duration)"}})
+
 	// A non-zero value of the same types is still mutated — the skip is
 	// about the value, not the type. The last two are shapes the zero test
 	// cannot decide from syntax: a rune literal, and a float too large for

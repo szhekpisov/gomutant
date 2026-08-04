@@ -156,6 +156,7 @@ func isSyntacticZero(expr ast.Expr) bool {
 	case *ast.BasicLit:
 		switch e.Kind {
 		case token.INT, token.FLOAT:
+			// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="strconv.ParseFloat's bitSize argument only branches at 32 vs ≠32 — values 63/64/65 all use the float64 parser, so mutating 64 is observably identical"
 			v, err := strconv.ParseFloat(strings.ReplaceAll(e.Value, "_", ""), 64)
 			return err == nil && v == 0
 		case token.STRING:
