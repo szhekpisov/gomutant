@@ -3,6 +3,8 @@ package mutator
 import (
 	"go/ast"
 	"go/token"
+	"strconv"
+	"strings"
 )
 
 // slotCtx is everything a predicate or replacement needs to reason about one
@@ -11,6 +13,7 @@ import (
 // original text.
 type slotCtx struct {
 	typ      ast.Expr
+	expr     ast.Expr // the returned expression this slot would replace
 	shadowed map[string]bool
 	fset     *token.FileSet
 	src      []byte
@@ -54,8 +57,9 @@ type returnValue struct {
 	// owns reports whether this mutator is responsible for a slot with the
 	// given declared type.
 	owns func(slotCtx) bool
-	// replacement returns the substitute source text for such a slot.
-	replacement func(slotCtx) string
+	// replacement returns the substitute source text for such a slot, or
+	// ok=false to decline the slot because no useful mutation exists.
+	replacement func(slotCtx) (string, bool)
 }
 
 func (m *returnValue) Type() MutationType { return m.typ }
@@ -83,11 +87,14 @@ func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) 
 			return
 		}
 		for i, expr := range ret.Results {
-			ctx := slotCtx{typ: results[i], shadowed: shadowed, fset: fset, src: src}
+			ctx := slotCtx{typ: results[i], expr: expr, shadowed: shadowed, fset: fset, src: src}
 			if !m.owns(ctx) {
 				continue
 			}
-			replacement := m.replacement(ctx)
+			replacement, ok := m.replacement(ctx)
+			if !ok {
+				continue
+			}
 			pos := fset.Position(expr.Pos())
 			endOffset := fset.Position(expr.End()).Offset
 			original := string(src[pos.Offset:endOffset])
@@ -122,8 +129,40 @@ func ownsOther(c slotCtx) bool { return !ownsError(c) && !ownsBool(c) }
 
 // fixed builds a replacement that always substitutes the same literal text,
 // used by the three mutators whose value doesn't depend on the slot type.
-func fixed(text string) func(slotCtx) string {
-	return func(slotCtx) string { return text }
+func fixed(text string) func(slotCtx) (string, bool) {
+	return func(slotCtx) (string, bool) { return text, true }
+}
+
+// isSyntacticZero reports whether expr is visibly already a zero value.
+//
+// It exists because the *new(T) fallback spells a zero value differently from
+// how source normally writes one: `Block{}` and `*new(Block)` are the same
+// value, as are `0` and `*new(time.Duration)`. The phantom guard in Discover
+// compares source text, so it cannot see that — without this check those slots
+// yield mutants that are byte-different but semantically identical, and no
+// test can ever kill them.
+//
+// Only shapes whose zero-ness is certain from syntax count. An empty composite
+// literal qualifies only for the types that reach the *new(T) fallback (named
+// types, structs, fixed arrays): for a slice or map, `[]int{}` and `map[k]v{}`
+// are non-nil and genuinely differ from the nil this mutator would emit, and
+// those types never reach the fallback anyway.
+func isSyntacticZero(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.CompositeLit:
+		return len(e.Elts) == 0
+	case *ast.Ident:
+		return e.Name == "nil" || e.Name == "false"
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.INT, token.FLOAT:
+			v, err := strconv.ParseFloat(strings.ReplaceAll(e.Value, "_", ""), 64)
+			return err == nil && v == 0
+		case token.STRING:
+			return e.Value == `""` || e.Value == "``"
+		}
+	}
+	return false
 }
 
 // zeroLiterals maps a predeclared type name to the shortest source text for
@@ -164,21 +203,25 @@ var zeroLiterals = map[string]string{
 // that is awkward or impossible to spell directly, but *new(T) is valid for
 // every one of them and needs no import that the signature hasn't already
 // required.
-func zeroValueExpr(c slotCtx) string {
+func zeroValueExpr(c slotCtx) (string, bool) {
 	switch t := c.typ.(type) {
 	case *ast.ArrayType:
 		if t.Len == nil {
 			// Slice. A fixed-size array has no nil, and falls through.
-			return "nil"
+			return "nil", true
 		}
 	case *ast.Ident:
 		// A file that redeclares the name means its own type, whose zero
 		// value the literal spelling would misrepresent.
 		if lit, ok := zeroLiterals[t.Name]; ok && !c.shadowed[t.Name] {
-			return lit
+			return lit, true
 		}
 	case *ast.StarExpr, *ast.MapType, *ast.ChanType, *ast.FuncType, *ast.InterfaceType:
-		return "nil"
+		return "nil", true
 	}
-	return "*new(" + c.typeText() + ")"
+	if isSyntacticZero(c.expr) {
+		// Already the zero value, written another way — see isSyntacticZero.
+		return "", false
+	}
+	return "*new(" + c.typeText() + ")", true
 }

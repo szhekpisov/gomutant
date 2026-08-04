@@ -1593,6 +1593,45 @@ func f() struct{ A int } { return v }
 	})
 }
 
+// TestReturnZeroSkipsAlreadyZeroValues pins that the *new(T) fallback does not
+// emit when the source already returns that zero value spelled another way.
+// `Block{}` and `*new(Block)` are the same value, as are `0` and
+// `*new(time.Duration)` — the byte-level phantom guard cannot see this because
+// the two spellings differ, so such mutants would survive forever uncatchable.
+func TestReturnZeroSkipsAlreadyZeroValues(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+type Block struct{ A int }
+func a() Block { return Block{} }
+func b() time.Duration { return 0 }
+func c() time.Duration { return 0.0 }
+func d() MyString { return "" }
+func e() MyString { return `+"``"+` }
+func f() MyFlag { return false }
+func g() [3]int { return [3]int{} }
+func h() MyIface { return nil }
+`, 0)
+
+	// A non-zero value of the same types is still mutated — the skip is
+	// about the value, not the type. The last two are shapes the zero test
+	// cannot decide from syntax: a rune literal, and a float too large for
+	// ParseFloat. Both fall through to being mutated, which is the safe
+	// direction — a spurious mutant is visible, a missing one is not.
+	assertReplacements(t, mutator.ReturnZero, `package p
+type Block struct{ A int }
+func a() Block { return Block{A: 1} }
+func b() time.Duration { return 5 }
+func c() MyString { return "x" }
+func d() MyRune { return 'a' }
+func e() MyFloat { return 1e999 }
+`, []replacementCase{
+		{"Block{A: 1}", "*new(Block)"},
+		{"5", "*new(time.Duration)"},
+		{`"x"`, "*new(MyString)"},
+		{"'a'", "*new(MyRune)"},
+		{"1e999", "*new(MyFloat)"},
+	})
+}
+
 func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
 	// `string` here is a struct, so `""` would not compile. The grouped
 	// type declaration also exercises a GenDecl carrying several specs, and
