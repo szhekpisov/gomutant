@@ -53,7 +53,7 @@
 
 * **Fastest at scale.** On full-module runs with many mutants, gomutants is ~20% faster wall-clock and ~1.7× faster per tested mutant than the nearest Go mutation tester — and warm reruns with the incremental cache enabled finish 120–150× faster than cold runs (e.g. a 46-minute `prometheus/tsdb` cold run becomes 19s warm). See [`docs/performance.md`](docs/performance.md) for methodology and external-target benchmarks.
 
-* **Gets mutation testing right.** Per-test coverage routing runs each mutant only against the tests whose coverage touches the mutated line, not the whole suite. Adaptive per-mutant timeouts kill infinite-loop mutants in seconds, not minutes. Byte-level patches via `go test -overlay` preserve generics and never modify the source tree. 22 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) surface weak-assertion test gaps that token-level mutation misses.
+* **Gets mutation testing right.** Per-test coverage routing runs each mutant only against the tests whose coverage touches the mutated line, not the whole suite. Adaptive per-mutant timeouts kill infinite-loop mutants in seconds, not minutes. Byte-level patches via `go test -overlay` preserve generics and never modify the source tree. 26 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface weak-assertion test gaps that token-level mutation misses.
 
 ## Where gomutants isn't the fit?
 
@@ -63,7 +63,7 @@ One-off manual runs or thin test suites (<70% line coverage) — the one-time se
 
 | Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
 |---|---|---|---|
-| Mutators (default set) | 16 | 5 | 6 |
+| Mutators (default set) | 26 | 5 | 6 |
 | Block-level mutators | yes | no | no |
 | Generics support | yes (byte-patching) | partial[^1] | no |
 | `--changed-since <ref>` | first-class | no | no |
@@ -241,7 +241,7 @@ gomutants --threshold-efficacy 80 ./...
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
 - **Adaptive per-mutant timeouts** — deadlines sized from recorded per-test durations × margin, so fast tests don't wait out a multi-minute global ceiling.
 - **Byte-level patching via `go test -overlay`** — generics and all Go syntax survive intact; source tree never modified.
-- **22 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
+- **26 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` and the return-value set `RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
 - **OOM-safe** — each `go test` child runs in its own process group with a 2 GiB RSS cap; output capped at 1 MiB per stream.
 - **Multiple report formats** — gremlins-compatible JSON (default), [Stryker `mutation-testing-elements` v2](https://github.com/stryker-mutator/mutation-testing-elements) JSON, and a self-contained interactive HTML report.
 - **Conservative discovery** — compile-failing mutants surface as `NOT_VIABLE` and don't inflate efficacy.
@@ -535,6 +535,17 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `STATEMENT_REMOVE` | Remove statement effect | `x = expr` -> `_ = expr`, `f()` -> `_ = 0` |
 | `LOOP_CONDITION` | Force for-loop condition to false | `for i := 0; i < n; i++ {}` -> `for i := 0; false; i++ {}` |
 | `RANGE_BREAK` | Insert early break in for…range body | `for _, v := range xs { f(v) }` -> `for _, v := range xs { break; f(v) }` |
+
+**Return values:**
+
+Each return slot is claimed by exactly one of these, based on the type declared in the function's signature, so they never mutate the same value twice.
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `RETURN_ERROR_NIL` | Swallow a propagated error | `return nil, err` -> `return nil, nil` |
+| `RETURN_ZERO` | Return the zero value instead | `return count` -> `return 0`, `return name` -> `return ""`, `return d` -> `return *new(time.Duration)` |
+| `RETURN_TRUE` | Force a boolean return true | `return x > 0` -> `return true` |
+| `RETURN_FALSE` | Force a boolean return false | `return x > 0` -> `return false` |
 
 **Mutant statuses:**
 

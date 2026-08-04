@@ -1066,8 +1066,8 @@ func TestRegistryEnabledMutators(t *testing.T) {
 	reg := mutator.NewRegistry()
 
 	all := reg.Mutators()
-	if len(all) != 22 {
-		t.Fatalf("expected 22 mutators, got %d", len(all))
+	if len(all) != 26 {
+		t.Fatalf("expected 26 mutators, got %d", len(all))
 	}
 
 	only := reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil)
@@ -1076,8 +1076,8 @@ func TestRegistryEnabledMutators(t *testing.T) {
 	}
 
 	disabled := reg.EnabledMutators(nil, []string{"ARITHMETIC_BASE", "BRANCH_IF"})
-	if len(disabled) != 20 {
-		t.Fatalf("expected 20 after disabling 2, got %d", len(disabled))
+	if len(disabled) != 24 {
+		t.Fatalf("expected 24 after disabling 2, got %d", len(disabled))
 	}
 }
 
@@ -1146,6 +1146,20 @@ func f(a, b int) int {
 	// Float literal — Float{Increment,Decrement}.
 	_ = 3.14
 	return 0
+}
+
+var errRich error
+
+// Return slots — ReturnErrorNil / ReturnZero / ReturnTrue / ReturnFalse.
+// The literal ` + "`true`" + ` is skipped by ReturnTrue and the literal ` + "`nil`" + ` by
+// ReturnErrorNil (both phantom), so each mutator needs a slot it can act on:
+// ` + "`errRich`" + ` for ReturnErrorNil, ` + "`true`" + ` for ReturnFalse, ` + "`a < 0`" + ` for both
+// boolean mutators, and ` + "`f`" + `'s int returns above for ReturnZero.
+func g(a int) (bool, error) {
+	if a > 0 {
+		return true, errRich
+	}
+	return a < 0, nil
 }
 `
 	fset, file, srcBytes := parse(t, src)
@@ -1459,13 +1473,226 @@ func f(x int) {
 	}
 }
 
+// --- Return values ---
+
+// returnMutators is the set of mutators that partition the return-slot space.
+var returnMutators = []mutator.MutationType{
+	mutator.ReturnErrorNil, mutator.ReturnZero, mutator.ReturnTrue, mutator.ReturnFalse,
+}
+
+// assertNoReturnCandidates asserts that none of the four return-value
+// mutators finds anything in src — used for the shapes they all skip.
+func assertNoReturnCandidates(t *testing.T, src string) {
+	t.Helper()
+	for _, typ := range returnMutators {
+		requireCandidates(t, typ, src, 0)
+	}
+}
+
+func TestReturnErrorNil(t *testing.T) {
+	// The `return nil` in c is phantom — patching it would reproduce the
+	// source byte-for-byte — so only a and b yield candidates.
+	assertReplacements(t, mutator.ReturnErrorNil, `package p
+var e error
+var n int
+func a() error { return e }
+func b() (int, error) { return n, e }
+func c() error { return nil }
+`, []replacementCase{{"e", "nil"}, {"e", "nil"}})
+}
+
+func TestReturnErrorNilSkipsShadowedError(t *testing.T) {
+	// The file declares its own `error`, so the slot is not the predeclared
+	// one and ReturnErrorNil must not claim it. ReturnZero picks it up
+	// instead, spelling the zero value as *new(error) rather than nil —
+	// which is what a struct type actually needs.
+	src := `package p
+type error struct{}
+var e error
+func f() error { return e }
+`
+	requireCandidates(t, mutator.ReturnErrorNil, src, 0)
+	assertReplacements(t, mutator.ReturnZero, src, []replacementCase{{"e", "*new(error)"}})
+}
+
+func TestReturnTrue(t *testing.T) {
+	// The literal `true` in g is phantom for this mutator; h's `false` is
+	// exactly the case a single boolean mutator could not cover.
+	assertReplacements(t, mutator.ReturnTrue, `package p
+func f(x int) bool { return x > 0 }
+func g() bool { return true }
+func h() bool { return false }
+`, []replacementCase{{"x > 0", "true"}, {"false", "true"}})
+}
+
+func TestReturnFalse(t *testing.T) {
+	assertReplacements(t, mutator.ReturnFalse, `package p
+func f(x int) bool { return x > 0 }
+func g() bool { return true }
+func h() bool { return false }
+`, []replacementCase{{"x > 0", "false"}, {"true", "false"}})
+}
+
+func TestReturnZeroBasicTypes(t *testing.T) {
+	assertReplacements(t, mutator.ReturnZero, `package p
+var v int
+func s() string { return v }
+func i() int { return v }
+func u() uint64 { return v }
+func f() float64 { return v }
+func c() complex128 { return v }
+func r() rune { return v }
+func b() byte { return v }
+func p2() uintptr { return v }
+func z() any { return v }
+`, []replacementCase{
+		{"v", `""`}, {"v", "0"}, {"v", "0"}, {"v", "0"}, {"v", "0"},
+		{"v", "0"}, {"v", "0"}, {"v", "0"}, {"v", "nil"},
+	})
+}
+
+func TestReturnZeroNilableTypes(t *testing.T) {
+	assertReplacements(t, mutator.ReturnZero, `package p
+var v int
+func a() *int { return v }
+func b() []int { return v }
+func c() map[string]int { return v }
+func d() chan int { return v }
+func e() func() int { return v }
+func f() interface{ M() } { return v }
+`, []replacementCase{
+		{"v", "nil"}, {"v", "nil"}, {"v", "nil"},
+		{"v", "nil"}, {"v", "nil"}, {"v", "nil"},
+	})
+}
+
+func TestReturnZeroFallsBackToNew(t *testing.T) {
+	// Every type here has a zero value that is awkward or impossible to
+	// spell as a literal. *new(T) covers them all, and needs no import the
+	// signature hasn't already required — including the fixed-size array,
+	// which is the one *ast.ArrayType that has no nil.
+	assertReplacements(t, mutator.ReturnZero, `package p
+var v int
+func a() [3]int { return v }
+func b() time.Duration { return v }
+func c() MyType { return v }
+func d() Result[int] { return v }
+func e[T any]() T { return v }
+func f() struct{ A int } { return v }
+`, []replacementCase{
+		{"v", "*new([3]int)"},
+		{"v", "*new(time.Duration)"},
+		{"v", "*new(MyType)"},
+		{"v", "*new(Result[int])"},
+		{"v", "*new(T)"},
+		{"v", "*new(struct{ A int })"},
+	})
+}
+
+func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
+	// `string` here is a struct, so `""` would not compile. The grouped
+	// type declaration also exercises a GenDecl carrying several specs.
+	assertReplacements(t, mutator.ReturnZero, `package p
+type (
+	string struct{ A int }
+	other  struct{}
+)
+var v int
+func f() string { return v }
+`, []replacementCase{{"v", "*new(string)"}})
+}
+
+func TestReturnValueSkipsUnmutableShapes(t *testing.T) {
+	// A bare `return` under named results carries no expression to replace;
+	// `return f()` spreads one call over two slots, so no per-slot span
+	// exists; a void function's bare return has nothing to act on; and a
+	// body-less declaration has no returns at all.
+	assertNoReturnCandidates(t, `package p
+func a() (int, error) { return g() }
+func b() (n int, err error) { return }
+func c() { return }
+func d(x int) int
+func g() (int, error) { return 0, nil }
+`)
+}
+
+func TestReturnValueUsesClosureSignature(t *testing.T) {
+	// A return inside a func literal belongs to the literal's own result
+	// list, not the enclosing declaration's. Attributing it to the outer
+	// signature would make ReturnErrorNil claim the inner `n` — an int.
+	// Closure candidates come after the enclosing function's because the
+	// outer walk reaches the literal while descending.
+	src := `package p
+var e error
+var n int
+func outer() error {
+	g := func() int { return n }
+	_ = g
+	return e
+}
+`
+	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"e", "nil"}})
+	assertReplacements(t, mutator.ReturnZero, src, []replacementCase{{"n", "0"}})
+}
+
+func TestReturnValueGroupedResults(t *testing.T) {
+	// `(a, b error)` is a single *ast.Field with two Names and must flatten
+	// to two slots; misflattening would shift every slot after it.
+	src := `package p
+var e error
+var n int
+func f() (a, b error) { return e, e }
+func g() (a, b int, c error) { return n, n, e }
+`
+	requireCandidates(t, mutator.ReturnErrorNil, src, 3)
+	assertReplacements(t, mutator.ReturnZero, src, []replacementCase{{"n", "0"}, {"n", "0"}})
+}
+
+// TestReturnValuePatchesAreDistinct asserts the four mutators never produce
+// the same patch twice. Their slot predicates partition by declared type, so
+// no span is claimed by two of them — except ReturnTrue and ReturnFalse,
+// which deliberately share a span and are separated by their replacement.
+func TestReturnValuePatchesAreDistinct(t *testing.T) {
+	src := `package p
+var e error
+var n int
+func f(x int) (bool, string, error) {
+	if x > 0 {
+		return true, "a", e
+	}
+	return x < 0, "", nil
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	type patch struct {
+		start, end  int
+		replacement string
+	}
+	seen := make(map[patch]mutator.MutationType)
+	total := 0
+	for _, typ := range returnMutators {
+		for _, c := range findMutator(t, typ).Discover(fset, file, srcBytes) {
+			total++
+			p := patch{c.StartOffset, c.EndOffset, c.Replacement}
+			if prev, dup := seen[p]; dup {
+				t.Errorf("%s duplicates a patch already emitted by %s: [%d:%d)→%q",
+					typ, prev, p.start, p.end, p.replacement)
+			}
+			seen[p] = typ
+		}
+	}
+	if total == 0 {
+		t.Fatal("expected candidates from the return mutators")
+	}
+}
+
 // --- EnabledMutators with both only and disable ---
 
 func TestRegistryEnabledMutatorsNoFilter(t *testing.T) {
 	reg := mutator.NewRegistry()
 	all := reg.EnabledMutators(nil, nil)
-	if len(all) != 22 {
-		t.Errorf("expected 22, got %d", len(all))
+	if len(all) != 26 {
+		t.Errorf("expected 26, got %d", len(all))
 	}
 }
 

@@ -131,7 +131,7 @@ output: mutation-report.json
 # exclude-calls entries you list (or none at all). Default: true.
 # exclude-calls-defaults: true
 
-# Available mutator types (22 total):
+# Available mutator types (26 total):
 #   Token-level:
 #     ARITHMETIC_BASE             — swap +/-, */%, etc.
 #     CONDITIONALS_BOUNDARY       — swap </<=, >/>=
@@ -156,3 +156,9 @@ output: mutation-report.json
 #     STATEMENT_REMOVE            — remove assignment/expression/increment side-effects
 #     LOOP_CONDITION              — replace `for ...; cond; ... {}` condition with `false`
 #     RANGE_BREAK                 — insert `break` as the first statement of a `for…range` body
+#   Return values (each return slot is claimed by exactly one of these,
+#   based on the type declared in the function's signature):
+#     RETURN_ERROR_NIL            — `error` slot → nil (swallow a propagated error)
+#     RETURN_ZERO                 — any other slot → its zero value (0, "", nil, *new(T))
+#     RETURN_TRUE                 — `bool` slot → true
+#     RETURN_FALSE                — `bool` slot → false

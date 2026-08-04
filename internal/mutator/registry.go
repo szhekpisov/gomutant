@@ -45,6 +45,10 @@ func NewRegistry() *Registry {
 		&literalStep{typ: FloatDecrement, kind: token.FLOAT, delta: -1},
 		&loopCondition{},
 		&rangeBreak{},
+		&returnValue{typ: ReturnErrorNil, owns: ownsError, replacement: fixed("nil")},
+		&returnValue{typ: ReturnZero, owns: ownsOther, replacement: zeroValueExpr},
+		&returnValue{typ: ReturnTrue, owns: ownsBool, replacement: fixed("true")},
+		&returnValue{typ: ReturnFalse, owns: ownsBool, replacement: fixed("false")},
 	}
 	typeSet := make(map[string]struct{}, len(mutators))
 	for _, m := range mutators {
