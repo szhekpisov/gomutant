@@ -48,30 +48,31 @@ func returnSites(file *ast.File, fn func(ret *ast.ReturnStmt, results []ast.Expr
 	ast.Inspect(file, func(n ast.Node) bool {
 		var ft *ast.FuncType
 		var body *ast.BlockStmt
+		// No default clause, and no early return for a nil body: every node
+		// that isn't a function — including the nil ast.Inspect passes on
+		// the way back up — simply leaves body nil, which is the same state
+		// a declaration without a Go body (assembly- or linkname-backed)
+		// arrives in. One guard below covers both.
 		switch d := n.(type) {
 		case *ast.FuncDecl:
 			ft, body = d.Type, d.Body
 		case *ast.FuncLit:
 			ft, body = d.Type, d.Body
-		default:
-			return true
 		}
-		if body == nil {
-			// Declaration without a Go body (assembly- or linkname-backed).
-			return true
+		if body != nil {
+			results := resultTypes(ft)
+			ast.Inspect(body, func(m ast.Node) bool {
+				if _, ok := m.(*ast.FuncLit); ok {
+					// Belongs to that literal's signature; the outer walk
+					// reaches it with its own results.
+					return false
+				}
+				if ret, ok := m.(*ast.ReturnStmt); ok {
+					fn(ret, results)
+				}
+				return true
+			})
 		}
-		results := resultTypes(ft)
-		ast.Inspect(body, func(m ast.Node) bool {
-			if _, ok := m.(*ast.FuncLit); ok {
-				// Belongs to that literal's signature; the outer walk
-				// reaches it with its own results.
-				return false
-			}
-			if ret, ok := m.(*ast.ReturnStmt); ok {
-				fn(ret, results)
-			}
-			return true
-		})
 		return true
 	})
 }

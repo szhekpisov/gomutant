@@ -1506,9 +1506,13 @@ func TestReturnErrorNilSkipsShadowedError(t *testing.T) {
 	// one and ReturnErrorNil must not claim it. ReturnZero picks it up
 	// instead, spelling the zero value as *new(error) rather than nil —
 	// which is what a struct type actually needs.
+	//
+	// The `var` deliberately precedes the `type`: the scan for shadowing
+	// names must skip non-type declarations and keep going, not stop at the
+	// first one it sees.
 	src := `package p
-type error struct{}
 var e error
+type error struct{}
 func f() error { return e }
 `
 	requireCandidates(t, mutator.ReturnErrorNil, src, 0)
@@ -1591,15 +1595,47 @@ func f() struct{ A int } { return v }
 
 func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
 	// `string` here is a struct, so `""` would not compile. The grouped
-	// type declaration also exercises a GenDecl carrying several specs.
+	// type declaration also exercises a GenDecl carrying several specs, and
+	// the leading `var` pins that the scan skips non-type declarations
+	// rather than stopping at the first one.
 	assertReplacements(t, mutator.ReturnZero, `package p
+var v int
 type (
 	string struct{ A int }
 	other  struct{}
 )
-var v int
 func f() string { return v }
 `, []replacementCase{{"v", "*new(string)"}})
+}
+
+// TestReturnZeroLeavesBoolSlotsAlone pins the boundary between ReturnZero
+// and the two boolean mutators. Widening ReturnZero to claim bool slots as
+// well would emit *new(bool) on top of the true/false pair — three mutants
+// where two suffice, two of them equivalent.
+func TestReturnZeroLeavesBoolSlotsAlone(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+func f(x int) bool { return x > 0 }
+func g() (bool, bool) { return true, false }
+`, 0)
+}
+
+// TestReturnValueContinuesPastSkippedSlots pins that a slot the mutator
+// passes over — because it belongs to another mutator, or because its
+// replacement would be phantom — does not stop the rest of the return
+// statement from being examined. Both returns here put a skipped slot ahead
+// of a mutable one.
+func TestReturnValueContinuesPastSkippedSlots(t *testing.T) {
+	src := `package p
+var n int
+var e error
+func f() (string, int) { return "", n }
+func g() (int, error) { return n, e }
+`
+	// Slot 0 of f is phantom for ReturnZero ("" is already the zero value),
+	// slot 1 is not.
+	assertReplacements(t, mutator.ReturnZero, src, []replacementCase{{"n", "0"}, {"n", "0"}})
+	// Slot 0 of g belongs to ReturnZero, slot 1 to ReturnErrorNil.
+	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"e", "nil"}})
 }
 
 func TestReturnValueSkipsUnmutableShapes(t *testing.T) {
