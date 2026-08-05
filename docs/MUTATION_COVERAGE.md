@@ -14,11 +14,11 @@ Status of gomutants's self-mutation test. "Efficacy" = `killed / (killed + lived
 | coverage | 336    | 17    | 34       | 95.18%   |
 | tce      | 98     | 8     | 18       | 92.45%   |
 | runner   | 279    | 23    | 26       | 92.38%   |
-| mutator  | 424    | 40    | 57       | 91.38%   |
+| mutator  | 425    | 37    | 57       | 91.99%   |
 | config   | 156    | 15    | 3        | 91.23%   |
-| **total**| **2447**| **136**| **264** | **94.73%** |
+| **total**| **2448**| **133**| **264** | **94.85%** |
 
-2847 mutants discovered, 25 further suppressed by inline directives. "Excluded"
+2845 mutants discovered, 27 further suppressed by inline directives. "Excluded"
 is `not_viable` + `timed_out`.
 
 Replicate with `gomutants -w 10 -o report.json ./internal/...`, or per package
@@ -28,16 +28,16 @@ with `gomutants -w 8 -o <pkg>.json ./internal/<pkg>/`.
 
 | Mutator | Lived |
 |---------|------:|
-| INTEGER_INCREMENT | 42 |
 | RETURN_FALSE      | 41 |
-| INTEGER_DECREMENT | 30 |
+| INTEGER_INCREMENT | 41 |
+| INTEGER_DECREMENT | 29 |
 | RETURN_ZERO       | 10 |
 | RETURN_TRUE       | 9  |
-| STATEMENT_REMOVE / INVERT_LOOP_CTRL / FLOAT_INCREMENT / FLOAT_DECREMENT | 1 each |
+| STATEMENT_REMOVE / FLOAT_INCREMENT / FLOAT_DECREMENT | 1 each |
 
-Two classes account for 121 of the 136 survivors: numeric literals whose exact
-value is not observable (72), and `return true` at the tail of an `ast.Inspect`
-visitor (38). Both are described below.
+Two classes account for 110 of the 133 survivors: `return true` at the tail of
+an `ast.Inspect` visitor (38), and numeric literals whose exact value is not
+observable (72). Both are described below.
 
 ## Why these mutants survive
 
@@ -81,7 +81,7 @@ highest-value one on the list.
 
 ### 2. Numeric literals whose exact value is not observable
 
-72 survivors (`INTEGER_INCREMENT` 42, `INTEGER_DECREMENT` 30, plus the two float
+72 survivors (`INTEGER_INCREMENT` 41, `INTEGER_DECREMENT` 29, plus the two float
 cases). The literals cluster tightly:
 
 | Literal | Count | What it is |
@@ -91,13 +91,17 @@ cases). The literals cluster tightly:
 | `1`      | 6  | off-by-one steps and slice offsets |
 | `1024`   | 4  | buffer sizes |
 | `0o755`  | 4  | directory mode |
-| `64`     | 3  | `strconv` bit sizes |
+| `3.0`    | 2  | float test fixtures |
+| `16`     | 2  | map pre-sizing |
+| `64`     | 1  | a `strconv` bit size |
 
 File modes are the clearest case: nothing in the suite reads back the mode, so
 `0o644` → `0o645` is invisible. Buffer sizes and `strconv` bit sizes are
 similar — the code behaves identically at any sane value, which is exactly why
-`numeric_literal.go` already carries `gomutants:disable-next-line` directives
-for the handful that are provably equivalent.
+`numeric_literal.go` and `return_value.go` carry `gomutants:disable-next-line`
+directives for the handful that are provably equivalent. `strconv.ParseFloat`'s
+bit size is the clearest: it only branches at 32 vs ≠32, so 63/64/65 all select
+the same parser.
 
 - `coverage/parse.go` (12 × `0`), `config/config.go` (8), `report/terminal.go`
   (5), `runner/worker.go` (4), `discover/directives.go` (3).

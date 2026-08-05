@@ -774,7 +774,7 @@ Compatible with the gremlins JSON format:
 
 ## Self-efficacy (gomutants on itself)
 
-gomutants kills **94.73%** of mutants in its `./internal/...` library code (2447 killed, 136 survivors out of 2847 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. See [docs/MUTATION_COVERAGE.md](docs/MUTATION_COVERAGE.md) for the per-package breakdown and an analysis of why the remaining mutants survive.
+gomutants kills **94.85%** of mutants in its `./internal/...` library code (2448 killed, 133 survivors out of 2845 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. See [docs/MUTATION_COVERAGE.md](docs/MUTATION_COVERAGE.md) for the per-package breakdown and an analysis of why the remaining mutants survive.
 
 The `main` package is excluded from mutation testing. Its mutants exercise the integration test suite (which forks gomutants subprocesses to test mutated overlays), each taking minutes; running them in CI under the same gate isn't tractable, and most surviving mutants are output-formatting drift the integration tests intentionally don't pin.
 
@@ -788,7 +788,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 - [zizmor](https://github.com/zizmorcore/zizmor) — GitHub Actions workflow security scanning
 - [golangci-lint](https://golangci-lint.run/) — multi-linter static analysis
 
-**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 94.73% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
+**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 94.85% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
 
 **Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/szhekpisov/gomutants/security/advisories/new).
 
