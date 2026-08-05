@@ -80,6 +80,9 @@ body:
         - label: BRANCH_IF / BRANCH_ELSE / BRANCH_CASE
         - label: EXPRESSION_REMOVE
         - label: STATEMENT_REMOVE
+        - label: RETURN_ERROR_NIL
+        - label: RETURN_ZERO
+        - label: RETURN_TRUE / RETURN_FALSE
 
   - type: checkboxes
     id: input-characteristics

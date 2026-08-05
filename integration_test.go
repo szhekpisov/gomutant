@@ -29,11 +29,13 @@ func TestIntegrationSimple(t *testing.T) {
 
 	r := loadReport(t, outPath)
 
-	// Expected: 51 total, 0 not covered (all positions in tested
+	// Expected: 68 total, 0 not covered (all positions in tested
 	// files are testable thanks to the FilterByCoverage relaxation
-	// that runs uninstrumented positions in tested files), 51 tested.
-	if r.MutantsTotal != 51 {
-		t.Errorf("total=%d, want 51", r.MutantsTotal)
+	// that runs uninstrumented positions in tested files), 68 tested.
+	// Every function in the fixture returns a value, so the return-value
+	// mutators contribute 17 of those on their own.
+	if r.MutantsTotal != 68 {
+		t.Errorf("total=%d, want 68", r.MutantsTotal)
 	}
 	if r.MutantsNotCovered != 0 {
 		t.Errorf("not_covered=%d, want 0", r.MutantsNotCovered)
@@ -41,8 +43,8 @@ func TestIntegrationSimple(t *testing.T) {
 
 	// All mutants should be either killed, lived, or not viable.
 	tested := r.MutantsKilled + r.MutantsLived + r.MutantsNotViable
-	if tested != 51 {
-		t.Errorf("tested=%d (killed=%d lived=%d not_viable=%d), want 51 total",
+	if tested != 68 {
+		t.Errorf("tested=%d (killed=%d lived=%d not_viable=%d), want 68 total",
 			tested, r.MutantsKilled, r.MutantsLived, r.MutantsNotViable)
 	}
 
@@ -72,14 +74,17 @@ func TestIntegrationUntested(t *testing.T) {
 
 	r := loadReport(t, outPath)
 
-	// Expected: 12 total, 6 not covered (IsEven has no test;
-	// its two literals each emit IntegerIncrement+IntegerDecrement
-	// alongside the original ARITHMETIC_BASE / CONDITIONALS_NEGATION).
-	if r.MutantsTotal != 12 {
-		t.Errorf("total=%d, want 12", r.MutantsTotal)
+	// Expected: 17 total, 9 not covered. IsEven has no test, so all seven
+	// of its mutants are uncovered — its two literals each emit
+	// IntegerIncrement+IntegerDecrement alongside the original
+	// ARITHMETIC_BASE / CONDITIONALS_NEGATION, plus RETURN_TRUE and
+	// RETURN_FALSE on the returned comparison. The ninth is the RETURN_ZERO
+	// on Max's `return b`, which TestMax's single direction never reaches.
+	if r.MutantsTotal != 17 {
+		t.Errorf("total=%d, want 17", r.MutantsTotal)
 	}
-	if r.MutantsNotCovered != 6 {
-		t.Errorf("not_covered=%d, want 6", r.MutantsNotCovered)
+	if r.MutantsNotCovered != 9 {
+		t.Errorf("not_covered=%d, want 9", r.MutantsNotCovered)
 	}
 
 	// Weak tests — some mutants should survive.
@@ -112,21 +117,24 @@ func TestIntegrationDirectives(t *testing.T) {
 
 	r := loadReport(t, outPath)
 
-	// Five mutants are suppressed across the four directive forms:
+	// Eight mutants are suppressed across the four directive forms:
 	// 1× same-line on Add (scoped to ARITHMETIC_BASE);
-	// 2× next-line on Sub (wildcard suppresses ARITHMETIC + INVERT_NEGATIVES);
-	// 1× disable-func on Magic body;
-	// 1× disable-regexp on Mul's `return a * b`.
-	if r.MutantsSuppressed != 5 {
-		t.Errorf("MutantsSuppressed=%d, want 5", r.MutantsSuppressed)
+	// 3× next-line on Sub (wildcard suppresses ARITHMETIC + INVERT_NEGATIVES
+	//    + RETURN_ZERO);
+	// 2× disable-func on Magic body (ARITHMETIC_BASE + RETURN_ZERO);
+	// 2× disable-regexp on Mul's `return a * b` (ARITHMETIC_BASE + RETURN_ZERO).
+	if r.MutantsSuppressed != 8 {
+		t.Errorf("MutantsSuppressed=%d, want 8", r.MutantsSuppressed)
 	}
 
-	// Suppressed mutants must not roll into MutantsTotal.
-	if r.MutantsTotal != 1 {
-		t.Errorf("MutantsTotal=%d, want 1 (only Plain's `+` survives suppression)", r.MutantsTotal)
+	// Suppressed mutants must not roll into MutantsTotal. Add's directive
+	// names ARITHMETIC_BASE only, so its RETURN_ZERO survives suppression
+	// alongside both of Plain's.
+	if r.MutantsTotal != 3 {
+		t.Errorf("MutantsTotal=%d, want 3 (Plain's `+` and RETURN_ZERO, plus Add's RETURN_ZERO)", r.MutantsTotal)
 	}
-	if r.MutantsKilled != 1 {
-		t.Errorf("MutantsKilled=%d, want 1", r.MutantsKilled)
+	if r.MutantsKilled != 3 {
+		t.Errorf("MutantsKilled=%d, want 3", r.MutantsKilled)
 	}
 
 	// No suppressed mutant should appear in Files[].Mutations.
@@ -224,8 +232,8 @@ func TestIntegrationExcludeCallsDefaults(t *testing.T) {
 		t.Errorf("MutantsSuppressedByCalls=%d, want all %d suppressions attributed to exclude-calls",
 			r.MutantsSuppressedByCalls, r.MutantsSuppressed)
 	}
-	if r.MutantsTotal != 17 {
-		t.Errorf("MutantsTotal=%d, want 17 (suppressed mutants leave the total)", r.MutantsTotal)
+	if r.MutantsTotal != 19 {
+		t.Errorf("MutantsTotal=%d, want 19 (suppressed mutants leave the total)", r.MutantsTotal)
 	}
 
 	lines := mutatedLines(r)
@@ -259,8 +267,8 @@ func TestIntegrationExcludeCallsUserPatternExtends(t *testing.T) {
 	if r.MutantsSuppressed != 7 {
 		t.Errorf("MutantsSuppressed=%d, want 7", r.MutantsSuppressed)
 	}
-	if r.MutantsTotal != 15 {
-		t.Errorf("MutantsTotal=%d, want 15", r.MutantsTotal)
+	if r.MutantsTotal != 17 {
+		t.Errorf("MutantsTotal=%d, want 17", r.MutantsTotal)
 	}
 
 	lines := mutatedLines(r)
@@ -287,8 +295,8 @@ func TestIntegrationExcludeCallsDefaultsOff(t *testing.T) {
 	if r.MutantsSuppressed != 0 {
 		t.Errorf("MutantsSuppressed=%d, want 0 with the built-ins off", r.MutantsSuppressed)
 	}
-	if r.MutantsTotal != 22 {
-		t.Errorf("MutantsTotal=%d, want 22 (every mutant back in the run)", r.MutantsTotal)
+	if r.MutantsTotal != 24 {
+		t.Errorf("MutantsTotal=%d, want 24 (every mutant back in the run)", r.MutantsTotal)
 	}
 	lines := mutatedLines(r)
 	if !lines[fxLogPrintfLine] || !lines[fxDebugLine] {

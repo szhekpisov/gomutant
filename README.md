@@ -53,7 +53,7 @@
 
 * **Fastest at scale.** On full-module runs with many mutants, gomutants is ~20% faster wall-clock and ~1.7× faster per tested mutant than the nearest Go mutation tester — and warm reruns with the incremental cache enabled finish 120–150× faster than cold runs (e.g. a 46-minute `prometheus/tsdb` cold run becomes 19s warm). See [`docs/performance.md`](docs/performance.md) for methodology and external-target benchmarks.
 
-* **Gets mutation testing right.** Per-test coverage routing runs each mutant only against the tests whose coverage touches the mutated line, not the whole suite. Adaptive per-mutant timeouts kill infinite-loop mutants in seconds, not minutes. Byte-level patches via `go test -overlay` preserve generics and never modify the source tree. 22 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) surface weak-assertion test gaps that token-level mutation misses.
+* **Gets mutation testing right.** Per-test coverage routing runs each mutant only against the tests whose coverage touches the mutated line, not the whole suite. Adaptive per-mutant timeouts kill infinite-loop mutants in seconds, not minutes. Byte-level patches via `go test -overlay` preserve generics and never modify the source tree. 26 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface weak-assertion test gaps that token-level mutation misses.
 
 ## Where gomutants isn't the fit?
 
@@ -63,7 +63,7 @@ One-off manual runs or thin test suites (<70% line coverage) — the one-time se
 
 | Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
 |---|---|---|---|
-| Mutators (default set) | 16 | 5 | 6 |
+| Mutators (default set) | 26 | 5 | 6 |
 | Block-level mutators | yes | no | no |
 | Generics support | yes (byte-patching) | partial[^1] | no |
 | `--changed-since <ref>` | first-class | no | no |
@@ -241,7 +241,7 @@ gomutants --threshold-efficacy 80 ./...
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
 - **Adaptive per-mutant timeouts** — deadlines sized from recorded per-test durations × margin, so fast tests don't wait out a multi-minute global ceiling.
 - **Byte-level patching via `go test -overlay`** — generics and all Go syntax survive intact; source tree never modified.
-- **22 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
+- **26 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` and the return-value set `RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
 - **OOM-safe** — each `go test` child runs in its own process group with a 2 GiB RSS cap; output capped at 1 MiB per stream.
 - **Multiple report formats** — gremlins-compatible JSON (default), [Stryker `mutation-testing-elements` v2](https://github.com/stryker-mutator/mutation-testing-elements) JSON, and a self-contained interactive HTML report.
 - **Conservative discovery** — compile-failing mutants surface as `NOT_VIABLE` and don't inflate efficacy.
@@ -536,6 +536,19 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `LOOP_CONDITION` | Force for-loop condition to false | `for i := 0; i < n; i++ {}` -> `for i := 0; false; i++ {}` |
 | `RANGE_BREAK` | Insert early break in for…range body | `for _, v := range xs { f(v) }` -> `for _, v := range xs { break; f(v) }` |
 
+**Return values:**
+
+Each return slot is claimed by exactly one of these, based on the type declared in the function's signature, so they never mutate the same value twice.
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `RETURN_ERROR_NIL` | Swallow a propagated error | `return nil, err` -> `return nil, nil` |
+| `RETURN_ZERO` | Return the zero value instead | `return count` -> `return 0`, `return name` -> `return ""`, `return d` -> `return *new(time.Duration)` |
+| `RETURN_TRUE` | Force a boolean return true | `return x > 0` -> `return true` |
+| `RETURN_FALSE` | Force a boolean return false | `return x > 0` -> `return false` |
+
+`RETURN_ZERO` on a single-expression formatting helper — `return fmt.Sprintf(...)` with no branching — is a known low-signal survivor. Killing it means asserting on the exact formatted string, which pins the wording of output that has no logic behind it. Drop these with [`--exclude-calls`](#call-site-exclusion) instead — `gomutants --exclude-calls 'fmt.Sprintf' ./...` suppresses them before any test runs, on the same reasoning that keeps logging arguments out of the count.
+
 **Mutant statuses:**
 
 | Status | Meaning |
@@ -763,7 +776,7 @@ Compatible with the gremlins JSON format:
 
 ## Self-efficacy (gomutants on itself)
 
-gomutants kills **100%** of mutants in its `./internal/...` library code (every package at 100% efficacy). Statement coverage is also 100%. The CI gate fails on any surviving mutant on changed lines per PR, and on the full `./internal/...` tree post-merge — drift surfaces on the merge that introduces it.
+gomutants kills **96.01%** of mutants in its `./internal/...` library code (2478 killed, 103 survivors out of 2845 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. See [docs/MUTATION_COVERAGE.md](docs/MUTATION_COVERAGE.md) for the per-package breakdown and an analysis of why the remaining mutants survive.
 
 The `main` package is excluded from mutation testing. Its mutants exercise the integration test suite (which forks gomutants subprocesses to test mutated overlays), each taking minutes; running them in CI under the same gate isn't tractable, and most surviving mutants are output-formatting drift the integration tests intentionally don't pin.
 
@@ -777,7 +790,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 - [zizmor](https://github.com/zizmorcore/zizmor) — GitHub Actions workflow security scanning
 - [golangci-lint](https://golangci-lint.run/) — multi-linter static analysis
 
-**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines) with 100% post-merge efficacy on `./internal/...` library code — the tool is dogfooded on itself, gated by its own CI gate.
+**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
 
 **Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/szhekpisov/gomutants/security/advisories/new).
 

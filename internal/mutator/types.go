@@ -60,6 +60,10 @@ const (
 	FloatDecrement           MutationType = "FLOAT_DECREMENT"
 	LoopCondition            MutationType = "LOOP_CONDITION"
 	RangeBreak               MutationType = "RANGE_BREAK"
+	ReturnErrorNil           MutationType = "RETURN_ERROR_NIL"
+	ReturnZero               MutationType = "RETURN_ZERO"
+	ReturnTrue               MutationType = "RETURN_TRUE"
+	ReturnFalse              MutationType = "RETURN_FALSE"
 )
 
 type MutantCandidate struct {
