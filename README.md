@@ -547,6 +547,8 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `RETURN_TRUE` | Force a boolean return true | `return x > 0` -> `return true` |
 | `RETURN_FALSE` | Force a boolean return false | `return x > 0` -> `return false` |
 
+`RETURN_ZERO` on a single-expression formatting helper — `return fmt.Sprintf(...)` with no branching — is a known low-signal survivor. Killing it means asserting on the exact formatted string, which pins the wording of output that has no logic behind it. Drop these with [`--exclude-calls`](#call-site-exclusion) instead — `gomutants --exclude-calls 'fmt.Sprintf' ./...` suppresses them before any test runs, on the same reasoning that keeps logging arguments out of the count.
+
 **Mutant statuses:**
 
 | Status | Meaning |
