@@ -84,10 +84,13 @@ func returnSites(file *ast.File, fn func(ret *ast.ReturnStmt, results []ast.Expr
 // return-value mutators identify slot types purely by identifier text, so a
 // redeclared name must not be treated as the predeclared one.
 //
-// Only this file's declarations are visible: Mutator.Discover receives a
-// single *ast.File, so a shadow declared in a sibling file of the same
-// package is missed. The consequence is a mutant that fails to compile and
-// is reported NOT VIABLE, never a wrong result.
+// Only this file's package-level declarations are visible, so two kinds of
+// shadow are missed: one declared in a sibling file of the same package
+// (Mutator.Discover receives a single *ast.File), and one declared inside a
+// function body (only file.Decls is scanned, and a local type is reachable
+// solely from the returns that follow it). The consequence of either is a
+// mutant that fails to compile and is reported NOT VIABLE, never a wrong
+// result — which is why neither is worth the extra scope tracking.
 func declaredTypeNames(file *ast.File) map[string]bool {
 	out := make(map[string]bool)
 	for _, d := range file.Decls {

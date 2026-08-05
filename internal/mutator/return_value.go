@@ -79,6 +79,12 @@ func (m *returnValue) Type() MutationType { return m.typ }
 // LIVED mutant no test could ever kill. This is what keeps RETURN_TRUE and
 // RETURN_FALSE from colliding on a literal `return true` / `return false`,
 // and what skips the already-propagating `return nil` for RETURN_ERROR_NIL.
+//
+// The span mutated is the expression with any enclosing parentheses stripped,
+// so that guard compares like with like: `(true)` is different source text
+// from `true` and would otherwise slip past it, leaving RETURN_TRUE an
+// unkillable rewrite of `return (true)` into itself. Narrowing the span also
+// keeps the patch minimal — RETURN_FALSE emits `return (false)`.
 func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) []MutantCandidate {
 	shadowed := declaredTypeNames(file)
 	var out []MutantCandidate
@@ -86,7 +92,8 @@ func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) 
 		if len(ret.Results) != len(results) {
 			return
 		}
-		for i, expr := range ret.Results {
+		for i, slot := range ret.Results {
+			expr := ast.Unparen(slot)
 			ctx := slotCtx{typ: results[i], expr: expr, shadowed: shadowed, fset: fset, src: src}
 			if !m.owns(ctx) {
 				continue
@@ -154,16 +161,49 @@ func isSyntacticZero(expr ast.Expr) bool {
 	case *ast.Ident:
 		return e.Name == "nil" || e.Name == "false"
 	case *ast.BasicLit:
-		switch e.Kind {
-		case token.INT, token.FLOAT:
-			// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="strconv.ParseFloat's bitSize argument only branches at 32 vs ≠32 — values 63/64/65 all use the float64 parser, so mutating 64 is observably identical"
-			v, err := strconv.ParseFloat(strings.ReplaceAll(e.Value, "_", ""), 64)
-			return err == nil && v == 0
-		case token.STRING:
-			return e.Value == `""` || e.Value == "``"
-		}
+		return isZeroLit(e)
 	}
 	return false
+}
+
+// isZeroLit reports whether a basic literal denotes zero, in every form Go
+// can spell one: 0, 00, 0b0, 0x0, 0.0, 0e10, 0x0p0, 0i, a NUL rune literal,
+// and both the interpreted and raw empty string.
+//
+// The three numeric kinds share a path because they share a grammar — an
+// imaginary literal is its real counterpart plus a trailing `i`, and zero
+// scaled by i is still zero.
+func isZeroLit(lit *ast.BasicLit) bool {
+	switch lit.Kind {
+	case token.INT, token.FLOAT, token.IMAG:
+		// Digit separators carry no value and strconv rejects them; the
+		// imaginary suffix is not part of the number either. Neither rewrite
+		// is safe for the quoted kinds — an underscore rune literal and
+		// "a_b" would both change — so this is not hoisted out of the switch.
+		text := strings.TrimSuffix(strings.ReplaceAll(lit.Value, "_", ""), "i")
+		// Both parsers are consulted because neither subsumes the other: only
+		// ParseInt accepts the binary and octal prefixes (`0b0`, `0o0`, `00`),
+		// and only ParseFloat accepts the fractional, exponent and hex-float
+		// forms (`0.0`, `0e10`, `0x0p0`). Each contributes a zero verdict
+		// solely when it parsed the text it was handed — ParseInt yields 0 on
+		// a syntax error, so an unguarded `n == 0` would call `1.5` zero.
+		//
+		// gomutants:disable-next-line INTEGER_DECREMENT reason="ParseInt's bitSize only has to admit zero, which 63 and 64 both do, so decrementing it is observably identical (incrementing past 64 is rejected outright, and is killed)"
+		n, intErr := strconv.ParseInt(text, 0, 64)
+		// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="strconv.ParseFloat's bitSize argument only branches at 32 vs ≠32 — values 63/64/65 all use the float64 parser, so mutating 64 is observably identical"
+		f, floatErr := strconv.ParseFloat(text, 64)
+		return (intErr == nil && n == 0) || (floatErr == nil && f == 0)
+	case token.CHAR:
+		// Unquote resolves every escape form a NUL rune can be written in.
+		// It cannot fail on a literal the parser accepted, and the ""
+		// it returns on failure is not NUL either way, so the error needs no
+		// branch of its own.
+		s, _ := strconv.Unquote(lit.Value)
+		return s == "\x00"
+	}
+	// STRING is the only other kind the parser puts in a BasicLit, so this is
+	// the string arm rather than an unreachable default.
+	return lit.Value == `""` || lit.Value == "``"
 }
 
 // zeroLiterals maps a predeclared type name to the shortest source text for
@@ -194,6 +234,26 @@ var zeroLiterals = map[string]string{
 	"complex128": "0",
 }
 
+// spelledSameZero reports whether expr already denotes the value that lit —
+// the shortest spelling of the slot type's zero — would substitute.
+//
+// It guards on the zeroLiterals path the equivalence isSyntacticZero guards on
+// the *new(T) path. Discover's phantom check compares source text, so `0.0` in
+// a float64 slot and a raw empty string in a string slot escape it while being
+// the very value the patch installs, leaving a mutant no test can kill.
+//
+// Only basic literals qualify, and only against a concrete zero. The one
+// zeroLiterals entry spelling nil is `any`, where the equivalence does not
+// hold: an interface holding 0 is not a nil interface, so `return 0` ->
+// `return nil` is a genuine mutation and must survive this guard.
+func spelledSameZero(expr ast.Expr, lit string) bool {
+	if lit == "nil" {
+		return false
+	}
+	basic, ok := expr.(*ast.BasicLit)
+	return ok && isZeroLit(basic)
+}
+
 // zeroValueExpr renders the zero value of a slot's declared type as source
 // text, using the shortest spelling that reads naturally and falling back to
 // *new(T) for everything else.
@@ -215,6 +275,9 @@ func zeroValueExpr(c slotCtx) (string, bool) {
 		// A file that redeclares the name means its own type, whose zero
 		// value the literal spelling would misrepresent.
 		if lit, ok := zeroLiterals[t.Name]; ok && !c.shadowed[t.Name] {
+			if spelledSameZero(c.expr, lit) {
+				return "", false
+			}
 			return lit, true
 		}
 	case *ast.StarExpr, *ast.MapType, *ast.ChanType, *ast.FuncType, *ast.InterfaceType:

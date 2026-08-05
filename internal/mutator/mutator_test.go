@@ -1781,6 +1781,24 @@ func g() [3]int { return [3]int{} }
 func h() MyIface { return nil }
 `, 0)
 
+	// Zero has a spelling in every numeric base and notation Go offers, and
+	// a rune literal has four ways to write NUL. All denote the same value
+	// the *new(T) patch would install, so all must be declined — the two
+	// parsers exist precisely because neither covers this list alone.
+	requireCandidates(t, mutator.ReturnZero, `package p
+func a() MyMask { return 0b0 }
+func b() MyMask { return 0o0 }
+func c() MyMask { return 00 }
+func d() MyMask { return 0x0 }
+func e() MyMask { return 0_0 }
+func f() MyFloat { return 0e10 }
+func g() MyFloat { return 0x0p0 }
+func h() MyComplex { return 0i }
+func i() MyComplex { return 0.0i }
+func j() MyRune { return '\x00' }
+func k() MyRune { return '\000' }
+`, 0)
+
 	// A declined slot must not stop the rest of the return from being
 	// examined: slot 0 is already zero and is skipped, slot 1 still mutates.
 	assertReplacements(t, mutator.ReturnZero, `package p
@@ -1789,24 +1807,82 @@ func a() (Block, time.Duration) { return Block{}, 5 }
 `, []replacementCase{{"5", "*new(time.Duration)"}})
 
 	// A non-zero value of the same types is still mutated — the skip is
-	// about the value, not the type. The last two are shapes the zero test
-	// cannot decide from syntax: a rune literal, and a float too large for
-	// ParseFloat. Both fall through to being mutated, which is the safe
-	// direction — a spurious mutant is visible, a missing one is not.
+	// about the value, not the type. `0b1` pins that the binary prefix is
+	// read by the parser that understands it rather than being waved
+	// through by the one that can't; `1e999` overflows ParseFloat, and a
+	// parse that failed must never be read as a zero verdict. The last case
+	// is an expression that is no kind of literal at all, whose value syntax
+	// cannot decide — the safe direction is to mutate it, since a spurious
+	// mutant is visible in the report and a missing one is not.
 	assertReplacements(t, mutator.ReturnZero, `package p
 type Block struct{ A int }
+var n int
 func a() Block { return Block{A: 1} }
 func b() time.Duration { return 5 }
 func c() MyString { return "x" }
 func d() MyRune { return 'a' }
 func e() MyFloat { return 1e999 }
+func f() MyMask { return 0b1 }
+func g() MyCount { return n + 1 }
 `, []replacementCase{
 		{"Block{A: 1}", "*new(Block)"},
 		{"5", "*new(time.Duration)"},
 		{`"x"`, "*new(MyString)"},
 		{"'a'", "*new(MyRune)"},
 		{"1e999", "*new(MyFloat)"},
+		{"0b1", "*new(MyMask)"},
+		{"n + 1", "*new(MyCount)"},
 	})
+}
+
+// TestReturnZeroSkipsAlreadyZeroLiteralSlots is the zeroLiterals-path twin of
+// TestReturnZeroSkipsAlreadyZeroValues. The shortest spelling of a predeclared
+// type's zero is not the only spelling: `0.0` in a float64 slot and a raw
+// empty string in a string slot are the same value the patch would install,
+// so Discover's byte comparison lets them through while nothing can kill them.
+//
+// The `any` slot is the deliberate exception. Its zero is nil, and an
+// interface holding 0 is not a nil interface, so that one is a real mutation
+// and has to survive the guard.
+func TestReturnZeroSkipsAlreadyZeroLiteralSlots(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+func a() float64 { return 0.0 }
+func b() float64 { return 0e10 }
+func c() float32 { return 0x0p0 }
+func d() string { return `+"``"+` }
+func e() int { return (0) }
+func f() uint { return 0b0 }
+func g() byte { return '\x00' }
+func h() complex128 { return 0i }
+`, 0)
+
+	assertReplacements(t, mutator.ReturnZero, `package p
+func a() any { return 0 }
+func b() any { return "" }
+func c() float64 { return 1.5 }
+`, []replacementCase{{"0", "nil"}, {`""`, "nil"}, {"1.5", "0"}})
+}
+
+// TestReturnValueStripsParens pins that the mutated span is the expression
+// inside any enclosing parentheses. Discover's phantom guard compares source
+// text, so `(true)` would otherwise read as different from `true` and
+// RETURN_TRUE would emit a patch that rewrites `return (true)` into itself.
+func TestReturnValueStripsParens(t *testing.T) {
+	src := `package p
+var e error
+func a() bool { return (true) }
+func b(x int) bool { return (x > 0) }
+func c() error { return (e) }
+`
+	assertReplacements(t, mutator.ReturnTrue, src, []replacementCase{{"x > 0", "true"}})
+	assertReplacements(t, mutator.ReturnFalse, src,
+		[]replacementCase{{"true", "false"}, {"x > 0", "false"}})
+	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"e", "nil"}})
+
+	// Nesting must unwrap all the way down, not one layer.
+	requireCandidates(t, mutator.ReturnZero, `package p
+func f() int { return ((0)) }
+`, 0)
 }
 
 func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
