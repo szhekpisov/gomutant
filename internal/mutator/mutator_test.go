@@ -1473,6 +1473,176 @@ func f(x int) {
 	}
 }
 
+// --- Nested-construct traversal ---
+
+// TestNestedConstructsAreTraversed pins that every mutator keeps descending
+// after it has examined a node, rather than pruning that node's subtree.
+//
+// Each ast.Inspect visitor ends in `return true`, and most carry interior
+// `return true` guards for nodes of the right kind but the wrong sub-kind (a
+// *ast.BinaryExpr whose operator this mutator doesn't swap, an if with an
+// empty body). Flipping any of them to `false` tells ast.Inspect to skip that
+// node's children — which changes nothing at all unless a *mutable* construct
+// is nested underneath. The flat fixtures elsewhere in this file leave that
+// undetected, so the sources below deliberately nest each mutator's target
+// inside a node the same visitor visits first:
+//
+//   - under a non-matching node of the same kind, for the sub-kind guards
+//     (`(a + b) < (a * b)` — the `<` is a BinaryExpr the arithmetic mutator
+//     declines, and the operands it would then never reach are the point);
+//   - under a matching node, for the final `return true` (`(a & b) | (a ^ b)`).
+//
+// Where a construct cannot nest inside itself, the nesting goes through a
+// function literal or a call argument — `m[func() int { y++; return 0 }()]++`
+// is the only way one IncDecStmt lands under another.
+//
+// Counts are exact on purpose: a pruned subtree shows up as a *smaller*
+// count, which a "at least one candidate" assertion would miss entirely.
+//
+// Not covered here, because pruning them provably cannot change the result:
+// INVERT_LOOP_CTRL (a BranchStmt's only child is its label) and the
+// numeric-literal mutators (a BasicLit has no children at all).
+func TestNestedConstructsAreTraversed(t *testing.T) {
+	cases := []struct {
+		typ  mutator.MutationType
+		want int
+		src  string
+	}{
+		{mutator.ArithmeticBase, 2, `package p
+var a, b int
+func f() { _ = (a + b) < (a * b) }
+`},
+		{mutator.ConditionalsBoundary, 5, `package p
+var a, b int
+func g(bool) int { return 0 }
+func f() {
+	_ = (a <= b) == (a >= b)
+	_ = g(a < b) < g(a > b)
+}
+`},
+		{mutator.ConditionalsNegation, 5, `package p
+var a, b int
+func g(bool) int { return 0 }
+func f() {
+	_ = (a == b) && (a != b)
+	_ = g(a == b) == g(a != b)
+}
+`},
+		{mutator.InvertLogical, 2, `package p
+var a, b, c, d bool
+func f() { _ = (a && b) == (c || d) }
+`},
+		// The three-element constraint union nests one `|` inside another,
+		// which is what pins the recursive constraint-position scan: recording
+		// only the outermost union would leave the inner one mutable.
+		{mutator.InvertBitwise, 5, `package p
+type C interface{ ~int | ~string | ~bool }
+var a, b int
+func f() {
+	_ = (a & b) + (a | b)
+	_ = (a & b) | (a ^ b)
+}
+`},
+		{mutator.InvertAssignments, 3, `package p
+var x, y int
+func f() {
+	x = func() int { y += 1; return y }()
+	x += func() int { y *= 2; return y }()
+}
+`},
+		{mutator.InvertBitwiseAssignments, 3, `package p
+var x, y int
+func f() {
+	x = func() int { y &= 1; return y }()
+	x |= func() int { y ^= 2; return y }()
+}
+`},
+		{mutator.RemoveSelfAssignments, 3, `package p
+var x, y int
+func f() {
+	x = func() int { y += 1; return y }()
+	x += func() int { y *= 2; return y }()
+}
+`},
+		// The outer statements are a short declaration and a blank assignment
+		// — both declined — so only the nested plain assignments are found.
+		{mutator.StatementRemove, 2, `package p
+var x, y int
+func f() {
+	x := func() int { y = 1; return y }()
+	_ = func() int { y = 2; return y }()
+	_ = x
+}
+`},
+		// The outer if has an empty body and is declined; the candidate comes
+		// entirely from the if nested in its else.
+		{mutator.BranchIf, 1, `package p
+var a, b bool
+func c() {}
+func f() { if a { } else { if b { c() } } }
+`},
+		{mutator.BranchElse, 4, `package p
+var a, b bool
+func x() {}
+func f() {
+	if a { x() } else if b { x() } else { x() }
+	if a { if b { x() } else { x() } } else { }
+	if a { x() } else { if b { x() } else { x() } }
+}
+`},
+		{mutator.BranchCase, 3, `package p
+var q bool
+func r() {}
+func f() {
+	switch { case func() bool { switch { case q: r() }; return true }(): }
+	switch { case q: switch { case q: r() } }
+}
+`},
+		{mutator.ExpressionRemove, 6, `package p
+var a, b, c bool
+func f() {
+	_ = (a && b) == c
+	_ = (a && b) || c
+}
+`},
+		{mutator.IncrementDecrement, 2, `package p
+var y int
+var m = map[int]int{}
+func f() { m[func() int { y++; return 0 }()]++ }
+`},
+		// This mutator switches on two node kinds, so both need nesting: a
+		// binary subtraction under a non-subtracting binary, and one under a
+		// unary operator that isn't negation.
+		{mutator.InvertNegatives, 3, `package p
+var a, b int
+func f() {
+	_ = (a - b) + (a - b)
+	_ = !((a - b) > 0)
+}
+`},
+		{mutator.LoopCondition, 3, `package p
+func f() {
+	for i := 0; false; i++ { for j := 0; j < 2; j++ { _ = j } }
+	for i := 0; i < 2; i++ { for j := 0; j < 3; j++ { _ = j } }
+}
+`},
+		// The outer range body already begins with a bare break and is
+		// declined; the sole candidate is the range nested behind it.
+		{mutator.RangeBreak, 1, `package p
+var xs, ys []int
+func f() {
+	for _, v := range xs { break; for _, w := range ys { _ = w } }
+	_ = xs
+}
+`},
+	}
+	for _, c := range cases {
+		t.Run(string(c.typ), func(t *testing.T) {
+			requireCandidates(t, c.typ, c.src, c.want)
+		})
+	}
+}
+
 // --- Return values ---
 
 // returnMutators is the set of mutators that partition the return-slot space.
