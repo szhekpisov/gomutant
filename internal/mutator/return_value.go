@@ -8,13 +8,16 @@ import (
 )
 
 // slotCtx is everything a predicate or replacement needs to reason about one
-// return slot: the slot's declared type expression, the predeclared names the
-// enclosing file shadows, and the fset/source needed to recover the type's
+// return slot: the slot's declared type expression, the type declarations the
+// enclosing file makes, and the fset/source needed to recover a type's
 // original text.
 type slotCtx struct {
-	typ      ast.Expr
-	expr     ast.Expr // the returned expression this slot would replace
-	shadowed map[string]bool
+	typ  ast.Expr
+	expr ast.Expr // the returned expression this slot would replace
+	// declared maps each type name the file declares to the type it is
+	// declared as. Membership answers "does this file shadow a predeclared
+	// name"; the value answers "what does this name actually resolve to".
+	declared map[string]ast.Expr
 	fset     *token.FileSet
 	src      []byte
 }
@@ -23,7 +26,15 @@ type slotCtx struct {
 // name — an unqualified ident that the file does not itself redeclare.
 func (c slotCtx) predeclared(name string) bool {
 	id, ok := c.typ.(*ast.Ident)
-	return ok && id.Name == name && !c.shadowed[name]
+	_, shadowed := c.declared[name]
+	return ok && id.Name == name && !shadowed
+}
+
+// text returns e exactly as written in the source.
+func (c slotCtx) text(e ast.Expr) string {
+	start := c.fset.Position(e.Pos()).Offset
+	end := c.fset.Position(e.End()).Offset
+	return string(c.src[start:end])
 }
 
 // typeText returns the slot type exactly as written in the source. Because
@@ -31,11 +42,7 @@ func (c slotCtx) predeclared(name string) bool {
 // construction a valid type expression at every return inside it — which is
 // what lets zeroValueExpr fall back to *new(T) without resolving imports or
 // consulting go/types.
-func (c slotCtx) typeText() string {
-	start := c.fset.Position(c.typ.Pos()).Offset
-	end := c.fset.Position(c.typ.End()).Offset
-	return string(c.src[start:end])
-}
+func (c slotCtx) typeText() string { return c.text(c.typ) }
 
 // returnValue is the single Mutator implementation behind the four
 // return-value mutators (RETURN_ERROR_NIL / RETURN_ZERO / RETURN_TRUE /
@@ -79,15 +86,29 @@ func (m *returnValue) Type() MutationType { return m.typ }
 // LIVED mutant no test could ever kill. This is what keeps RETURN_TRUE and
 // RETURN_FALSE from colliding on a literal `return true` / `return false`,
 // and what skips the already-propagating `return nil` for RETURN_ERROR_NIL.
+//
+// That guard compares the replacement against the expression with any
+// enclosing parentheses stripped, because `(true)` is different source text
+// from `true` and would otherwise slip past it, leaving RETURN_TRUE an
+// unkillable rewrite of `return (true)` into itself.
+//
+// The span replaced stays the whole slot expression, parentheses included, so
+// the patch is `return false` rather than `return (false)`. Both are valid —
+// the replacement is always a complete expression — but only the outer span
+// keeps the candidate reported on the line the `return` starts on. A
+// gomutants:disable-next-line directive resolves to that line, and matching in
+// FilterByDirectives is by exact line, so reporting a multi-line
+// `return (\n\texpr)` against the inner expression's line would silently stop
+// honouring the directive above it.
 func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) []MutantCandidate {
-	shadowed := declaredTypeNames(file)
+	declared := declaredTypes(file)
 	var out []MutantCandidate
 	returnSites(file, func(ret *ast.ReturnStmt, results []ast.Expr) {
 		if len(ret.Results) != len(results) {
 			return
 		}
-		for i, expr := range ret.Results {
-			ctx := slotCtx{typ: results[i], expr: expr, shadowed: shadowed, fset: fset, src: src}
+		for i, slot := range ret.Results {
+			ctx := slotCtx{typ: results[i], expr: ast.Unparen(slot), declared: declared, fset: fset, src: src}
 			if !m.owns(ctx) {
 				continue
 			}
@@ -95,12 +116,12 @@ func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) 
 			if !ok {
 				continue
 			}
-			pos := fset.Position(expr.Pos())
-			endOffset := fset.Position(expr.End()).Offset
-			original := string(src[pos.Offset:endOffset])
-			if original == replacement {
+			if ctx.text(ctx.expr) == replacement {
 				continue
 			}
+			pos := fset.Position(slot.Pos())
+			endOffset := fset.Position(slot.End()).Offset
+			original := string(src[pos.Offset:endOffset])
 			out = append(out, MutantCandidate{
 				Type:        m.typ,
 				Pos:         Position{Filename: pos.Filename, Line: pos.Line, Column: pos.Column, Offset: pos.Offset},
@@ -142,28 +163,141 @@ func fixed(text string) func(slotCtx) (string, bool) {
 // yield mutants that are byte-different but semantically identical, and no
 // test can ever kill them.
 //
-// Only shapes whose zero-ness is certain from syntax count. An empty composite
-// literal qualifies only for the types that reach the *new(T) fallback (named
-// types, structs, fixed arrays): for a slice or map, `[]int{}` and `map[k]v{}`
-// are non-nil and genuinely differ from the nil this mutator would emit, and
-// those types never reach the fallback anyway.
-func isSyntacticZero(expr ast.Expr) bool {
-	switch e := expr.(type) {
+// Only shapes whose zero-ness is certain from syntax count, and what counts
+// depends on the slot: an interface's zero is nil and nothing else, while for
+// every other type it is the empty literal — except a slice or map, whose
+// empty literal is non-nil.
+func isSyntacticZero(c slotCtx) bool {
+	if c.interfaceSlot() {
+		// Only nil is an interface's zero value. Every other expression that
+		// compiles in the slot — a zero-valued literal, an empty struct value
+		// — yields a non-nil interface carrying a dynamic type, which is
+		// exactly what *new(I) is not.
+		id, ok := c.expr.(*ast.Ident)
+		return ok && id.Name == "nil"
+	}
+	switch e := c.expr.(type) {
 	case *ast.CompositeLit:
-		return len(e.Elts) == 0
+		// Slices and maps are the composite kinds whose empty literal is not
+		// their zero value: `S{}` is a non-nil empty slice and `M{}` a non-nil
+		// empty map, while *new(S) and *new(M) are both nil. The difference is
+		// observable under ==, under reflect.DeepEqual, in JSON ([] versus
+		// null), and for a map by writing to it — the nil one panics.
+		//
+		// The literal's own type needs no comparison against the slot's. A
+		// composite literal only compiles in a non-interface slot when its
+		// type is identical to the slot's or shares its underlying type, and
+		// the zero value follows the underlying type either way — so `S{}` in
+		// a `type A = S` slot, and an unnamed `struct{ X int }{}` in a named
+		// slot, are both genuinely the slot's zero.
+		return len(e.Elts) == 0 && !c.nilableType(c.typ)
 	case *ast.Ident:
 		return e.Name == "nil" || e.Name == "false"
 	case *ast.BasicLit:
-		switch e.Kind {
-		case token.INT, token.FLOAT:
-			// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="strconv.ParseFloat's bitSize argument only branches at 32 vs ≠32 — values 63/64/65 all use the float64 parser, so mutating 64 is observably identical"
-			v, err := strconv.ParseFloat(strings.ReplaceAll(e.Value, "_", ""), 64)
-			return err == nil && v == 0
-		case token.STRING:
-			return e.Value == `""` || e.Value == "``"
-		}
+		return isZeroLit(e)
 	}
 	return false
+}
+
+// underlying resolves typ through this file's own type declarations until it
+// reaches a type that is not a bare name, and returns that.
+//
+// Only same-file declarations resolve, matching the single-file scope the rest
+// of this mutator works in. A name declared in a sibling file or another
+// package reads back nil and ends the walk unresolved, classifying as neither
+// an interface nor a slice or map — the suppressing default. That loses a
+// mutant, where the opposite default would emit an equivalent one, and an
+// equivalent mutant can never be cleared from a report while a missing one
+// costs only coverage.
+func (c slotCtx) underlying(typ ast.Expr) ast.Expr {
+	seen := make(map[string]bool)
+	for {
+		// Anything that is not a bare name is already as resolved as this can
+		// make it. The seen guard covers the chain `type A B; type B A`, which
+		// cannot compile but does parse, and Discover is only promised a file
+		// that parsed.
+		id, ok := typ.(*ast.Ident)
+		if !ok || seen[id.Name] {
+			return typ
+		}
+		next, declared := c.declared[id.Name]
+		if !declared {
+			// A name this file does not declare is as far as resolution goes,
+			// and the name itself is the useful answer: it may be predeclared
+			// — `any` resolves no further but is still an interface.
+			return typ
+		}
+		seen[id.Name] = true
+		typ = next
+	}
+}
+
+// interfaceSlot reports whether the slot's type is an interface, whose zero
+// value is nil and whose every other value is not.
+func (c slotCtx) interfaceSlot() bool {
+	switch t := c.underlying(c.typ).(type) {
+	case *ast.InterfaceType:
+		return true
+	case *ast.Ident:
+		// `any` is predeclared, so it survives resolution as a bare name and
+		// has to be recognised as the interface it is. A file that declares
+		// its own `any` never reaches here — the lookup above resolves it.
+		return t.Name == "any"
+	}
+	return false
+}
+
+// nilableType reports whether typ resolves to a slice or map — the two types
+// whose zero value is nil but whose empty composite literal is not.
+func (c slotCtx) nilableType(typ ast.Expr) bool {
+	switch t := c.underlying(typ).(type) {
+	case *ast.ArrayType:
+		// A slice has no length; a fixed-size array is not nilable.
+		return t.Len == nil
+	case *ast.MapType:
+		return true
+	}
+	return false
+}
+
+// isZeroLit reports whether a basic literal denotes zero, in every form Go
+// can spell one: 0, 00, 0b0, 0x0, 0.0, 0e10, 0x0p0, 0i, a NUL rune literal,
+// and both the interpreted and raw empty string.
+//
+// The three numeric kinds share a path because they share a grammar — an
+// imaginary literal is its real counterpart plus a trailing `i`, and zero
+// scaled by i is still zero.
+func isZeroLit(lit *ast.BasicLit) bool {
+	switch lit.Kind {
+	case token.INT, token.FLOAT, token.IMAG:
+		// Digit separators carry no value and strconv rejects them; the
+		// imaginary suffix is not part of the number either. Neither rewrite
+		// is safe for the quoted kinds — an underscore rune literal and
+		// "a_b" would both change — so this is not hoisted out of the switch.
+		text := strings.TrimSuffix(strings.ReplaceAll(lit.Value, "_", ""), "i")
+		// Both parsers are consulted because neither subsumes the other: only
+		// ParseInt accepts the binary and octal prefixes (`0b0`, `0o0`, `00`),
+		// and only ParseFloat accepts the fractional, exponent and hex-float
+		// forms (`0.0`, `0e10`, `0x0p0`). Each contributes a zero verdict
+		// solely when it parsed the text it was handed — ParseInt yields 0 on
+		// a syntax error, so an unguarded `n == 0` would call `1.5` zero.
+		//
+		// gomutants:disable-next-line INTEGER_DECREMENT reason="ParseInt's bitSize only has to admit zero, which 63 and 64 both do, so decrementing it is observably identical (incrementing past 64 is rejected outright, and is killed)"
+		n, intErr := strconv.ParseInt(text, 0, 64)
+		// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="strconv.ParseFloat's bitSize argument only branches at 32 vs ≠32 — values 63/64/65 all use the float64 parser, so mutating 64 is observably identical"
+		f, floatErr := strconv.ParseFloat(text, 64)
+		return (intErr == nil && n == 0) || (floatErr == nil && f == 0)
+	case token.CHAR:
+		// Unquote resolves every escape form a NUL rune can be written in.
+		// It cannot fail on a literal the parser accepted, and the ""
+		// it returns on failure is not NUL either way, so the error needs no
+		// branch of its own.
+		s, _ := strconv.Unquote(lit.Value)
+		return s == "\x00"
+	}
+	// STRING is the only other kind the parser puts in a BasicLit, so this is
+	// the string arm rather than an unreachable default.
+	return lit.Value == `""` || lit.Value == "``"
 }
 
 // zeroLiterals maps a predeclared type name to the shortest source text for
@@ -194,6 +328,26 @@ var zeroLiterals = map[string]string{
 	"complex128": "0",
 }
 
+// spelledSameZero reports whether expr already denotes the value that lit —
+// the shortest spelling of the slot type's zero — would substitute.
+//
+// It guards on the zeroLiterals path the equivalence isSyntacticZero guards on
+// the *new(T) path. Discover's phantom check compares source text, so `0.0` in
+// a float64 slot and a raw empty string in a string slot escape it while being
+// the very value the patch installs, leaving a mutant no test can kill.
+//
+// Only basic literals qualify, and only against a concrete zero. The one
+// zeroLiterals entry spelling nil is `any`, where the equivalence does not
+// hold: an interface holding 0 is not a nil interface, so `return 0` ->
+// `return nil` is a genuine mutation and must survive this guard.
+func spelledSameZero(expr ast.Expr, lit string) bool {
+	if lit == "nil" {
+		return false
+	}
+	basic, ok := expr.(*ast.BasicLit)
+	return ok && isZeroLit(basic)
+}
+
 // zeroValueExpr renders the zero value of a slot's declared type as source
 // text, using the shortest spelling that reads naturally and falling back to
 // *new(T) for everything else.
@@ -214,13 +368,17 @@ func zeroValueExpr(c slotCtx) (string, bool) {
 	case *ast.Ident:
 		// A file that redeclares the name means its own type, whose zero
 		// value the literal spelling would misrepresent.
-		if lit, ok := zeroLiterals[t.Name]; ok && !c.shadowed[t.Name] {
+		_, shadowed := c.declared[t.Name]
+		if lit, ok := zeroLiterals[t.Name]; ok && !shadowed {
+			if spelledSameZero(c.expr, lit) {
+				return "", false
+			}
 			return lit, true
 		}
 	case *ast.StarExpr, *ast.MapType, *ast.ChanType, *ast.FuncType, *ast.InterfaceType:
 		return "nil", true
 	}
-	if isSyntacticZero(c.expr) {
+	if isSyntacticZero(c) {
 		// Already the zero value, written another way — see isSyntacticZero.
 		return "", false
 	}

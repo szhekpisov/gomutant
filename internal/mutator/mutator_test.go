@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1781,6 +1782,24 @@ func g() [3]int { return [3]int{} }
 func h() MyIface { return nil }
 `, 0)
 
+	// Zero has a spelling in every numeric base and notation Go offers, and
+	// a rune literal has four ways to write NUL. All denote the same value
+	// the *new(T) patch would install, so all must be declined — the two
+	// parsers exist precisely because neither covers this list alone.
+	requireCandidates(t, mutator.ReturnZero, `package p
+func a() MyMask { return 0b0 }
+func b() MyMask { return 0o0 }
+func c() MyMask { return 00 }
+func d() MyMask { return 0x0 }
+func e() MyMask { return 0_0 }
+func f() MyFloat { return 0e10 }
+func g() MyFloat { return 0x0p0 }
+func h() MyComplex { return 0i }
+func i() MyComplex { return 0.0i }
+func j() MyRune { return '\x00' }
+func k() MyRune { return '\000' }
+`, 0)
+
 	// A declined slot must not stop the rest of the return from being
 	// examined: slot 0 is already zero and is skipped, slot 1 still mutates.
 	assertReplacements(t, mutator.ReturnZero, `package p
@@ -1789,24 +1808,174 @@ func a() (Block, time.Duration) { return Block{}, 5 }
 `, []replacementCase{{"5", "*new(time.Duration)"}})
 
 	// A non-zero value of the same types is still mutated — the skip is
-	// about the value, not the type. The last two are shapes the zero test
-	// cannot decide from syntax: a rune literal, and a float too large for
-	// ParseFloat. Both fall through to being mutated, which is the safe
-	// direction — a spurious mutant is visible, a missing one is not.
+	// about the value, not the type. `0b1` pins that the binary prefix is
+	// read by the parser that understands it rather than being waved
+	// through by the one that can't; `1e999` overflows ParseFloat, and a
+	// parse that failed must never be read as a zero verdict. The last case
+	// is an expression that is no kind of literal at all, whose value syntax
+	// cannot decide — the safe direction is to mutate it, since a spurious
+	// mutant is visible in the report and a missing one is not.
 	assertReplacements(t, mutator.ReturnZero, `package p
 type Block struct{ A int }
+var n int
 func a() Block { return Block{A: 1} }
 func b() time.Duration { return 5 }
 func c() MyString { return "x" }
 func d() MyRune { return 'a' }
 func e() MyFloat { return 1e999 }
+func f() MyMask { return 0b1 }
+func g() MyCount { return n + 1 }
 `, []replacementCase{
 		{"Block{A: 1}", "*new(Block)"},
 		{"5", "*new(time.Duration)"},
 		{`"x"`, "*new(MyString)"},
 		{"'a'", "*new(MyRune)"},
 		{"1e999", "*new(MyFloat)"},
+		{"0b1", "*new(MyMask)"},
+		{"n + 1", "*new(MyCount)"},
 	})
+}
+
+// TestReturnZeroSkipsAlreadyZeroLiteralSlots is the zeroLiterals-path twin of
+// TestReturnZeroSkipsAlreadyZeroValues. The shortest spelling of a predeclared
+// type's zero is not the only spelling: `0.0` in a float64 slot and a raw
+// empty string in a string slot are the same value the patch would install,
+// so Discover's byte comparison lets them through while nothing can kill them.
+//
+// The `any` slot is the deliberate exception. Its zero is nil, and an
+// interface holding 0 is not a nil interface, so that one is a real mutation
+// and has to survive the guard.
+func TestReturnZeroSkipsAlreadyZeroLiteralSlots(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+func a() float64 { return 0.0 }
+func b() float64 { return 0e10 }
+func c() float32 { return 0x0p0 }
+func d() string { return `+"``"+` }
+func e() int { return (0) }
+func f() uint { return 0b0 }
+func g() byte { return '\x00' }
+func h() complex128 { return 0i }
+`, 0)
+
+	assertReplacements(t, mutator.ReturnZero, `package p
+func a() any { return 0 }
+func b() any { return "" }
+func c() float64 { return 1.5 }
+`, []replacementCase{{"0", "nil"}, {`""`, "nil"}, {"1.5", "0"}})
+}
+
+// TestReturnZeroMutatesNilableEmptyLiterals pins the half of the empty-literal
+// rule that is not about being empty.
+//
+// `S{}` for a named slice is a non-nil empty slice and `M{}` a non-nil empty
+// map, while *new(S) and *new(M) are both nil — observable under ==, under
+// reflect.DeepEqual, in JSON as [] versus null, and for a map by writing to it,
+// where the nil one panics. Treating those as already-zero would suppress a
+// mutant a test can genuinely kill.
+//
+// An unnamed slice or map never gets this far, because zeroValueExpr answers
+// *ast.ArrayType and *ast.MapType with a plain nil first. Only a named one
+// reaches the *new(T) fallback, which is why the name has to be resolved.
+func TestReturnZeroMutatesNilableEmptyLiterals(t *testing.T) {
+	assertReplacements(t, mutator.ReturnZero, `package p
+type S []int
+type M map[string]int
+type Chain S
+type Alias = []int
+func a() S { return S{} }
+func b() M { return M{} }
+func c() Chain { return Chain{} }
+func d() Alias { return Alias{} }
+`, []replacementCase{
+		{"S{}", "*new(S)"},
+		{"M{}", "*new(M)"},
+		{"Chain{}", "*new(Chain)"},
+		{"Alias{}", "*new(Alias)"},
+	})
+
+	// The literal must also be spelled as the slot's own type. `Impl{}` in an
+	// interface slot is a non-nil interface holding a zero Impl, which is not
+	// the nil that *new(I) yields.
+	assertReplacements(t, mutator.ReturnZero, `package p
+type I interface{ M() }
+type Impl struct{}
+func f() I { return Impl{} }
+`, []replacementCase{{"Impl{}", "*new(I)"}})
+}
+
+// TestReturnZeroSuppressesNonNilableEmptyLiterals is the other side of
+// TestReturnZeroMutatesNilableEmptyLiterals: the empty literal of a struct or
+// a fixed-size array really is that type's zero value, named or not, and must
+// stay suppressed. This is the case #80 added the guard for, and the
+// nilable-type carve-out must not cost it.
+//
+// The last two are the shapes the resolution cannot decide. A name declared in
+// a sibling file or another package does not resolve, and a cyclic declaration
+// resolves to nothing; both keep the suppressing default, which loses a mutant
+// rather than emitting one that could never be killed. The cycle is also here
+// to pin termination — it parses even though it cannot compile, and Discover
+// is only ever promised a file that parsed.
+func TestReturnZeroSuppressesNonNilableEmptyLiterals(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+type Arr [3]int
+type Block struct{ A int }
+type C D
+type D C
+func a() Arr { return Arr{} }
+func b() Block { return Block{} }
+func c() [3]int { return [3]int{} }
+func d() other.Thing { return other.Thing{} }
+func e() Elsewhere { return Elsewhere{} }
+func f() C { return C{} }
+`, 0)
+}
+
+// TestReturnValueStripsParens pins that the phantom guard compares against the
+// expression inside any enclosing parentheses. `(true)` would otherwise read as
+// different from `true` and RETURN_TRUE would emit a patch that rewrites
+// `return (true)` into itself.
+//
+// The span replaced stays the whole slot expression, parentheses included, so
+// the recorded Original is `(true)` and the patch is `return false`. See
+// TestReturnValueReportsTheReturnLine for why the span is not narrowed.
+func TestReturnValueStripsParens(t *testing.T) {
+	src := `package p
+var e error
+func a() bool { return (true) }
+func b(x int) bool { return (x > 0) }
+func c() error { return (e) }
+`
+	assertReplacements(t, mutator.ReturnTrue, src, []replacementCase{{"(x > 0)", "true"}})
+	assertReplacements(t, mutator.ReturnFalse, src,
+		[]replacementCase{{"(true)", "false"}, {"(x > 0)", "false"}})
+	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"(e)", "nil"}})
+
+	// Nesting must unwrap all the way down, not one layer.
+	requireCandidates(t, mutator.ReturnZero, `package p
+func f() int { return ((0)) }
+`, 0)
+}
+
+// TestReturnValueReportsTheReturnLine pins that a candidate is reported on the
+// line its `return` starts on, even when the returned expression begins on a
+// later one.
+//
+// A gomutants:disable-next-line directive resolves to the first code line
+// below it — the `return` line — and FilterByDirectives matches on the
+// mutant's Line exactly. Reporting a multi-line `return (\n\texpr)` against
+// the inner expression's line would leave the directive matching nothing, and
+// a mutation the author explicitly suppressed would quietly start running
+// again. Nothing else in the pipeline would notice.
+func TestReturnValueReportsTheReturnLine(t *testing.T) {
+	cs := requireCandidates(t, mutator.ReturnZero, `package p
+func f() int {
+	return (
+		1 + 2)
+}
+`, 1)
+	if cs[0].Pos.Line != 3 {
+		t.Errorf("reported line %d, want 3 (the `return` line, which is what a disable-next-line above it resolves to)", cs[0].Pos.Line)
+	}
 }
 
 func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
@@ -1935,6 +2104,157 @@ func f(x int) (bool, string, error) {
 	}
 	if total == 0 {
 		t.Fatal("expected candidates from the return mutators")
+	}
+}
+
+// --- Return-value equivalence corpus ---
+
+// The corpus asks one question of RETURN_ZERO and answers it two ways.
+//
+// Every decision the mutator makes about a zero value is a claim that two
+// pieces of Go text do, or do not, denote the same value. Until now those
+// claims were checked by asserting the behaviour someone had reasoned their
+// way to, which is exactly the step that has gone wrong: an empty literal was
+// read as a zero value when for a named slice it is not, and `0.0` was read as
+// distinct from `0` when it is not.
+//
+// So the expected answer here is not written down. It is computed by handing
+// the two expressions to the Go runtime and asking reflect.DeepEqual, and the
+// test asserts the biconditional: RETURN_ZERO declines a slot **if and only
+// if** the value it would substitute is the value already there.
+//
+// That closes the direction nothing else can see. An equivalent mutant that is
+// emitted at least surfaces as a survivor someone eventually investigates; a
+// real mutant that is wrongly suppressed produces no signal at all — the count
+// is simply lower, and the efficacy number looks better for it.
+//
+// corpusDecls is the type environment each case is discovered in. It must stay
+// in lockstep with the Go declarations immediately below: the string feeds the
+// mutator, the declarations feed reflect.DeepEqual, and the test only means
+// anything while the two agree. They are kept adjacent so a change to one that
+// misses the other is visible in the same diff hunk.
+const corpusDecls = `
+type zBlock struct{ A int }
+type zArr [3]int
+type zSlice []int
+type zMap map[string]int
+type zMask uint
+type zCode rune
+type zMarker interface{ Mark() }
+type zImpl struct{}
+type zAny any
+type zAlias = zBlock
+func (zImpl) Mark() {}
+`
+
+type zBlock struct{ A int }
+type zArr [3]int
+type zSlice []int
+type zMap map[string]int
+type zMask uint
+type zCode rune
+type zMarker interface{ Mark() }
+type zImpl struct{}
+type zAny any
+type zAlias = zBlock
+
+func (zImpl) Mark() {}
+
+// equivalenceCase is one (slot type, returned expression) pair together with
+// the text RETURN_ZERO does or would substitute for it. Whether it should is
+// not a field anyone fills in — see same.
+type equivalenceCase struct {
+	typ  string // the slot type, as written in the signature
+	expr string // the expression returned into that slot
+	repl string // what RETURN_ZERO substitutes, or would if it did not decline
+	// same is ground truth, evaluated by the Go runtime rather than asserted:
+	// both operands are converted to the slot type first, because DeepEqual
+	// compares dynamic types and would otherwise call float64(0) and int(0)
+	// different for the wrong reason.
+	same bool
+}
+
+var equivalenceCorpus = []equivalenceCase{
+	// Alternate spellings of a zero the mutator has a short literal for.
+	{"float64", "0.0", "0", reflect.DeepEqual(float64(0.0), float64(0))},
+	{"float64", "0e10", "0", reflect.DeepEqual(float64(0e10), float64(0))},
+	{"string", "``", `""`, reflect.DeepEqual(``, "")},
+	{"int", "(0)", "0", reflect.DeepEqual(int((0)), int(0))},
+	{"uint", "0b0", "0", reflect.DeepEqual(uint(0b0), uint(0))},
+	{"complex128", "0i", "0", reflect.DeepEqual(complex128(0i), complex128(0))},
+	{"byte", `'\x00'`, "0", reflect.DeepEqual(byte('\x00'), byte(0))},
+
+	// Alternate spellings of a zero reached through the *new(T) fallback.
+	{"zBlock", "zBlock{}", "*new(zBlock)", reflect.DeepEqual(zBlock{}, *new(zBlock))},
+	{"zArr", "zArr{}", "*new(zArr)", reflect.DeepEqual(zArr{}, *new(zArr))},
+
+	// Empty literals that are not the slot's zero: the composite kinds whose
+	// empty form is non-nil, and a literal of some other type entirely.
+	{"zSlice", "zSlice{}", "*new(zSlice)", reflect.DeepEqual(zSlice{}, *new(zSlice))},
+	{"zMap", "zMap{}", "*new(zMap)", reflect.DeepEqual(zMap{}, *new(zMap))},
+	{"zMarker", "zImpl{}", "*new(zMarker)", reflect.DeepEqual(zMarker(zImpl{}), *new(zMarker))},
+
+	// An interface holding zero is not a nil interface — true of the
+	// predeclared `any`, and equally of a named interface reached through the
+	// *new(T) fallback, whatever spelling the zero-valued literal uses.
+	{"any", "0", "nil", reflect.DeepEqual(any(0), *new(any))},
+	{"zAny", "0", "*new(zAny)", reflect.DeepEqual(zAny(0), *new(zAny))},
+	{"zAny", `'\x00'`, "*new(zAny)", reflect.DeepEqual(zAny('\x00'), *new(zAny))},
+	{"zAny", "0b0", "*new(zAny)", reflect.DeepEqual(zAny(0b0), *new(zAny))},
+	{"zAny", "0i", "*new(zAny)", reflect.DeepEqual(zAny(0i), *new(zAny))},
+	{"zAny", "false", "*new(zAny)", reflect.DeepEqual(zAny(false), *new(zAny))},
+	{"zAny", "``", "*new(zAny)", reflect.DeepEqual(zAny(``), *new(zAny))},
+
+	// A literal spelled as a different name for the same non-nilable type is
+	// still that type's zero, so it must stay suppressed. An alias and an
+	// unnamed struct sharing the slot's underlying type both qualify.
+	{"zAlias", "zBlock{}", "*new(zAlias)", reflect.DeepEqual(zAlias(zBlock{}), *new(zAlias))},
+	{"zBlock", "struct{ A int }{}", "*new(zBlock)", reflect.DeepEqual(zBlock(struct{ A int }{}), *new(zBlock))},
+
+	// Plainly non-zero values, as controls: a guard that declines these is as
+	// broken as one that fails to decline the cases above.
+	{"int", "1", "0", reflect.DeepEqual(int(1), int(0))},
+	{"float64", "1.5", "0", reflect.DeepEqual(float64(1.5), float64(0))},
+	{"string", `"x"`, `""`, reflect.DeepEqual("x", "")},
+	{"zMask", "0b1", "*new(zMask)", reflect.DeepEqual(zMask(0b1), *new(zMask))},
+	{"zCode", "'a'", "*new(zCode)", reflect.DeepEqual(zCode('a'), *new(zCode))},
+}
+
+// assertEquivalenceCase discovers RETURN_ZERO against one corpus case and
+// holds it to the verdict reflect.DeepEqual gave.
+func assertEquivalenceCase(t *testing.T, c equivalenceCase) {
+	t.Helper()
+	src := "package p\n" + corpusDecls + "\nfunc f() " + c.typ + " { return " + c.expr + " }\n"
+	fset, file, srcBytes := parse(t, src)
+	got := findMutator(t, mutator.ReturnZero).Discover(fset, file, srcBytes)
+
+	if c.same {
+		if len(got) != 0 {
+			t.Errorf("%s slot returning %s: got mutant %q→%q, but the two are the same value — nothing could ever kill it",
+				c.typ, c.expr, got[0].Original, got[0].Replacement)
+		}
+		return
+	}
+	if len(got) != 1 {
+		t.Fatalf("%s slot returning %s: got %d mutants, want 1 — %s differs from %s, so a test can kill the swap",
+			c.typ, c.expr, len(got), c.expr, c.repl)
+	}
+	if got[0].Replacement != c.repl {
+		t.Errorf("%s slot returning %s: substituted %q, want %q",
+			c.typ, c.expr, got[0].Replacement, c.repl)
+	}
+}
+
+func TestReturnZeroEquivalenceCorpus(t *testing.T) {
+	sawBoth := map[bool]int{}
+	for _, c := range equivalenceCorpus {
+		sawBoth[c.same]++
+		t.Run(c.typ+"/"+c.expr, func(t *testing.T) { assertEquivalenceCase(t, c) })
+	}
+	// A corpus that drifted to all-equivalent or all-distinct would still pass
+	// every case above while testing only one side of the biconditional.
+	if sawBoth[true] == 0 || sawBoth[false] == 0 {
+		t.Errorf("corpus covers only one verdict: %d equivalent, %d distinct", sawBoth[true], sawBoth[false])
 	}
 }
 
