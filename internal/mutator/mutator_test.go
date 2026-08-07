@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -2077,6 +2078,135 @@ func f(x int) (bool, string, error) {
 	}
 	if total == 0 {
 		t.Fatal("expected candidates from the return mutators")
+	}
+}
+
+// --- Return-value equivalence corpus ---
+
+// The corpus asks one question of RETURN_ZERO and answers it two ways.
+//
+// Every decision the mutator makes about a zero value is a claim that two
+// pieces of Go text do, or do not, denote the same value. Until now those
+// claims were checked by asserting the behaviour someone had reasoned their
+// way to, which is exactly the step that has gone wrong: an empty literal was
+// read as a zero value when for a named slice it is not, and `0.0` was read as
+// distinct from `0` when it is not.
+//
+// So the expected answer here is not written down. It is computed by handing
+// the two expressions to the Go runtime and asking reflect.DeepEqual, and the
+// test asserts the biconditional: RETURN_ZERO declines a slot **if and only
+// if** the value it would substitute is the value already there.
+//
+// That closes the direction nothing else can see. An equivalent mutant that is
+// emitted at least surfaces as a survivor someone eventually investigates; a
+// real mutant that is wrongly suppressed produces no signal at all — the count
+// is simply lower, and the efficacy number looks better for it.
+//
+// corpusDecls is the type environment each case is discovered in. It must stay
+// in lockstep with the Go declarations immediately below: the string feeds the
+// mutator, the declarations feed reflect.DeepEqual, and the test only means
+// anything while the two agree. They are kept adjacent so a change to one that
+// misses the other is visible in the same diff hunk.
+const corpusDecls = `
+type zBlock struct{ A int }
+type zArr [3]int
+type zSlice []int
+type zMap map[string]int
+type zMask uint
+type zCode rune
+type zIface interface{ M() }
+type zImpl struct{}
+func (zImpl) M() {}
+`
+
+type zBlock struct{ A int }
+type zArr [3]int
+type zSlice []int
+type zMap map[string]int
+type zMask uint
+type zCode rune
+type zIface interface{ M() }
+type zImpl struct{}
+
+func (zImpl) M() {}
+
+// equivalenceCase is one (slot type, returned expression) pair together with
+// the text RETURN_ZERO does or would substitute for it. Whether it should is
+// not a field anyone fills in — see same.
+type equivalenceCase struct {
+	typ  string // the slot type, as written in the signature
+	expr string // the expression returned into that slot
+	repl string // what RETURN_ZERO substitutes, or would if it did not decline
+	// same is ground truth, evaluated by the Go runtime rather than asserted:
+	// both operands are converted to the slot type first, because DeepEqual
+	// compares dynamic types and would otherwise call float64(0) and int(0)
+	// different for the wrong reason.
+	same bool
+}
+
+var equivalenceCorpus = []equivalenceCase{
+	// Alternate spellings of a zero the mutator has a short literal for.
+	{"float64", "0.0", "0", reflect.DeepEqual(float64(0.0), float64(0))},
+	{"float64", "0e10", "0", reflect.DeepEqual(float64(0e10), float64(0))},
+	{"string", "``", `""`, reflect.DeepEqual(``, "")},
+	{"int", "(0)", "0", reflect.DeepEqual(int((0)), int(0))},
+	{"uint", "0b0", "0", reflect.DeepEqual(uint(0b0), uint(0))},
+	{"complex128", "0i", "0", reflect.DeepEqual(complex128(0i), complex128(0))},
+	{"byte", `'\x00'`, "0", reflect.DeepEqual(byte('\x00'), byte(0))},
+
+	// Alternate spellings of a zero reached through the *new(T) fallback.
+	{"zBlock", "zBlock{}", "*new(zBlock)", reflect.DeepEqual(zBlock{}, *new(zBlock))},
+	{"zArr", "zArr{}", "*new(zArr)", reflect.DeepEqual(zArr{}, *new(zArr))},
+
+	// Empty literals that are not the slot's zero: the composite kinds whose
+	// empty form is non-nil, and a literal of some other type entirely.
+	{"zSlice", "zSlice{}", "*new(zSlice)", reflect.DeepEqual(zSlice{}, *new(zSlice))},
+	{"zMap", "zMap{}", "*new(zMap)", reflect.DeepEqual(zMap{}, *new(zMap))},
+	{"zIface", "zImpl{}", "*new(zIface)", reflect.DeepEqual(zIface(zImpl{}), *new(zIface))},
+
+	// An interface holding zero is not a nil interface, which is why `any` is
+	// carved out of the literal-spelling guard.
+	{"any", "0", "nil", reflect.DeepEqual(any(0), *new(any))},
+
+	// Plainly non-zero values, as controls: a guard that declines these is as
+	// broken as one that fails to decline the cases above.
+	{"int", "1", "0", reflect.DeepEqual(int(1), int(0))},
+	{"float64", "1.5", "0", reflect.DeepEqual(float64(1.5), float64(0))},
+	{"string", `"x"`, `""`, reflect.DeepEqual("x", "")},
+	{"zMask", "0b1", "*new(zMask)", reflect.DeepEqual(zMask(0b1), *new(zMask))},
+	{"zCode", "'a'", "*new(zCode)", reflect.DeepEqual(zCode('a'), *new(zCode))},
+}
+
+func TestReturnZeroEquivalenceCorpus(t *testing.T) {
+	sawBoth := map[bool]int{}
+	for _, c := range equivalenceCorpus {
+		sawBoth[c.same]++
+		t.Run(c.typ+"/"+c.expr, func(t *testing.T) {
+			src := "package p\n" + corpusDecls + "\nfunc f() " + c.typ + " { return " + c.expr + " }\n"
+			fset, file, srcBytes := parse(t, src)
+			got := findMutator(t, mutator.ReturnZero).Discover(fset, file, srcBytes)
+
+			if c.same {
+				if len(got) != 0 {
+					t.Errorf("%s slot returning %s: got mutant %q→%q, but the two are the same value — nothing could ever kill it",
+						c.typ, c.expr, got[0].Original, got[0].Replacement)
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("%s slot returning %s: got %d mutants, want 1 — %s differs from %s, so a test can kill the swap",
+					c.typ, c.expr, len(got), c.expr, c.repl)
+			}
+			if got[0].Replacement != c.repl {
+				t.Errorf("%s slot returning %s: substituted %q, want %q",
+					c.typ, c.expr, got[0].Replacement, c.repl)
+			}
+		})
+	}
+	// A corpus that drifted to all-equivalent or all-distinct would still pass
+	// every case above while testing only one side of the biconditional.
+	if sawBoth[true] == 0 || sawBoth[false] == 0 {
+		t.Errorf("corpus covers only one verdict: %d equivalent, %d distinct", sawBoth[true], sawBoth[false])
 	}
 }
 
