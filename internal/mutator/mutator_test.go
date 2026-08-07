@@ -1863,6 +1863,72 @@ func c() float64 { return 1.5 }
 `, []replacementCase{{"0", "nil"}, {`""`, "nil"}, {"1.5", "0"}})
 }
 
+// TestReturnZeroMutatesNilableEmptyLiterals pins the half of the empty-literal
+// rule that is not about being empty.
+//
+// `S{}` for a named slice is a non-nil empty slice and `M{}` a non-nil empty
+// map, while *new(S) and *new(M) are both nil — observable under ==, under
+// reflect.DeepEqual, in JSON as [] versus null, and for a map by writing to it,
+// where the nil one panics. Treating those as already-zero would suppress a
+// mutant a test can genuinely kill.
+//
+// An unnamed slice or map never gets this far, because zeroValueExpr answers
+// *ast.ArrayType and *ast.MapType with a plain nil first. Only a named one
+// reaches the *new(T) fallback, which is why the name has to be resolved.
+func TestReturnZeroMutatesNilableEmptyLiterals(t *testing.T) {
+	assertReplacements(t, mutator.ReturnZero, `package p
+type S []int
+type M map[string]int
+type Chain S
+type Alias = []int
+func a() S { return S{} }
+func b() M { return M{} }
+func c() Chain { return Chain{} }
+func d() Alias { return Alias{} }
+`, []replacementCase{
+		{"S{}", "*new(S)"},
+		{"M{}", "*new(M)"},
+		{"Chain{}", "*new(Chain)"},
+		{"Alias{}", "*new(Alias)"},
+	})
+
+	// The literal must also be spelled as the slot's own type. `Impl{}` in an
+	// interface slot is a non-nil interface holding a zero Impl, which is not
+	// the nil that *new(I) yields.
+	assertReplacements(t, mutator.ReturnZero, `package p
+type I interface{ M() }
+type Impl struct{}
+func f() I { return Impl{} }
+`, []replacementCase{{"Impl{}", "*new(I)"}})
+}
+
+// TestReturnZeroSuppressesNonNilableEmptyLiterals is the other side of
+// TestReturnZeroMutatesNilableEmptyLiterals: the empty literal of a struct or
+// a fixed-size array really is that type's zero value, named or not, and must
+// stay suppressed. This is the case #80 added the guard for, and the
+// nilable-type carve-out must not cost it.
+//
+// The last two are the shapes the resolution cannot decide. A name declared in
+// a sibling file or another package does not resolve, and a cyclic declaration
+// resolves to nothing; both keep the suppressing default, which loses a mutant
+// rather than emitting one that could never be killed. The cycle is also here
+// to pin termination — it parses even though it cannot compile, and Discover
+// is only ever promised a file that parsed.
+func TestReturnZeroSuppressesNonNilableEmptyLiterals(t *testing.T) {
+	requireCandidates(t, mutator.ReturnZero, `package p
+type Arr [3]int
+type Block struct{ A int }
+type C D
+type D C
+func a() Arr { return Arr{} }
+func b() Block { return Block{} }
+func c() [3]int { return [3]int{} }
+func d() other.Thing { return other.Thing{} }
+func e() Elsewhere { return Elsewhere{} }
+func f() C { return C{} }
+`, 0)
+}
+
 // TestReturnValueStripsParens pins that the mutated span is the expression
 // inside any enclosing parentheses. Discover's phantom guard compares source
 // text, so `(true)` would otherwise read as different from `true` and

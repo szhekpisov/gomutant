@@ -77,22 +77,28 @@ func returnSites(file *ast.File, fn func(ret *ast.ReturnStmt, results []ast.Expr
 	})
 }
 
-// declaredTypeNames returns the package-level type names declared in file.
+// declaredTypes returns the package-level type declarations in file, each name
+// mapped to the type expression it is declared as.
 //
-// Go's predeclared identifiers (`error`, `bool`, `string`, `int`, …) are not
-// reserved words — a package may declare its own type of the same name. The
-// return-value mutators identify slot types purely by identifier text, so a
-// redeclared name must not be treated as the predeclared one.
+// Membership and value answer two different questions. Membership: Go's
+// predeclared identifiers (`error`, `bool`, `string`, `int`, …) are not
+// reserved words, so a package may declare its own type of the same name, and
+// the return-value mutators identify slot types purely by identifier text — a
+// redeclared name must not be treated as the predeclared one. Value: a named
+// type's zero value depends on what it is declared as, which is how
+// slotCtx.nilableType tells `type S []int` (whose `S{}` is non-nil) from
+// `type S struct{}` (whose `S{}` is the zero value).
 //
 // Only this file's package-level declarations are visible, so two kinds of
-// shadow are missed: one declared in a sibling file of the same package
-// (Mutator.Discover receives a single *ast.File), and one declared inside a
-// function body (only file.Decls is scanned, and a local type is reachable
-// solely from the returns that follow it). The consequence of either is a
-// mutant that fails to compile and is reported NOT VIABLE, never a wrong
-// result — which is why neither is worth the extra scope tracking.
-func declaredTypeNames(file *ast.File) map[string]bool {
-	out := make(map[string]bool)
+// declaration are missed: one in a sibling file of the same package
+// (Mutator.Discover receives a single *ast.File), and one inside a function
+// body (only file.Decls is scanned, and a local type is reachable solely from
+// the returns that follow it). A missed shadow costs a mutant that fails to
+// compile and is reported NOT VIABLE, never a wrong result; a missed
+// resolution costs an undiscovered mutant. Neither is worth the extra scope
+// tracking.
+func declaredTypes(file *ast.File) map[string]ast.Expr {
+	out := make(map[string]ast.Expr)
 	for _, d := range file.Decls {
 		gen, ok := d.(*ast.GenDecl)
 		if !ok || gen.Tok != token.TYPE {
@@ -103,7 +109,8 @@ func declaredTypeNames(file *ast.File) map[string]bool {
 			// only ever sees files that parsed without error, so the
 			// assertion needs no comma-ok guard (which would be a branch no
 			// test could reach).
-			out[spec.(*ast.TypeSpec).Name.Name] = true
+			ts := spec.(*ast.TypeSpec)
+			out[ts.Name.Name] = ts.Type
 		}
 	}
 	return out
