@@ -1930,10 +1930,14 @@ func f() C { return C{} }
 `, 0)
 }
 
-// TestReturnValueStripsParens pins that the mutated span is the expression
-// inside any enclosing parentheses. Discover's phantom guard compares source
-// text, so `(true)` would otherwise read as different from `true` and
-// RETURN_TRUE would emit a patch that rewrites `return (true)` into itself.
+// TestReturnValueStripsParens pins that the phantom guard compares against the
+// expression inside any enclosing parentheses. `(true)` would otherwise read as
+// different from `true` and RETURN_TRUE would emit a patch that rewrites
+// `return (true)` into itself.
+//
+// The span replaced stays the whole slot expression, parentheses included, so
+// the recorded Original is `(true)` and the patch is `return false`. See
+// TestReturnValueReportsTheReturnLine for why the span is not narrowed.
 func TestReturnValueStripsParens(t *testing.T) {
 	src := `package p
 var e error
@@ -1941,15 +1945,37 @@ func a() bool { return (true) }
 func b(x int) bool { return (x > 0) }
 func c() error { return (e) }
 `
-	assertReplacements(t, mutator.ReturnTrue, src, []replacementCase{{"x > 0", "true"}})
+	assertReplacements(t, mutator.ReturnTrue, src, []replacementCase{{"(x > 0)", "true"}})
 	assertReplacements(t, mutator.ReturnFalse, src,
-		[]replacementCase{{"true", "false"}, {"x > 0", "false"}})
-	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"e", "nil"}})
+		[]replacementCase{{"(true)", "false"}, {"(x > 0)", "false"}})
+	assertReplacements(t, mutator.ReturnErrorNil, src, []replacementCase{{"(e)", "nil"}})
 
 	// Nesting must unwrap all the way down, not one layer.
 	requireCandidates(t, mutator.ReturnZero, `package p
 func f() int { return ((0)) }
 `, 0)
+}
+
+// TestReturnValueReportsTheReturnLine pins that a candidate is reported on the
+// line its `return` starts on, even when the returned expression begins on a
+// later one.
+//
+// A gomutants:disable-next-line directive resolves to the first code line
+// below it — the `return` line — and FilterByDirectives matches on the
+// mutant's Line exactly. Reporting a multi-line `return (\n\texpr)` against
+// the inner expression's line would leave the directive matching nothing, and
+// a mutation the author explicitly suppressed would quietly start running
+// again. Nothing else in the pipeline would notice.
+func TestReturnValueReportsTheReturnLine(t *testing.T) {
+	cs := requireCandidates(t, mutator.ReturnZero, `package p
+func f() int {
+	return (
+		1 + 2)
+}
+`, 1)
+	if cs[0].Pos.Line != 3 {
+		t.Errorf("reported line %d, want 3 (the `return` line, which is what a disable-next-line above it resolves to)", cs[0].Pos.Line)
+	}
 }
 
 func TestReturnZeroSkipsShadowedBasicType(t *testing.T) {
@@ -2116,6 +2142,8 @@ type zMask uint
 type zCode rune
 type zIface interface{ M() }
 type zImpl struct{}
+type zAny any
+type zAlias = zBlock
 func (zImpl) M() {}
 `
 
@@ -2127,6 +2155,8 @@ type zMask uint
 type zCode rune
 type zIface interface{ M() }
 type zImpl struct{}
+type zAny any
+type zAlias = zBlock
 
 func (zImpl) M() {}
 
@@ -2164,9 +2194,22 @@ var equivalenceCorpus = []equivalenceCase{
 	{"zMap", "zMap{}", "*new(zMap)", reflect.DeepEqual(zMap{}, *new(zMap))},
 	{"zIface", "zImpl{}", "*new(zIface)", reflect.DeepEqual(zIface(zImpl{}), *new(zIface))},
 
-	// An interface holding zero is not a nil interface, which is why `any` is
-	// carved out of the literal-spelling guard.
+	// An interface holding zero is not a nil interface — true of the
+	// predeclared `any`, and equally of a named interface reached through the
+	// *new(T) fallback, whatever spelling the zero-valued literal uses.
 	{"any", "0", "nil", reflect.DeepEqual(any(0), *new(any))},
+	{"zAny", "0", "*new(zAny)", reflect.DeepEqual(zAny(0), *new(zAny))},
+	{"zAny", `'\x00'`, "*new(zAny)", reflect.DeepEqual(zAny('\x00'), *new(zAny))},
+	{"zAny", "0b0", "*new(zAny)", reflect.DeepEqual(zAny(0b0), *new(zAny))},
+	{"zAny", "0i", "*new(zAny)", reflect.DeepEqual(zAny(0i), *new(zAny))},
+	{"zAny", "false", "*new(zAny)", reflect.DeepEqual(zAny(false), *new(zAny))},
+	{"zAny", "``", "*new(zAny)", reflect.DeepEqual(zAny(``), *new(zAny))},
+
+	// A literal spelled as a different name for the same non-nilable type is
+	// still that type's zero, so it must stay suppressed. An alias and an
+	// unnamed struct sharing the slot's underlying type both qualify.
+	{"zAlias", "zBlock{}", "*new(zAlias)", reflect.DeepEqual(zAlias(zBlock{}), *new(zAlias))},
+	{"zBlock", "struct{ A int }{}", "*new(zBlock)", reflect.DeepEqual(zBlock(struct{ A int }{}), *new(zBlock))},
 
 	// Plainly non-zero values, as controls: a guard that declines these is as
 	// broken as one that fails to decline the cases above.

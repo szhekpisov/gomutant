@@ -87,11 +87,19 @@ func (m *returnValue) Type() MutationType { return m.typ }
 // RETURN_FALSE from colliding on a literal `return true` / `return false`,
 // and what skips the already-propagating `return nil` for RETURN_ERROR_NIL.
 //
-// The span mutated is the expression with any enclosing parentheses stripped,
-// so that guard compares like with like: `(true)` is different source text
+// That guard compares the replacement against the expression with any
+// enclosing parentheses stripped, because `(true)` is different source text
 // from `true` and would otherwise slip past it, leaving RETURN_TRUE an
-// unkillable rewrite of `return (true)` into itself. Narrowing the span also
-// keeps the patch minimal — RETURN_FALSE emits `return (false)`.
+// unkillable rewrite of `return (true)` into itself.
+//
+// The span replaced stays the whole slot expression, parentheses included, so
+// the patch is `return false` rather than `return (false)`. Both are valid —
+// the replacement is always a complete expression — but only the outer span
+// keeps the candidate reported on the line the `return` starts on. A
+// gomutants:disable-next-line directive resolves to that line, and matching in
+// FilterByDirectives is by exact line, so reporting a multi-line
+// `return (\n\texpr)` against the inner expression's line would silently stop
+// honouring the directive above it.
 func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) []MutantCandidate {
 	declared := declaredTypes(file)
 	var out []MutantCandidate
@@ -100,8 +108,7 @@ func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) 
 			return
 		}
 		for i, slot := range ret.Results {
-			expr := ast.Unparen(slot)
-			ctx := slotCtx{typ: results[i], expr: expr, declared: declared, fset: fset, src: src}
+			ctx := slotCtx{typ: results[i], expr: ast.Unparen(slot), declared: declared, fset: fset, src: src}
 			if !m.owns(ctx) {
 				continue
 			}
@@ -109,12 +116,12 @@ func (m *returnValue) Discover(fset *token.FileSet, file *ast.File, src []byte) 
 			if !ok {
 				continue
 			}
-			pos := fset.Position(expr.Pos())
-			endOffset := fset.Position(expr.End()).Offset
-			original := string(src[pos.Offset:endOffset])
-			if original == replacement {
+			if ctx.text(ctx.expr) == replacement {
 				continue
 			}
+			pos := fset.Position(slot.Pos())
+			endOffset := fset.Position(slot.End()).Offset
+			original := string(src[pos.Offset:endOffset])
 			out = append(out, MutantCandidate{
 				Type:        m.typ,
 				Pos:         Position{Filename: pos.Filename, Line: pos.Line, Column: pos.Column, Offset: pos.Offset},
@@ -156,12 +163,34 @@ func fixed(text string) func(slotCtx) (string, bool) {
 // yield mutants that are byte-different but semantically identical, and no
 // test can ever kill them.
 //
-// Only shapes whose zero-ness is certain from syntax count, which for an empty
-// composite literal takes more than counting its elements — see emptyLitIsZero.
+// Only shapes whose zero-ness is certain from syntax count, and what counts
+// depends on the slot: an interface's zero is nil and nothing else, while for
+// every other type it is the empty literal — except a slice or map, whose
+// empty literal is non-nil.
 func isSyntacticZero(c slotCtx) bool {
+	if c.interfaceSlot() {
+		// Only nil is an interface's zero value. Every other expression that
+		// compiles in the slot — a zero-valued literal, an empty struct value
+		// — yields a non-nil interface carrying a dynamic type, which is
+		// exactly what *new(I) is not.
+		id, ok := c.expr.(*ast.Ident)
+		return ok && id.Name == "nil"
+	}
 	switch e := c.expr.(type) {
 	case *ast.CompositeLit:
-		return len(e.Elts) == 0 && c.emptyLitIsZero(e)
+		// Slices and maps are the composite kinds whose empty literal is not
+		// their zero value: `S{}` is a non-nil empty slice and `M{}` a non-nil
+		// empty map, while *new(S) and *new(M) are both nil. The difference is
+		// observable under ==, under reflect.DeepEqual, in JSON ([] versus
+		// null), and for a map by writing to it — the nil one panics.
+		//
+		// The literal's own type needs no comparison against the slot's. A
+		// composite literal only compiles in a non-interface slot when its
+		// type is identical to the slot's or shares its underlying type, and
+		// the zero value follows the underlying type either way — so `S{}` in
+		// a `type A = S` slot, and an unnamed `struct{ X int }{}` in a named
+		// slot, are both genuinely the slot's zero.
+		return len(e.Elts) == 0 && !c.nilableType(c.typ)
 	case *ast.Ident:
 		return e.Name == "nil" || e.Name == "false"
 	case *ast.BasicLit:
@@ -170,67 +199,65 @@ func isSyntacticZero(c slotCtx) bool {
 	return false
 }
 
-// emptyLitIsZero reports whether an empty composite literal is the zero value
-// of the slot it is being returned into, and so denotes the same value as the
-// *new(T) this mutator would put in its place.
-//
-// Two independent things have to hold, and an empty element list alone implies
-// neither.
-//
-// The literal must be spelled as the slot's own type. `return Impl{}` in a
-// slot declared as an interface is a non-nil interface holding a zero Impl,
-// which differs from the nil that *new(I) yields.
-//
-// The type must also not be a slice or map. Those are the two composite-literal
-// kinds whose empty literal is not their zero value: `S{}` is a non-nil empty
-// slice and `M{}` a non-nil empty map, while *new(S) and *new(M) are both nil.
-// The difference is observable under ==, under reflect.DeepEqual, in JSON
-// ([] versus null), and for a map by writing to it — the nil one panics.
-//
-// An unnamed slice or map never reaches this check, because zeroValueExpr
-// answers *ast.ArrayType and *ast.MapType with a plain nil before the fallback.
-// A named one does, which is what makes resolving the name necessary.
-func (c slotCtx) emptyLitIsZero(lit *ast.CompositeLit) bool {
-	// A composite literal at the top of a return statement always carries its
-	// type; the elided form exists only nested inside another literal.
-	return c.text(lit.Type) == c.typeText() && !c.nilableType(c.typ)
-}
-
-// nilableType reports whether typ resolves, through this file's own type
-// declarations, to a slice or map.
+// underlying resolves typ through this file's own type declarations until it
+// reaches a type that is not a bare name, and returns that.
 //
 // Only same-file declarations resolve, matching the single-file scope the rest
-// of this mutator works in. A named slice or map declared in a sibling file or
-// another package stays unresolved and keeps the suppressing default: that
-// loses a mutant, where the opposite default would emit an equivalent one, and
-// an equivalent mutant can never be cleared from a report while a missing one
+// of this mutator works in. A name declared in a sibling file or another
+// package reads back nil and ends the walk unresolved, classifying as neither
+// an interface nor a slice or map — the suppressing default. That loses a
+// mutant, where the opposite default would emit an equivalent one, and an
+// equivalent mutant can never be cleared from a report while a missing one
 // costs only coverage.
-func (c slotCtx) nilableType(typ ast.Expr) bool {
+func (c slotCtx) underlying(typ ast.Expr) ast.Expr {
 	seen := make(map[string]bool)
 	for {
-		switch t := typ.(type) {
-		case *ast.ArrayType:
-			// A slice has no length; a fixed-size array is not nilable.
-			return t.Len == nil
-		case *ast.MapType:
-			return true
-		case *ast.Ident:
-			// Guard the chain `type A B; type B A`. It cannot compile, but it
-			// parses, and Discover is only promised a file that parsed.
-			if seen[t.Name] {
-				return false
-			}
-			seen[t.Name] = true
-			// A name this file does not declare reads back as a nil
-			// expression, which the default arm answers on the next turn —
-			// so an explicit "not found" branch here would be dead weight.
-			typ = c.declared[t.Name]
-		default:
-			// Includes the nil left by an unresolved name above, and every
-			// type that has no composite literal to begin with.
-			return false
+		// Anything that is not a bare name is already as resolved as this can
+		// make it. The seen guard covers the chain `type A B; type B A`, which
+		// cannot compile but does parse, and Discover is only promised a file
+		// that parsed.
+		id, ok := typ.(*ast.Ident)
+		if !ok || seen[id.Name] {
+			return typ
 		}
+		next, declared := c.declared[id.Name]
+		if !declared {
+			// A name this file does not declare is as far as resolution goes,
+			// and the name itself is the useful answer: it may be predeclared
+			// — `any` resolves no further but is still an interface.
+			return typ
+		}
+		seen[id.Name] = true
+		typ = next
 	}
+}
+
+// interfaceSlot reports whether the slot's type is an interface, whose zero
+// value is nil and whose every other value is not.
+func (c slotCtx) interfaceSlot() bool {
+	switch t := c.underlying(c.typ).(type) {
+	case *ast.InterfaceType:
+		return true
+	case *ast.Ident:
+		// `any` is predeclared, so it survives resolution as a bare name and
+		// has to be recognised as the interface it is. A file that declares
+		// its own `any` never reaches here — the lookup above resolves it.
+		return t.Name == "any"
+	}
+	return false
+}
+
+// nilableType reports whether typ resolves to a slice or map — the two types
+// whose zero value is nil but whose empty composite literal is not.
+func (c slotCtx) nilableType(typ ast.Expr) bool {
+	switch t := c.underlying(typ).(type) {
+	case *ast.ArrayType:
+		// A slice has no length; a fixed-size array is not nilable.
+		return t.Len == nil
+	case *ast.MapType:
+		return true
+	}
+	return false
 }
 
 // isZeroLit reports whether a basic literal denotes zero, in every form Go
