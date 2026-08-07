@@ -163,6 +163,8 @@ func strykerStatus(s mutator.MutantStatus) string {
 		return "CompileError"
 	case mutator.StatusTimedOut:
 		return "Timeout"
+	case mutator.StatusInfraError:
+		return "RuntimeError"
 	case mutator.StatusEquivalent:
 		// Stryker's schema has no "Equivalent"; "Ignored" is its bucket for
 		// mutants deliberately excluded from scoring, which matches a
