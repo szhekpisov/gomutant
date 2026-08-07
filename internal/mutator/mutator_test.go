@@ -2140,11 +2140,11 @@ type zSlice []int
 type zMap map[string]int
 type zMask uint
 type zCode rune
-type zIface interface{ M() }
+type zMarker interface{ Mark() }
 type zImpl struct{}
 type zAny any
 type zAlias = zBlock
-func (zImpl) M() {}
+func (zImpl) Mark() {}
 `
 
 type zBlock struct{ A int }
@@ -2153,12 +2153,12 @@ type zSlice []int
 type zMap map[string]int
 type zMask uint
 type zCode rune
-type zIface interface{ M() }
+type zMarker interface{ Mark() }
 type zImpl struct{}
 type zAny any
 type zAlias = zBlock
 
-func (zImpl) M() {}
+func (zImpl) Mark() {}
 
 // equivalenceCase is one (slot type, returned expression) pair together with
 // the text RETURN_ZERO does or would substitute for it. Whether it should is
@@ -2192,7 +2192,7 @@ var equivalenceCorpus = []equivalenceCase{
 	// empty form is non-nil, and a literal of some other type entirely.
 	{"zSlice", "zSlice{}", "*new(zSlice)", reflect.DeepEqual(zSlice{}, *new(zSlice))},
 	{"zMap", "zMap{}", "*new(zMap)", reflect.DeepEqual(zMap{}, *new(zMap))},
-	{"zIface", "zImpl{}", "*new(zIface)", reflect.DeepEqual(zIface(zImpl{}), *new(zIface))},
+	{"zMarker", "zImpl{}", "*new(zMarker)", reflect.DeepEqual(zMarker(zImpl{}), *new(zMarker))},
 
 	// An interface holding zero is not a nil interface — true of the
 	// predeclared `any`, and equally of a named interface reached through the
@@ -2220,31 +2220,36 @@ var equivalenceCorpus = []equivalenceCase{
 	{"zCode", "'a'", "*new(zCode)", reflect.DeepEqual(zCode('a'), *new(zCode))},
 }
 
+// assertEquivalenceCase discovers RETURN_ZERO against one corpus case and
+// holds it to the verdict reflect.DeepEqual gave.
+func assertEquivalenceCase(t *testing.T, c equivalenceCase) {
+	t.Helper()
+	src := "package p\n" + corpusDecls + "\nfunc f() " + c.typ + " { return " + c.expr + " }\n"
+	fset, file, srcBytes := parse(t, src)
+	got := findMutator(t, mutator.ReturnZero).Discover(fset, file, srcBytes)
+
+	if c.same {
+		if len(got) != 0 {
+			t.Errorf("%s slot returning %s: got mutant %q→%q, but the two are the same value — nothing could ever kill it",
+				c.typ, c.expr, got[0].Original, got[0].Replacement)
+		}
+		return
+	}
+	if len(got) != 1 {
+		t.Fatalf("%s slot returning %s: got %d mutants, want 1 — %s differs from %s, so a test can kill the swap",
+			c.typ, c.expr, len(got), c.expr, c.repl)
+	}
+	if got[0].Replacement != c.repl {
+		t.Errorf("%s slot returning %s: substituted %q, want %q",
+			c.typ, c.expr, got[0].Replacement, c.repl)
+	}
+}
+
 func TestReturnZeroEquivalenceCorpus(t *testing.T) {
 	sawBoth := map[bool]int{}
 	for _, c := range equivalenceCorpus {
 		sawBoth[c.same]++
-		t.Run(c.typ+"/"+c.expr, func(t *testing.T) {
-			src := "package p\n" + corpusDecls + "\nfunc f() " + c.typ + " { return " + c.expr + " }\n"
-			fset, file, srcBytes := parse(t, src)
-			got := findMutator(t, mutator.ReturnZero).Discover(fset, file, srcBytes)
-
-			if c.same {
-				if len(got) != 0 {
-					t.Errorf("%s slot returning %s: got mutant %q→%q, but the two are the same value — nothing could ever kill it",
-						c.typ, c.expr, got[0].Original, got[0].Replacement)
-				}
-				return
-			}
-			if len(got) != 1 {
-				t.Fatalf("%s slot returning %s: got %d mutants, want 1 — %s differs from %s, so a test can kill the swap",
-					c.typ, c.expr, len(got), c.expr, c.repl)
-			}
-			if got[0].Replacement != c.repl {
-				t.Errorf("%s slot returning %s: substituted %q, want %q",
-					c.typ, c.expr, got[0].Replacement, c.repl)
-			}
-		})
+		t.Run(c.typ+"/"+c.expr, func(t *testing.T) { assertEquivalenceCase(t, c) })
 	}
 	// A corpus that drifted to all-equivalent or all-distinct would still pass
 	// every case above while testing only one side of the biconditional.
