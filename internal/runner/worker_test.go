@@ -489,6 +489,55 @@ func TestWorkerTestWriteFailures(t *testing.T) {
 	}
 }
 
+func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "f.go")
+	src := []byte("package p\nvar X = 1\n")
+	if err := os.WriteFile(srcPath, src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, signature := range infrastructureErrorSignatures {
+		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
+		for _, write := range []struct {
+			name        string
+			failOnIndex int32
+		}{
+			{"patched source", 1},
+			{"overlay", 2},
+		} {
+			t.Run(signatureName+"/"+write.name, func(t *testing.T) {
+				w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, map[string][]byte{srcPath: src}, dir, nil)
+				if err != nil {
+					t.Fatalf("NewWorker: %v", err)
+				}
+
+				origWrite := writeFileFunc
+				defer func() { writeFileFunc = origWrite }()
+				var calls atomic.Int32
+				writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
+					if calls.Add(1) == write.failOnIndex {
+						return errors.New("INJECTED: " + strings.ToUpper(signature))
+					}
+					return os.WriteFile(name, data, perm)
+				}
+
+				result := w.Test(context.Background(), mutator.Mutant{
+					ID: 1, File: srcPath, Pkg: "p",
+					StartOffset: len(src) - 1, EndOffset: len(src),
+					Replacement: "X", Status: mutator.StatusPending,
+				})
+				if result.Status != mutator.StatusInfraError {
+					t.Errorf("Status=%v, want InfraError", result.Status)
+				}
+				if result.Duration <= 0 {
+					t.Errorf("Duration=%v, want > 0", result.Duration)
+				}
+			})
+		}
+	}
+}
+
 // TestShortFlagFromEnv kills CONDITIONALS_NEGATION on the
 // `os.Getenv("GOMUTANTS_TEST_SHORT") == "1"` check.
 func TestShortFlagFromEnv(t *testing.T) {
@@ -546,8 +595,8 @@ func envContains(env []string, want string) bool {
 }
 
 // TestWorkerTestStartFailureClassifiesNotViable kills BRANCH_IF on the
-// `if err := cmd.Start(); err != nil` body. Stub execCommandContext to
-// return a Cmd whose Path is bogus so Start fails. With the body elided,
+// command-start error body. Stub startCommandFunc so Start fails
+// deterministically. With the body elided,
 // Getpgid runs against a nil cmd.Process and panics; the original returns
 // NotViable cleanly. Also asserts the diagnostic Fprintf surfaces in
 // stderr (kills STATEMENT_REMOVE on the log line).
@@ -560,12 +609,9 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	}
 	cache := map[string][]byte{srcPath: src}
 
-	orig := execCommandContext
-	defer func() { execCommandContext = orig }()
-	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		// Path that Start() will fail to exec.
-		return exec.CommandContext(ctx, "/this/path/does/not/exist/zzz")
-	}
+	origStart := startCommandFunc
+	defer func() { startCommandFunc = origStart }()
+	startCommandFunc = func(*exec.Cmd) error { return errors.New("injected start failure") }
 
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, cache, dir, nil)
 	if err != nil {
@@ -594,6 +640,31 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	}
 	if !strings.Contains(captured, "cmd.Start failed") {
 		t.Errorf("stderr missing the cmd.Start diagnostic; got: %q — STATEMENT_REMOVE on the Fprintf elides the log", captured)
+	}
+}
+
+func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
+	w := &Worker{id: 7, projectDir: "."}
+	for _, signature := range infrastructureErrorSignatures {
+		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
+		t.Run(signatureName, func(t *testing.T) {
+			origStart := startCommandFunc
+			defer func() { startCommandFunc = origStart }()
+			startCommandFunc = func(*exec.Cmd) error {
+				return errors.New("INJECTED: " + strings.ToUpper(signature))
+			}
+
+			var got mutator.MutantStatus
+			captured := captureStderr(t, func() {
+				got = w.runMutantTest(context.Background(), nil)
+			})
+			if got != mutator.StatusInfraError {
+				t.Errorf("Status=%v, want InfraError", got)
+			}
+			if !strings.Contains(captured, "INFRA ERROR") {
+				t.Error("stderr missing INFRA ERROR classification")
+			}
+		})
 	}
 }
 
@@ -1053,24 +1124,26 @@ func TestClassifyTestOutcome(t *testing.T) {
 		stderr     string
 		want       mutator.MutantStatus
 	}{
-		{"memkilled beats everything", anyErr, true, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "OUT OF MEMORY", "", mutator.StatusTimedOut},
 		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
 		// memKilled early return is elided, execution falls through to
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
 		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
-		{"success => lived", nil, false, nil, "", "", mutator.StatusLived},
-		{"timeout before classify", anyErr, false, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		{"success beats infrastructure error", nil, false, nil, "OUT OF MEMORY", "", mutator.StatusLived},
+		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "OUT OF MEMORY", mutator.StatusTimedOut},
 		{"compile failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [build failed]\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [build failed]\nOUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
 		{"setup failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nOUT OF MEMORY\n", mutator.StatusNotViable},
 		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
 			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
 		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
 			"FAIL [build failed]\n", "", mutator.StatusKilled},
 		{"normal test failure => killed", anyErr, false, nil,
 			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
+		{"unexplained signal killed => killed", errors.New("signal: killed"), false, nil,
+			"", "", mutator.StatusKilled},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1079,6 +1152,26 @@ func TestClassifyTestOutcome(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
+	for _, signature := range infrastructureErrorSignatures {
+		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
+		for _, stream := range []struct {
+			name           string
+			stdout, stderr string
+		}{
+			{"stdout", "go test: " + strings.ToUpper(signature), ""},
+			{"stderr", "", "go test: " + strings.ToUpper(signature)},
+		} {
+			t.Run(signatureName+"/"+stream.name, func(t *testing.T) {
+				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr)
+				if got != mutator.StatusInfraError {
+					t.Errorf("got %v, want InfraError in %s", got, stream.name)
+				}
+			})
+		}
 	}
 }
 

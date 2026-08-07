@@ -26,6 +26,9 @@ import (
 // stay in MutantsTotal but count as neither KILLED nor LIVED, so they
 // drop out of the TestEfficacy denominator — an equivalent mutant is not
 // a test gap.
+// MutantsInfraError counts mutants for which environmental resource or I/O
+// failure prevented a verdict. They stay in MutantsTotal and mutation
+// coverage, but count as neither KILLED nor LIVED for TestEfficacy.
 type Report struct {
 	GoModule          string       `json:"go_module"`
 	Files             []FileReport `json:"files"`
@@ -37,6 +40,7 @@ type Report struct {
 	MutantsNotViable  int          `json:"mutants_not_viable"`
 	MutantsNotCovered int          `json:"mutants_not_covered"`
 	MutantsTimedOut   int          `json:"mutants_timed_out,omitempty"`
+	MutantsInfraError int          `json:"mutants_infra_error,omitempty"`
 	MutantsCached     int          `json:"mutants_cached,omitempty"`
 	MutantsSuppressed int          `json:"mutants_suppressed,omitempty"`
 	// MutantsSuppressedByCalls is the --exclude-calls share of
@@ -97,6 +101,8 @@ func Generate(mutants []mutator.Mutant, goModule string, elapsed time.Duration, 
 			r.MutantsNotCovered++
 		case mutator.StatusTimedOut:
 			r.MutantsTimedOut++
+		case mutator.StatusInfraError:
+			r.MutantsInfraError++
 		case mutator.StatusEquivalent:
 			r.MutantsEquivalent++
 		}

@@ -536,6 +536,7 @@ func TestLookup_HitMissMatrix(t *testing.T) {
 		// so reuse is gated only on prod_hash.
 		{"not_viable prod match", mutator.StatusNotViable, true, false, true},
 		{"not_viable prod mismatch", mutator.StatusNotViable, false, false, false},
+		{"infra_error never reused", mutator.StatusInfraError, true, true, false},
 		{"not_covered never reused", mutator.StatusNotCovered, true, true, false},
 		{"pending never reused", mutator.StatusPending, true, true, false},
 	}
@@ -794,6 +795,8 @@ func TestUpdate_StatusFiltering(t *testing.T) {
 		mkMutant(prodPath, 5, mutator.StatusTimedOut),
 		// NOT_VIABLE — cached.
 		mkMutant(prodPath, 6, mutator.StatusNotViable),
+		// INFRA_ERROR — must NOT be cached (environmental failure is transient).
+		mkMutant(prodPath, 7, mutator.StatusInfraError),
 	}
 	c.Update(mutants, NewHasher(nil), root, pkgDirTestFilesFor)
 
@@ -802,7 +805,9 @@ func TestUpdate_StatusFiltering(t *testing.T) {
 	}
 
 	for _, e := range c.Entries {
-		if e.Status == mutator.StatusPending.String() || e.Status == mutator.StatusNotCovered.String() {
+		if e.Status == mutator.StatusPending.String() ||
+			e.Status == mutator.StatusNotCovered.String() ||
+			e.Status == mutator.StatusInfraError.String() {
 			t.Errorf("non-cacheable status %q persisted: %+v", e.Status, e)
 		}
 	}
@@ -1296,5 +1301,17 @@ func TestHashCoverageInputs_IgnoresNonGoFiles(t *testing.T) {
 func TestParseStatus_Equivalent(t *testing.T) {
 	if got := parseStatus(mutator.StatusEquivalent.String()); got != mutator.StatusEquivalent {
 		t.Errorf("parseStatus(%q) = %v, want StatusEquivalent", mutator.StatusEquivalent.String(), got)
+	}
+}
+
+func TestInfraErrorCacheBehavior(t *testing.T) {
+	if canReuse(mutator.StatusInfraError) {
+		t.Error("INFRA ERROR must not be reusable")
+	}
+	if needsTestsHash(mutator.StatusInfraError) {
+		t.Error("INFRA ERROR must not require a tests hash because it is not cacheable")
+	}
+	if got := parseStatus(mutator.StatusInfraError.String()); got != mutator.StatusPending {
+		t.Errorf("parseStatus(%q)=%v, want Pending", mutator.StatusInfraError, got)
 	}
 }

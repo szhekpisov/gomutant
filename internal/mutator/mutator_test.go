@@ -1357,6 +1357,7 @@ func TestMutantStatusString(t *testing.T) {
 		{mutator.StatusNotViable, "NOT VIABLE"},
 		{mutator.StatusTimedOut, "TIMED OUT"},
 		{mutator.StatusEquivalent, "EQUIVALENT"},
+		{mutator.StatusInfraError, "INFRA ERROR"},
 		{mutator.MutantStatus(99), "UNKNOWN"},
 	}
 	for _, tc := range tests {
@@ -1364,6 +1365,12 @@ func TestMutantStatusString(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("MutantStatus(%d).String() = %q, want %q", tc.status, got, tc.want)
 		}
+	}
+}
+
+func TestStatusInfraErrorIsAppended(t *testing.T) {
+	if mutator.StatusInfraError != mutator.StatusEquivalent+1 {
+		t.Errorf("StatusInfraError=%d, want %d so existing numeric values stay stable", mutator.StatusInfraError, mutator.StatusEquivalent+1)
 	}
 }
 

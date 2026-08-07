@@ -239,6 +239,52 @@ func TestGenerateEmitsMutantsTimedOutWhenNonZero(t *testing.T) {
 	}
 }
 
+func TestGenerateCountsAndSerializesMutantsInfraError(t *testing.T) {
+	r := Generate([]mutator.Mutant{
+		{Type: mutator.ArithmeticBase, Status: mutator.StatusKilled, RelFile: "x.go"},
+		{Type: mutator.ArithmeticBase, Status: mutator.StatusLived, RelFile: "x.go"},
+		{Type: mutator.ArithmeticBase, Status: mutator.StatusNotCovered, RelFile: "x.go"},
+		{Type: mutator.ArithmeticBase, Status: mutator.StatusInfraError, RelFile: "x.go"},
+	}, "m", 0, 0)
+
+	if r.MutantsInfraError != 1 {
+		t.Errorf("MutantsInfraError=%d, want 1", r.MutantsInfraError)
+	}
+	if r.MutantsTotal != 4 {
+		t.Errorf("MutantsTotal=%d, want 4", r.MutantsTotal)
+	}
+	if r.TestEfficacy != 50 {
+		t.Errorf("TestEfficacy=%v, want 50 (infra error excluded)", r.TestEfficacy)
+	}
+	if r.MutationsCoverage != 75 {
+		t.Errorf("MutationsCoverage=%v, want 75 (infra error included)", r.MutationsCoverage)
+	}
+	if got := r.Files[0].Mutations[3].Status; got != "INFRA ERROR" {
+		t.Errorf("per-mutant status=%q, want INFRA ERROR", got)
+	}
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"mutants_infra_error":1`) {
+		t.Errorf("expected mutants_infra_error:1 in JSON, got: %s", data)
+	}
+}
+
+func TestGenerateOmitsMutantsInfraErrorWhenZero(t *testing.T) {
+	r := Generate([]mutator.Mutant{
+		{Type: mutator.ArithmeticBase, Status: mutator.StatusKilled, RelFile: "x.go"},
+	}, "m", 0, 0)
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"mutants_infra_error"`) {
+		t.Errorf("mutants_infra_error should be omitted when 0, got: %s", data)
+	}
+}
+
 func TestGenerateOmitsMutantsCachedWhenZero(t *testing.T) {
 	mutants := []mutator.Mutant{
 		{ID: 1, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 1, Col: 1, Status: mutator.StatusKilled},

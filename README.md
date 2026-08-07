@@ -244,7 +244,7 @@ gomutants --threshold-efficacy 80 ./...
 - **26 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` and the return-value set `RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
 - **OOM-safe** — each `go test` child runs in its own process group with a 2 GiB RSS cap; output capped at 1 MiB per stream.
 - **Multiple report formats** — gremlins-compatible JSON (default), [Stryker `mutation-testing-elements` v2](https://github.com/stryker-mutator/mutation-testing-elements) JSON, and a self-contained interactive HTML report.
-- **Conservative discovery** — compile-failing mutants surface as `NOT_VIABLE` and don't inflate efficacy.
+- **Conservative outcomes** — compile-failing mutants surface as `NOT_VIABLE`, while recognized host resource and I/O failures surface as `INFRA ERROR`; neither inflates efficacy or becomes a cached verdict.
 - **Equivalent-mutant detection (opt-in)** — `--detect-equivalent` recompiles each survivor with `-gcflags=-S` and reclassifies it as `EQUIVALENT` when the generated assembly matches the original (Trivial Compiler Equivalence). Such mutants can't be killed by any test, so they drop out of the efficacy denominator instead of failing the gate. Sound: a killable mutant is never marked equivalent.
 - **Cross-package routing (opt-in)** — `--integration` extends per-test routing across package boundaries so a mutant is killed by a covering test in *any* importing package (cross-package/E2E tests), not just its own. See [Cross-Package Mode](#cross-package-mode).
 - **Inline ignore directives** — `// gomutants:disable*` comments suppress specific mutants by line, function, or regex.
@@ -325,7 +325,7 @@ gomutants --html-output mutation-report.html ./...
 
 Writes a single self-contained HTML file. Open it in any browser — no web server, no network access, no companion JSON file. The page bundles the [`<mutation-test-report-app>`](https://www.npmjs.com/package/mutation-testing-elements) web component and the report data into one document, so it works as a CI artifact you can upload from a job and link to from a PR check.
 
-Inside, you get a per-file efficacy sidebar and click-through annotated source: each mutated line is highlighted with the mutator name, status (KILLED / SURVIVED / NO_COVERAGE / TIMEOUT / COMPILE_ERROR), and the original-vs-replacement diff.
+Inside, you get a per-file efficacy sidebar and click-through annotated source: each mutated line is highlighted with the mutator name, status (KILLED / SURVIVED / NO_COVERAGE / TIMEOUT / COMPILE_ERROR / RUNTIME_ERROR), and the original-vs-replacement diff.
 
 If you already publish to the [Stryker Dashboard](https://stryker-mutator.io/docs/General/dashboard/) you don't need this flag — the dashboard renders the same report with history and a hosted badge. `--html-output` is for local viewing and CI artifacts, especially in air-gapped environments where uploading to a third-party dashboard isn't an option.
 
@@ -343,8 +343,8 @@ If you already publish to the [Stryker Dashboard](https://stryker-mutator.io/doc
 gomutants --threshold-efficacy 80 --threshold-mcover 90 ./...
 ```
 
-`test_efficacy = killed / (killed + lived)` — excludes `not_viable`, `not_covered`, and `timed_out`.
-`mutations_coverage = (killed + lived) / (killed + lived + not_covered)`.
+`test_efficacy = killed / (killed + lived)` — excludes `not_viable`, `not_covered`, `timed_out`, `equivalent`, and `infra_error`.
+The JSON `mutations_coverage` field is `(mutants_total - mutants_not_covered) / mutants_total`, so infrastructure errors remain visible in that run-level coverage measure. The `--threshold-mcover` gate retains its gremlins-compatible `(killed + lived) / (killed + lived + not_covered)` formula.
 
 ### Claude Code Plugin
 
@@ -558,6 +558,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | NOT COVERED | No test covers the mutated line |
 | NOT VIABLE | Mutation causes a compile error (filtered, not counted as a kill) |
 | TIMED OUT | Test execution exceeded the per-mutant timeout |
+| INFRA ERROR | A recognized host resource or I/O failure prevented a reliable verdict |
 
 ### All Flags
 
@@ -740,6 +741,7 @@ so `--test-flags '-race -args -x'` works either way.
    - Mutations are applied as byte-level patches; the original tree is never written to.
    - The mutant's covered tests are looked up; only those run via `go test -overlay -run=<regex>`.
    - Each `go test` child runs in its own process group with a 2 GiB RSS cap; output is capped at 1 MiB per stream.
+   - Recognized resource and I/O failures in test output, command startup, or gomutants' per-mutant temp-file writes are reported as `INFRA ERROR`, not as false kills.
 7. **Detect equivalent mutants** (only with `--detect-equivalent`). Each surviving mutant is recompiled with package-scoped `-gcflags=-S` under the same overlay mechanism; the reference (original) package is compiled once per package. When the normalized assembly matches the original, the mutation was folded away by the compiler and is reclassified `EQUIVALENT` — provably unkillable, so it leaves the efficacy denominator rather than failing the gate. The comparison is one-sided: any real difference in generated code diverges the hash, so a killable mutant is never marked equivalent.
 
 Performance optimizations layered on top:
@@ -748,7 +750,7 @@ Performance optimizations layered on top:
 - **`GOMAXPROCS=NumCPU/workers` per child.** Without this, `--workers=10` on a 10-core box would have each child also assume 10 cores, oversubscribing 100×. With it, each child compiles + tests within its share.
 - **Sort pending mutants by `(Pkg, File, Offset)` before dispatch.** The first mutant in a package pays the cold compile; subsequent ones reuse the build cache for deps and stdlib. This sort alone was a 17% wall-clock reduction.
 - **`-vet=off` on the inner `go test`.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
-- **Incremental cache.** Mutants whose source byte range and the surrounding tests are byte-identical to a prior run are skipped and their previous classifications reused. CI runs that touch one file pay for that file only.
+- **Incremental cache.** Mutants whose source byte range and the surrounding tests are byte-identical to a prior run are skipped and their previous classifications reused. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried. CI runs that touch one file pay for that file only.
 
 ### JSON report
 
@@ -773,6 +775,8 @@ Compatible with the gremlins JSON format:
 `mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 
 `mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
+
+`mutants_infra_error` is omitted when zero; it counts mutants whose tests could not produce a reliable verdict because gomutants recognized an environmental resource or I/O failure. They stay in `mutants_total` and `mutations_coverage`, but count as neither killed nor lived and are not cached. Per-mutant entries use the status `INFRA ERROR`; Stryker and HTML reports map it to `RuntimeError`.
 
 ## Self-efficacy (gomutants on itself)
 

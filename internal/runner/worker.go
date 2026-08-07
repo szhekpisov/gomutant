@@ -78,13 +78,52 @@ func (c *cappedBuffer) String() string { return string(c.buf) }
 
 var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 
-// writeFileFunc and execCommandContext are package-level indirections to
-// os.WriteFile and exec.CommandContext respectively. Swapping them in tests
-// lets us hit the unhappy paths in NewWorker / Worker.Test (write failure,
-// fork/exec failure) without contriving filesystem or PATH state.
+// infrastructureErrorSignatures are operating-system/resource failures that
+// prevent gomutants from obtaining a meaningful verdict for a mutant. Keep
+// matching deliberately conservative: an unexplained signal (including
+// "signal: killed") can also be caused by the mutated test and must remain a
+// normal KILLED outcome.
+var infrastructureErrorSignatures = []string{
+	"no space left on device",
+	"cannot allocate memory",
+	"out of memory",
+	"too many open files",
+	"read-only file system",
+	"input/output error",
+	"resource temporarily unavailable",
+	"text file busy",
+}
+
+// hasInfrastructureError reports whether any input contains a recognized
+// infrastructure signature. Subprocess output and OS errors vary in
+// capitalization, so matching is case-insensitive.
+func hasInfrastructureError(values ...string) bool {
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		for _, signature := range infrastructureErrorSignatures {
+			if strings.Contains(lower, signature) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func setupErrorStatus(err error) mutator.MutantStatus {
+	if hasInfrastructureError(err.Error()) {
+		return mutator.StatusInfraError
+	}
+	return mutator.StatusNotViable
+}
+
+// writeFileFunc, execCommandContext, and startCommandFunc are package-level
+// indirections around process/file operations. Swapping them in tests lets us
+// hit the unhappy paths in NewWorker / Worker.Test (write failure, fork/exec
+// failure) without contriving filesystem, PATH, or host resource state.
 var (
 	writeFileFunc      = os.WriteFile
 	execCommandContext = exec.CommandContext
+	startCommandFunc   = func(cmd *exec.Cmd) error { return cmd.Start() }
 )
 
 // shortFlagFromEnv reports whether the inner `go test` should be invoked
@@ -190,7 +229,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 
 	// 3. Write patched source to worker's temp file.
 	if err := writeFileFunc(w.tmpSrcPath, patched, 0o644); err != nil {
-		m.Status = mutator.StatusNotViable
+		m.Status = setupErrorStatus(err)
 		m.Duration = nonZeroSince(start)
 		return m
 	}
@@ -199,7 +238,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	ov := overlay{Replace: map[string]string{m.File: w.tmpSrcPath}}
 	ovBytes, _ := json.Marshal(ov)
 	if err := writeFileFunc(w.overlayPath, ovBytes, 0o644); err != nil {
-		m.Status = mutator.StatusNotViable
+		m.Status = setupErrorStatus(err)
 		m.Duration = nonZeroSince(start)
 		return m
 	}
@@ -219,8 +258,9 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// 6. Run each covering package's invocation in turn, short-circuiting on
 	// the first non-Lived outcome (a kill, timeout, or compile failure). A
 	// mutant is Lived only if every covering package's tests pass. A
-	// cmd.Start failure surfaces as NotViable from runMutantTest, which the
-	// non-Lived check below returns just like any other terminal outcome.
+	// cmd.Start failure surfaces as NotViable or InfraError from
+	// runMutantTest, which the non-Lived check below returns just like any
+	// other terminal outcome.
 	for _, args := range w.testInvocations(m, shortFlagFromEnv(), timeout) {
 		status := w.runMutantTest(testCtx, args)
 		// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
@@ -248,17 +288,18 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 // runMutantTest runs one `go test` invocation under the RSS monitor and
 // returns its classified status. A cmd.Start failure (an infrastructure
 // problem — exec/fork failure, PATH misconfig, rlimit — not a mutant-viability
-// signal) is reported as NotViable, which the caller treats as a terminal
-// outcome like any other.
+// signal) is reported as InfraError when it carries a recognized signature,
+// or NotViable otherwise. The caller treats either as a terminal outcome.
 //
 // Extracted from Worker.Test so the integration path can drive it once per
 // covering package while sharing a single per-mutant deadline.
 func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.MutantStatus {
 	cmd, stdout, stderr := w.makeTestCmd(testCtx, args)
 
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as NotViable: %v\n", w.id, err)
-		return mutator.StatusNotViable
+	if err := startCommandFunc(cmd); err != nil {
+		status := setupErrorStatus(err)
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as %s: %v\n", w.id, status, err)
+		return status
 	}
 
 	// Resolve the process-group "handle" we'll later kill if RSS runs away.
@@ -476,7 +517,9 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
 //  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
 //     `[build failed]` / `[setup failed]` → NotViable.
-//  5. Otherwise → Killed.
+//  5. stdout or stderr carries a recognized infrastructure signature →
+//     InfraError.
+//  6. Otherwise → Killed.
 func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string) mutator.MutantStatus {
 	if memKilled {
 		return mutator.StatusTimedOut
@@ -490,6 +533,9 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if compileErrorRe.MatchString(stderr) &&
 		(strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")) {
 		return mutator.StatusNotViable
+	}
+	if hasInfrastructureError(stdout, stderr) {
+		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
 }
