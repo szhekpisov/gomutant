@@ -227,7 +227,7 @@ func TestSummaryInfraErrorsNonZero(t *testing.T) {
 		TestEfficacy:      83.33,
 	})
 
-	if !strings.Contains(buf.String(), "  Timed out:    2\n  Infra errors:  1\n") {
+	if !strings.Contains(buf.String(), "  Timed out:    2\n  Infra errors: 1  (environment failure, not a mutant result — rerun to confirm)\n") {
 		t.Errorf("expected nonzero infra errors immediately after timed out, got %q", buf.String())
 	}
 }
