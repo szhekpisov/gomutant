@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -489,14 +490,24 @@ func TestWorkerTestWriteFailures(t *testing.T) {
 	}
 }
 
-// infraWriteCase is one (signature, failing write) pair for
+// subtestName makes a signature or errno text safe to use as a subtest name.
+var subtestName = strings.NewReplacer(" ", "_", "/", "_")
+
+// infraInjection is one error a stubbed write can return, with the subtest
+// name it should run under.
+type infraInjection struct {
+	name string
+	err  error
+}
+
+// infraWriteCase is one (injected error, failing write) pair for
 // TestWorkerTestInfrastructureWriteFailures. failOnIndex is the 1-based
 // writeFileFunc call to fail: 1 is the patched source, 2 is the overlay.
 type infraWriteCase struct {
 	srcPath     string
 	src         []byte
 	root        string
-	signature   string
+	injected    error
 	failOnIndex int32
 }
 
@@ -517,7 +528,7 @@ func runInfraWriteFailure(t *testing.T, tc infraWriteCase) {
 	var calls atomic.Int32
 	writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
 		if calls.Add(1) == tc.failOnIndex {
-			return errors.New("INJECTED: " + strings.ToUpper(tc.signature))
+			return tc.injected
 		}
 		return os.WriteFile(name, data, perm)
 	}
@@ -535,6 +546,24 @@ func runInfraWriteFailure(t *testing.T, tc infraWriteCase) {
 	}
 }
 
+// infraInjections is every error shape setupErrorStatus must recognize: each
+// errno as os.WriteFile really returns it (wrapped in a *fs.PathError, so the
+// test exercises errors.Is unwrapping rather than a bare errno), plus one
+// error that lost its errno on the way up and is recognizable only by text.
+func infraInjections() []infraInjection {
+	out := make([]infraInjection, 0, len(infrastructureErrnos)+1)
+	for _, errno := range infrastructureErrnos {
+		out = append(out, infraInjection{
+			name: subtestName.Replace(errno.Error()),
+			err:  &fs.PathError{Op: "write", Path: "worker-0.go", Err: errno},
+		})
+	}
+	return append(out, infraInjection{
+		name: "message_only_no_errno",
+		err:  errors.New("INJECTED: NO SPACE LEFT ON DEVICE"),
+	})
+}
+
 func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "f.go")
@@ -543,7 +572,6 @@ func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nameOf := strings.NewReplacer(" ", "_", "/", "_")
 	writes := []struct {
 		name        string
 		failOnIndex int32
@@ -552,14 +580,14 @@ func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
 		{"overlay", 2},
 	}
 
-	for _, signature := range infrastructureErrorSignatures {
+	for _, injection := range infraInjections() {
 		for _, write := range writes {
-			t.Run(nameOf.Replace(signature)+"/"+write.name, func(t *testing.T) {
+			t.Run(injection.name+"/"+write.name, func(t *testing.T) {
 				runInfraWriteFailure(t, infraWriteCase{
 					srcPath:     srcPath,
 					src:         src,
 					root:        dir,
-					signature:   signature,
+					injected:    injection.err,
 					failOnIndex: write.failOnIndex,
 				})
 			})
@@ -625,10 +653,10 @@ func envContains(env []string, want string) bool {
 
 // TestWorkerTestStartFailureClassifiesNotViable kills BRANCH_IF on the
 // command-start error body. Stub startCommandFunc so Start fails
-// deterministically. With the body elided,
-// Getpgid runs against a nil cmd.Process and panics; the original returns
-// NotViable cleanly. Also asserts the diagnostic Fprintf surfaces in
-// stderr (kills STATEMENT_REMOVE on the log line).
+// deterministically with an error carrying no infrastructure signature.
+// With the body elided, Getpgid runs against a nil cmd.Process and panics;
+// the original returns NotViable cleanly. Also asserts the diagnostic
+// Fprintf surfaces in stderr (kills STATEMENT_REMOVE on the log line).
 func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "f.go")
@@ -674,14 +702,11 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 
 func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
 	w := &Worker{id: 7, projectDir: "."}
-	for _, signature := range infrastructureErrorSignatures {
-		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
-		t.Run(signatureName, func(t *testing.T) {
+	for _, injection := range infraInjections() {
+		t.Run(injection.name, func(t *testing.T) {
 			origStart := startCommandFunc
 			defer func() { startCommandFunc = origStart }()
-			startCommandFunc = func(*exec.Cmd) error {
-				return errors.New("INJECTED: " + strings.ToUpper(signature))
-			}
+			startCommandFunc = func(*exec.Cmd) error { return injection.err }
 
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
@@ -1153,18 +1178,18 @@ func TestClassifyTestOutcome(t *testing.T) {
 		stderr     string
 		want       mutator.MutantStatus
 	}{
-		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "OUT OF MEMORY", "", mutator.StatusTimedOut},
+		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusTimedOut},
 		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
 		// memKilled early return is elided, execution falls through to
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
 		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
-		{"success beats infrastructure error", nil, false, nil, "OUT OF MEMORY", "", mutator.StatusLived},
-		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "OUT OF MEMORY", mutator.StatusTimedOut},
+		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusLived},
+		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		{"compile failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [build failed]\nOUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [build failed]\nFATAL ERROR: OUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
 		{"setup failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nOUT OF MEMORY\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nFATAL ERROR: OUT OF MEMORY\n", mutator.StatusNotViable},
 		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
 			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
 		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
@@ -1173,6 +1198,12 @@ func TestClassifyTestOutcome(t *testing.T) {
 			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
 		{"unexplained signal killed => killed", errors.New("signal: killed"), false, nil,
 			"", "", mutator.StatusKilled},
+		// The tested code's own output lands on the same stdout as the test
+		// framework's. A test that reported a failure detected the mutation,
+		// so a signature it printed itself must not launder the kill into a
+		// non-result — this kills the negation of the `--- FAIL: ` guard.
+		{"reported test failure beats infrastructure signature", anyErr, false, nil,
+			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", "", mutator.StatusKilled},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1185,8 +1216,8 @@ func TestClassifyTestOutcome(t *testing.T) {
 }
 
 func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
-	for _, signature := range infrastructureErrorSignatures {
-		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
+	for _, signature := range infrastructureOutputSignatures {
+		signatureName := subtestName.Replace(signature)
 		for _, stream := range []struct {
 			name           string
 			stdout, stderr string

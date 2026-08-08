@@ -914,7 +914,10 @@ func run(ctx context.Context, args []string) error {
 	// percentages so a single read shows the full state.
 	// EQUIVALENT mutants are neither KILLED nor LIVED, so they fall out of
 	// both gates' denominators here — a compiler-proven non-gap shouldn't
-	// move efficacy or mutant coverage in either direction.
+	// move efficacy or mutant coverage in either direction. INFRA ERROR
+	// mutants fall out the same way, but unlike EQUIVALENT they represent a
+	// *missing* measurement, so the run warns before evaluating the gates.
+	warnInfraErrors(stderr, r)
 	tested := r.MutantsKilled + r.MutantsLived
 	mcoverDenom := tested + r.MutantsNotCovered
 	mcover := 0.0
@@ -943,6 +946,20 @@ func run(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+// warnInfraErrors notes on stderr that part of the run never produced a
+// verdict. The terminal summary already prints the count, but that goes to
+// stdout for a human watching the run: a CI job that keeps only the JSON
+// report and the exit code would otherwise see a green threshold gate
+// computed over fewer mutants than were discovered, with nothing saying so.
+func warnInfraErrors(w io.Writer, r *report.Report) {
+	if r.MutantsInfraError == 0 {
+		return
+	}
+	fmt.Fprintf(w, "gomutants: %d of %d mutants ended in INFRA ERROR (host resource or I/O failure); "+
+		"they are excluded from both threshold gates and were not cached — rerun once the host is healthy for a complete measurement\n",
+		r.MutantsInfraError, r.MutantsTotal)
 }
 
 // runGoVersion shells out to `go version` once so the coverage cache key

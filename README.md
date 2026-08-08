@@ -741,7 +741,7 @@ so `--test-flags '-race -args -x'` works either way.
    - Mutations are applied as byte-level patches; the original tree is never written to.
    - The mutant's covered tests are looked up; only those run via `go test -overlay -run=<regex>`.
    - Each `go test` child runs in its own process group with a 2 GiB RSS cap; output is capped at 1 MiB per stream.
-   - Recognized resource and I/O failures in test output, command startup, or gomutants' per-mutant temp-file writes are reported as `INFRA ERROR`, not as false kills.
+   - Recognized resource and I/O failures in test output, command startup, or gomutants' per-mutant temp-file writes are reported as `INFRA ERROR`, not as false kills. Detection is deliberately narrow so a real kill is never laundered into a non-result: gomutants' own failed syscalls are matched on the errno (`ENOSPC`, `ENOMEM`, `EMFILE`, …), and subprocess output is matched only against phrases the host — not the code under test — produces (`fatal error: out of memory`, never a bare `out of memory`). If any test reported a failure of its own (`--- FAIL:`), the mutant was detected and stays `KILLED` regardless of what else the output contains. An unexplained `signal: killed` also stays `KILLED`; a real OOM kill surfaces as `TIMED OUT` via the RSS monitor.
 7. **Detect equivalent mutants** (only with `--detect-equivalent`). Each surviving mutant is recompiled with package-scoped `-gcflags=-S` under the same overlay mechanism; the reference (original) package is compiled once per package. When the normalized assembly matches the original, the mutation was folded away by the compiler and is reclassified `EQUIVALENT` — provably unkillable, so it leaves the efficacy denominator rather than failing the gate. The comparison is one-sided: any real difference in generated code diverges the hash, so a killable mutant is never marked equivalent.
 
 Performance optimizations layered on top:
@@ -777,6 +777,8 @@ Compatible with the gremlins JSON format:
 `mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
 
 `mutants_infra_error` is omitted when zero; it counts mutants whose tests could not produce a reliable verdict because gomutants recognized an environmental resource or I/O failure. They stay in `mutants_total` and `mutations_coverage`, but count as neither killed nor lived and are not cached. Per-mutant entries use the status `INFRA ERROR`; Stryker and HTML reports map it to `RuntimeError`.
+
+Because those mutants leave both threshold denominators, a run that hit them is an *incomplete* measurement rather than a passing one. When the count is non-zero gomutants prints a warning on **stderr** before evaluating the gates, so a CI job that keeps only the exit code and the JSON report still sees that the run needs a rerun.
 
 ## Self-efficacy (gomutants on itself)
 
