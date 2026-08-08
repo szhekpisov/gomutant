@@ -1219,6 +1219,25 @@ func TestClassifyTestOutcome(t *testing.T) {
 		// non-result — this kills the negation of the `--- FAIL: ` guard.
 		{"reported test failure beats infrastructure signature", anyErr, false, nil,
 			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", "", mutator.StatusKilled},
+		// The shape issue #79 actually produces: the OOM-killer takes the test
+		// binary (the biggest RSS in the cgroup), not the `go` process
+		// supervising it, so `go test` survives to report the death on stdout
+		// and exits 1. runErr says nothing.
+		{"go test reports the binary's SIGKILL on stdout => infra error", anyErr, false, nil,
+			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", "", mutator.StatusInfraError},
+		// Anchored to the line start, because the tested code writes to this
+		// stream too: quoted inside a test's own message it is just text.
+		{"a test quoting signal: killed mid-line stays killed", anyErr, false, nil,
+			"    x_test.go:9: exec failed: signal: killed\n", "", mutator.StatusKilled},
+		// A panic outside the test goroutine aborts the binary before `go test`
+		// can print a per-test failure line, so `--- FAIL: ` alone would read a
+		// detected mutation as a host problem.
+		{"goroutine panic quoting a host error stays killed", anyErr, false, nil,
+			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", "", mutator.StatusKilled},
+		// The runtime's own abort is not a panic and must still be readable as
+		// the host failure it is.
+		{"runtime fatal error is not vetoed as a panic", anyErr, false, nil,
+			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", "", mutator.StatusInfraError},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

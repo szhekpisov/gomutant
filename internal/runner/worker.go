@@ -101,9 +101,9 @@ var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 // therefore qualified with the prefix only the real failure produces ("out of
 // memory" alone is an ordinary application error message; "fatal error: out
 // of memory" is the Go runtime dying). A bare "signal: killed" is absent for
-// a different reason: it is not something the host writes to the stream, so
-// it is classified from the process's own exit error instead — see
-// unexplainedKill.
+// a different reason: `go test` does write it to this stream when the test
+// binary is signalled, but always alone on a line, so it is matched with the
+// line anchoring a substring scan cannot express — see unexplainedKill.
 //
 // The runtime-abort wordings stay despite a mutation being able to provoke
 // them in principle, which is a deliberate call rather than an oversight. To
@@ -165,13 +165,32 @@ var infrastructureErrnos = []error{
 // detected the mutation, so an infrastructure signature elsewhere in the same
 // output is the test's own text rather than the host failing — the mutant
 // stays KILLED. A genuine host failure aborts the binary with a runtime
-// `fatal error:` or a toolchain message and no per-test failure line.
+// `fatal error:` or a toolchain message and no per-test failure line. It is
+// not the only shape a detected mutation takes, though — see panicMarker.
 const testFailureMarker = "--- FAIL: "
 
-// sigkillMessage is what os/exec reports when the process died on SIGKILL.
-// Matching the text keeps this portable: reading the signal off ProcessState
-// needs a syscall.WaitStatus, which does not exist on every platform we build
-// for.
+// panicMarker begins the runtime's report for a panic that reached the top of
+// a goroutine. It settles a mutant as killed for the same reason
+// testFailureMarker does, and covers what that marker misses: a panic outside
+// the test's own goroutine — a background worker, TestMain, package init —
+// aborts the binary on the spot, so `go test` never reaches the point where
+// it would print a per-test failure line, and the whole run ends with nothing
+// but `FAIL\tpkg\t0.3s`.
+//
+// Without this, a mutation that provokes such a panic *through* a host
+// resource is scored as an environment problem rather than the kill it is:
+// drop a `defer f.Close()` and a background goroutine panics with
+// "too many open files", which the test-phase list matches. Genuine host
+// failures never arrive in this shape — the Go runtime aborts with
+// `fatal error:` and an OOM-killer leaves `signal: killed`, neither of which
+// starts a line with `panic: `.
+const panicMarker = "panic: "
+
+// sigkillMessage is what os/exec reports when the process died on SIGKILL,
+// and — because `go test` reports its child the same way — also the line
+// `go test` prints when the test binary alone was signalled. Matching the
+// text keeps this portable: reading the signal off ProcessState needs a
+// syscall.WaitStatus, which does not exist on every platform we build for.
 const sigkillMessage = "signal: killed"
 
 // killVetoed reports whether the captured output settles the mutant as a kill
@@ -179,12 +198,32 @@ const sigkillMessage = "signal: killed"
 // signature in the output and an unexplained SIGKILL — consult it, because
 // both are claims about a stream the code under test also writes to.
 //
-// A `--- FAIL: ` line means a test ran and reported the mutation, which is a
-// kill whatever happened to the process afterwards. Truncation makes that
-// line's absence meaningless (see infraFromOutput), so a clipped stream
+// A `--- FAIL: ` line or a `panic: ` line means the mutation was detected,
+// which is a kill whatever happened to the process afterwards. Truncation
+// makes their absence meaningless (see infraFromOutput), so a clipped stream
 // declines to classify as well.
 func killVetoed(stdout string, truncated bool) bool {
-	return truncated || strings.Contains(stdout, testFailureMarker)
+	return truncated ||
+		strings.Contains(stdout, testFailureMarker) ||
+		hasLineWithPrefix(stdout, panicMarker)
+}
+
+// hasLineWithPrefix reports whether any line of s starts with prefix.
+//
+// Line anchoring is what separates the two authors of `go test`'s stdout for
+// the phrases that carry no qualifying prefix of their own. The toolchain and
+// the runtime write theirs at column zero; a test quoting the same words puts
+// them inside a message that `go test` indents under a `--- FAIL: ` header,
+// or mid-line in its own logging. A plain substring scan cannot tell those
+// apart, which is why the phrases matched here are absent from the signature
+// lists above.
+func hasLineWithPrefix(s, prefix string) bool {
+	for line := range strings.Lines(s) {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // unexplainedKill reports whether the test process died on a SIGKILL that
@@ -194,17 +233,34 @@ func killVetoed(stdout string, truncated bool) bool {
 // reached. What is left came from outside the run — a cgroup or kernel
 // OOM-killer reaping the test binary, or the CI runner tearing the job down.
 //
-// That is the failure issue #79 reported, and it is the one the RSS monitor
-// cannot see: the monitor SIGKILLs at its own 2 GiB ceiling on a 1 s poll, so
-// a container whose limit is lower is always killed by the kernel first, well
-// before memKilled is ever set. Classified as KILLED it would be cached, and
-// cached kills are never revisited — the false score outlives the bad host.
+// It takes two readings because the signal lands on one of two processes and
+// only one of them is the process gomutants waits on:
+//
+//   - The `go` parent is signalled (a teardown that sweeps the tree). cmd.Wait
+//     reports the death directly, so runErr carries os/exec's "signal: killed".
+//   - The test binary alone is signalled. This is the usual shape, because the
+//     kernel OOM-killer picks the largest RSS in the cgroup and that is the
+//     binary, not the `go` process supervising it. `go test` survives, prints
+//     "signal: killed" on a line of its own, and exits 1 — leaving runErr as a
+//     bare "exit status 1" with all of the evidence on stdout.
+//
+// The second is the failure issue #79 reported, and it is the one the RSS
+// monitor cannot see: the monitor SIGKILLs at its own 2 GiB ceiling on a 1 s
+// poll, so a container whose limit is lower is always killed by the kernel
+// first, well before memKilled is ever set. Classified as KILLED it would be
+// cached, and cached kills are never revisited — the false score outlives the
+// bad host.
+//
+// Reading stdout means reading a stream the tested code also writes to, so
+// the phrase counts only at the start of a line, where `go test` puts it (see
+// hasLineWithPrefix). The caller pairs that with killVetoed for the rest.
 //
 // runErr is never nil here: classifyTestOutcome returns LIVED on a nil error
 // long before this is reached, so a nil guard would be dead code (and an
 // equivalent mutant).
-func unexplainedKill(runErr error) bool {
-	return strings.Contains(runErr.Error(), sigkillMessage)
+func unexplainedKill(runErr error, stdout string) bool {
+	return strings.Contains(runErr.Error(), sigkillMessage) ||
+		hasLineWithPrefix(stdout, sigkillMessage)
 }
 
 // matchesAnySignature reports whether already-lowercased text contains any of
@@ -705,9 +761,10 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //     that failed *with* a compile diagnostic is the mutation's doing and has
 //     already returned, so what reaches step 5 is a build that broke with
 //     nothing to say about the code.
-//  6. the process died on a SIGKILL gomutants did not send (see
-//     unexplainedKill) → InfraError. Steps 1 and 3 have already taken both
-//     signals it does send, so this is an outside hand.
+//  6. the `go` process or the test binary under it died on a SIGKILL
+//     gomutants did not send (see unexplainedKill) → InfraError. Steps 1 and
+//     3 have already taken both signals it does send, so this is an outside
+//     hand.
 //  7. Otherwise → Killed.
 func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string, truncated bool) mutator.MutantStatus {
 	if memKilled {
@@ -725,7 +782,7 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if infraFromOutput(stdout, stderr, truncated) {
 		return mutator.StatusInfraError
 	}
-	if unexplainedKill(runErr) && !killVetoed(stdout, truncated) {
+	if unexplainedKill(runErr, stdout) && !killVetoed(stdout, truncated) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled

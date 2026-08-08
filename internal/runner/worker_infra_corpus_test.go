@@ -64,6 +64,15 @@ func TestInfraClassificationCorpus(t *testing.T) {
 		{"signatures match case-insensitively",
 			"", "Write /VAR/TMP/X: NO SPACE LEFT ON DEVICE\n",
 			mutator.StatusInfraError},
+		// Verbatim `go test` output for the issue #79 shape, captured by
+		// SIGKILLing a test binary from inside itself. Note what is *not*
+		// here: the exit error is the anyErr above, a plain "exit status 1".
+		// `go test` is not the process that died, so the only trace of the
+		// kill is this line — an earlier draft read the exit error alone and
+		// classified the whole scenario it was written for as a kill.
+		{"OOM-killer reaps the test binary under a surviving go test",
+			"signal: killed\nFAIL\tkv\t0.405s\nFAIL\n", "",
+			mutator.StatusInfraError},
 
 		// --- The tested code printed the phrase: still a kill. ---
 		{"test asserts on an ENOSPC message",
@@ -87,6 +96,14 @@ func TestInfraClassificationCorpus(t *testing.T) {
 		// exactly such a suite, and got misclassified by an earlier draft.
 		{"test echoes a build marker as fixture data",
 			"--- FAIL: TestCorpus\n    x_test.go:9: stdout: \"FAIL\\tm [build failed]\\n\" stderr: \"out of memory\"\n", "",
+			mutator.StatusKilled},
+		// Verbatim output from a panic in a non-test goroutine. There is no
+		// `--- FAIL: ` line anywhere in it — the binary aborted before `go
+		// test` could print one — so the marker alone would hand this to the
+		// test-phase list, which matches the panic value's "too many open
+		// files" and excuses a mutation that dropped a `defer f.Close()`.
+		{"background goroutine panics on a host error the mutation caused",
+			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nkv.TestGoroutinePanic.func1()\n\t/tmp/kv/a_test.go:10 +0x2c\nFAIL\tkv\t0.333s\nFAIL\n", "",
 			mutator.StatusKilled},
 
 		// --- Neither: the existing classifications still win. ---
