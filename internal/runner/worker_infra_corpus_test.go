@@ -134,6 +134,17 @@ func TestInfraClassificationTruncatedOutputStaysKilled(t *testing.T) {
 	if got := classifyTestOutcome(anyErr, false, nil, chatty, "", false); got != mutator.StatusInfraError {
 		t.Errorf("whole stdout with an infra signature = %v, want InfraError", got)
 	}
+
+	// The unexplained-SIGKILL path reads the same veto: with the tail gone,
+	// the `--- FAIL: ` line that would settle this as a kill may be among the
+	// dropped bytes.
+	sigkilled := errors.New("signal: killed")
+	if got := classifyTestOutcome(sigkilled, false, nil, "ok\ttestmod\n", "", true); got != mutator.StatusKilled {
+		t.Errorf("truncated stdout with an unexplained SIGKILL = %v, want Killed", got)
+	}
+	if got := classifyTestOutcome(sigkilled, false, nil, "ok\ttestmod\n", "", false); got != mutator.StatusInfraError {
+		t.Errorf("whole stdout with an unexplained SIGKILL = %v, want InfraError", got)
+	}
 }
 
 // cappedBuffer must set truncated exactly when it drops bytes — the flag is

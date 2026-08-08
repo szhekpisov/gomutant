@@ -1203,8 +1203,16 @@ func TestClassifyTestOutcome(t *testing.T) {
 			"FAIL [build failed]\n", "", mutator.StatusKilled},
 		{"normal test failure => killed", anyErr, false, nil,
 			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
-		{"unexplained signal killed => killed", errors.New("signal: killed"), false, nil,
-			"", "", mutator.StatusKilled},
+		// Neither signal gomutants sends reaches here: the RSS monitor's is
+		// memKilled and the deadline's is DeadlineExceeded, both already
+		// TIMED OUT. A SIGKILL with no test output to explain it came from
+		// the kernel, a cgroup, or the CI runner.
+		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, nil,
+			"", "", mutator.StatusInfraError},
+		// ... unless a test reported the mutation first, in which case the
+		// process being reaped afterwards changes nothing.
+		{"reported failure beats an unexplained signal killed", errors.New("signal: killed"), false, nil,
+			"--- FAIL: TestAdd\n", "", mutator.StatusKilled},
 		// The tested code's own output lands on the same stdout as the test
 		// framework's. A test that reported a failure detected the mutation,
 		// so a signature it printed itself must not launder the kill into a
