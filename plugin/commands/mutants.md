@@ -43,6 +43,7 @@ Notes:
 - Do **not** pass `-cache=off`. The default `.gomutants-cache.json` is on, which makes repeat runs in the same session fast.
 - Exit codes 10 / 11 mean the efficacy / coverage thresholds were not met. Both reports still wrote, so continue.
 - Exit code 2 means the invocation or configuration is invalid. Stop and surface the error; do not continue with a stale or missing report.
+- `INFRA ERROR` entries mean the host ran out of a recognized resource or hit an I/O failure. Do not treat them as killed mutants or propose tests for them; report the count and recommend rerunning after the environment is healthy.
 - If the run is taking visibly long on `./...`, narrow to the package with the most changed files and tell the user you did so.
 
 ## Step 3 — extract surviving mutants
@@ -57,7 +58,7 @@ Read `/tmp/gomutants-report.json`. Schema:
       "mutations": [
         {
           "type": "...",
-          "status": "LIVED|KILLED|NOT_COVERED|NOT_VIABLE|TIMED_OUT",
+          "status": "LIVED|KILLED|NOT COVERED|NOT VIABLE|TIMED OUT|INFRA ERROR",
           "line": N,
           "column": N,
           "original": "...",
@@ -69,7 +70,7 @@ Read `/tmp/gomutants-report.json`. Schema:
 }
 ```
 
-Filter to `status == "LIVED"`. Note the `NOT_COVERED` count per file separately as a secondary signal — those mutants no test even exercises.
+Filter to `status == "LIVED"`. Note the `NOT COVERED` count per file separately as a secondary signal — those mutants no test even exercises. Count `INFRA ERROR` entries separately as an incomplete environmental outcome; they are intentionally excluded from test proposals and the incremental cache.
 
 ## Step 4 — propose tests
 
@@ -101,5 +102,7 @@ End with a two-line summary:
 N surviving mutants across M files; proposed K new tests.
 HTML report: /tmp/gomutants-report.html  (open with `open /tmp/gomutants-report.html` on macOS, or `xdg-open` on Linux)
 ```
+
+If the report contains infrastructure errors, state `<count> INFRA ERROR outcomes need a rerun after the host issue is fixed.` immediately before that two-line summary.
 
 Do **not** edit any files — proposals only. If the user wants them applied, they will ask.

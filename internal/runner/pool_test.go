@@ -266,6 +266,53 @@ func TestPoolNoWorkersLogsToStderr(t *testing.T) {
 	}
 }
 
+// TestPoolNoWorkersMarksPendingInfra pins what the stderr line above cannot
+// carry on its own. A mutant left Pending is counted in the report's total
+// but in none of its buckets, so a run where every worker failed to start
+// reports no infrastructure errors, warns about nothing, and evaluates its
+// thresholds over cached results alone — a green gate on a run that tested
+// nothing. Every pending mutant must come back as an INFRA ERROR, and must
+// be reported through onResult so the progress display and the report agree.
+func TestPoolNoWorkersMarksPendingInfra(t *testing.T) {
+	orig := newWorkerFunc
+	defer func() { newWorkerFunc = orig }()
+	newWorkerFunc = func(int, string, TimeoutPolicy, map[string][]byte, string, *coverage.TestMap) (*Worker, error) {
+		return nil, errors.New("write /tmp/gomutants-0.go: no space left on device")
+	}
+
+	mutants := []mutator.Mutant{
+		{ID: 1, File: "/abs/f.go", Pkg: "p", Status: mutator.StatusPending},
+		{ID: 2, File: "/abs/f.go", Pkg: "p", Status: mutator.StatusPending},
+		// A mutant the cache already settled must be left exactly as it is.
+		{ID: 3, File: "/abs/f.go", Pkg: "p", Status: mutator.StatusKilled, FromCache: true},
+	}
+	var reported []mutator.Mutant
+	captureStderr(t, func() {
+		p := NewPool(2, ExecOpts{}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
+		p.Run(context.Background(), mutants, func(m mutator.Mutant) {
+			reported = append(reported, m)
+		})
+	})
+
+	for _, i := range []int{0, 1} {
+		if mutants[i].Status != mutator.StatusInfraError {
+			t.Errorf("mutant %d = %v, want InfraError; Pending would vanish from every report bucket",
+				mutants[i].ID, mutants[i].Status)
+		}
+	}
+	if mutants[2].Status != mutator.StatusKilled {
+		t.Errorf("cached mutant = %v, want its Killed verdict untouched", mutants[2].Status)
+	}
+	if len(reported) != 2 {
+		t.Fatalf("onResult called %d times, want 2 (once per pending mutant)", len(reported))
+	}
+	for _, m := range reported {
+		if m.Status != mutator.StatusInfraError {
+			t.Errorf("reported mutant %d as %v, want InfraError", m.ID, m.Status)
+		}
+	}
+}
+
 // captureStderr redirects os.Stderr through a pipe for the duration of fn
 // and returns whatever was written. Used to assert on log lines that have
 // no other observable handle.

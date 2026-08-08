@@ -216,6 +216,22 @@ func TestSummaryTimedOutNonZero(t *testing.T) {
 	}
 }
 
+func TestSummaryInfraErrorsNonZero(t *testing.T) {
+	var buf bytes.Buffer
+	term := NewTerminal(&buf, 0, false, false)
+	term.Summary(&Report{
+		MutantsKilled:     5,
+		MutantsLived:      1,
+		MutantsTimedOut:   2,
+		MutantsInfraError: 1,
+		TestEfficacy:      83.33,
+	})
+
+	if !strings.Contains(buf.String(), "  Timed out:    2\n  Infra errors: 1  (environment failure, not a mutant result — rerun to confirm)\n") {
+		t.Errorf("expected nonzero infra errors immediately after timed out, got %q", buf.String())
+	}
+}
+
 // TestSummaryTTYLeadingNewline covers the `t.isTTY && !t.verbose` branch
 // that prints a newline before the summary to clear the progress line.
 func TestSummaryTTYLeadingNewline(t *testing.T) {

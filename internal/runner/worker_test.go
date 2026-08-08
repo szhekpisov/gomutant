@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -489,6 +490,118 @@ func TestWorkerTestWriteFailures(t *testing.T) {
 	}
 }
 
+// subtestName makes a signature or errno text safe to use as a subtest name.
+var subtestName = strings.NewReplacer(" ", "_", "/", "_")
+
+// infraInjection is one error a stubbed write can return, with the subtest
+// name it should run under.
+type infraInjection struct {
+	name string
+	err  error
+}
+
+// infraWriteCase is one (injected error, failing write) pair for
+// TestWorkerTestInfrastructureWriteFailures. failOnIndex is the 1-based
+// writeFileFunc call to fail: 1 is the patched source, 2 is the overlay.
+type infraWriteCase struct {
+	srcPath     string
+	src         []byte
+	root        string
+	injected    error
+	failOnIndex int32
+}
+
+// runInfraWriteFailure asserts that a write failure carrying an
+// infrastructure signature classifies the mutant as InfraError rather than
+// NotViable. Split out of the test body so the nested loops and closures
+// don't stack into one over-complex function.
+func runInfraWriteFailure(t *testing.T, tc infraWriteCase) {
+	t.Helper()
+
+	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, map[string][]byte{tc.srcPath: tc.src}, tc.root, nil)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	origWrite := writeFileFunc
+	defer func() { writeFileFunc = origWrite }()
+	var calls atomic.Int32
+	writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
+		if calls.Add(1) == tc.failOnIndex {
+			return tc.injected
+		}
+		return os.WriteFile(name, data, perm)
+	}
+
+	result := w.Test(context.Background(), mutator.Mutant{
+		ID: 1, File: tc.srcPath, Pkg: "p",
+		StartOffset: len(tc.src) - 1, EndOffset: len(tc.src),
+		Replacement: "X", Status: mutator.StatusPending,
+	})
+	if result.Status != mutator.StatusInfraError {
+		t.Errorf("Status=%v, want InfraError", result.Status)
+	}
+	if result.Duration <= 0 {
+		t.Errorf("Duration=%v, want > 0", result.Duration)
+	}
+}
+
+// infraInjections is every error shape setupErrorStatus must recognize: each
+// errno as os.WriteFile really returns it (wrapped in a *fs.PathError, so the
+// test exercises errors.Is unwrapping rather than a bare errno), plus one
+// error that lost its errno on the way up and is recognizable only by text.
+func infraInjections() []infraInjection {
+	out := make([]infraInjection, 0, len(infrastructureErrnos)+1)
+	for _, errno := range infrastructureErrnos {
+		out = append(out, infraInjection{
+			name: subtestName.Replace(errno.Error()),
+			err:  &fs.PathError{Op: "write", Path: "worker-0.go", Err: errno},
+		})
+	}
+	return append(out,
+		infraInjection{
+			name: "message_only_no_errno",
+			err:  errors.New("INJECTED: NO SPACE LEFT ON DEVICE"),
+		},
+		// Generic wording: safe to match here because an error value from
+		// gomutants' own syscall is never authored by the code under test.
+		infraInjection{
+			name: "message_only_generic_wording",
+			err:  errors.New("INJECTED: OUT OF MEMORY"),
+		})
+}
+
+func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "f.go")
+	src := []byte("package p\nvar X = 1\n")
+	if err := os.WriteFile(srcPath, src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writes := []struct {
+		name        string
+		failOnIndex int32
+	}{
+		{"patched source", 1},
+		{"overlay", 2},
+	}
+
+	for _, injection := range infraInjections() {
+		for _, write := range writes {
+			t.Run(injection.name+"/"+write.name, func(t *testing.T) {
+				runInfraWriteFailure(t, infraWriteCase{
+					srcPath:     srcPath,
+					src:         src,
+					root:        dir,
+					injected:    injection.err,
+					failOnIndex: write.failOnIndex,
+				})
+			})
+		}
+	}
+}
+
 // TestShortFlagFromEnv kills CONDITIONALS_NEGATION on the
 // `os.Getenv("GOMUTANTS_TEST_SHORT") == "1"` check.
 func TestShortFlagFromEnv(t *testing.T) {
@@ -546,11 +659,11 @@ func envContains(env []string, want string) bool {
 }
 
 // TestWorkerTestStartFailureClassifiesNotViable kills BRANCH_IF on the
-// `if err := cmd.Start(); err != nil` body. Stub execCommandContext to
-// return a Cmd whose Path is bogus so Start fails. With the body elided,
-// Getpgid runs against a nil cmd.Process and panics; the original returns
-// NotViable cleanly. Also asserts the diagnostic Fprintf surfaces in
-// stderr (kills STATEMENT_REMOVE on the log line).
+// command-start error body. Stub startCommandFunc so Start fails
+// deterministically with an error carrying no infrastructure signature.
+// With the body elided, Getpgid runs against a nil cmd.Process and panics;
+// the original returns NotViable cleanly. Also asserts the diagnostic
+// Fprintf surfaces in stderr (kills STATEMENT_REMOVE on the log line).
 func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "f.go")
@@ -560,12 +673,9 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	}
 	cache := map[string][]byte{srcPath: src}
 
-	orig := execCommandContext
-	defer func() { execCommandContext = orig }()
-	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		// Path that Start() will fail to exec.
-		return exec.CommandContext(ctx, "/this/path/does/not/exist/zzz")
-	}
+	origStart := startCommandFunc
+	defer func() { startCommandFunc = origStart }()
+	startCommandFunc = func(*exec.Cmd) error { return errors.New("injected start failure") }
 
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, cache, dir, nil)
 	if err != nil {
@@ -594,6 +704,28 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 	}
 	if !strings.Contains(captured, "cmd.Start failed") {
 		t.Errorf("stderr missing the cmd.Start diagnostic; got: %q — STATEMENT_REMOVE on the Fprintf elides the log", captured)
+	}
+}
+
+func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
+	w := &Worker{id: 7, projectDir: "."}
+	for _, injection := range infraInjections() {
+		t.Run(injection.name, func(t *testing.T) {
+			origStart := startCommandFunc
+			defer func() { startCommandFunc = origStart }()
+			startCommandFunc = func(*exec.Cmd) error { return injection.err }
+
+			var got mutator.MutantStatus
+			captured := captureStderr(t, func() {
+				got = w.runMutantTest(context.Background(), nil)
+			})
+			if got != mutator.StatusInfraError {
+				t.Errorf("Status=%v, want InfraError", got)
+			}
+			if !strings.Contains(captured, "INFRA ERROR") {
+				t.Error("stderr missing INFRA ERROR classification")
+			}
+		})
 	}
 }
 
@@ -1053,28 +1185,160 @@ func TestClassifyTestOutcome(t *testing.T) {
 		stderr     string
 		want       mutator.MutantStatus
 	}{
-		{"memkilled beats everything", anyErr, true, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusTimedOut},
 		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
 		// memKilled early return is elided, execution falls through to
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
 		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
-		{"success => lived", nil, false, nil, "", "", mutator.StatusLived},
-		{"timeout before classify", anyErr, false, context.DeadlineExceeded, "", "", mutator.StatusTimedOut},
+		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusLived},
+		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		{"compile failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [build failed]\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [build failed]\nFATAL ERROR: OUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
 		{"setup failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\n", mutator.StatusNotViable},
+			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nFATAL ERROR: OUT OF MEMORY\n", mutator.StatusNotViable},
 		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
 			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
 		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
 			"FAIL [build failed]\n", "", mutator.StatusKilled},
 		{"normal test failure => killed", anyErr, false, nil,
 			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
+		// Neither signal gomutants sends reaches here: the RSS monitor's is
+		// memKilled and the deadline's is DeadlineExceeded, both already
+		// TIMED OUT. A SIGKILL with no test output to explain it came from
+		// the kernel, a cgroup, or the CI runner.
+		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, nil,
+			"", "", mutator.StatusInfraError},
+		// ... unless a test reported the mutation first, in which case the
+		// process being reaped afterwards changes nothing.
+		{"reported failure beats an unexplained signal killed", errors.New("signal: killed"), false, nil,
+			"--- FAIL: TestAdd\n", "", mutator.StatusKilled},
+		// The tested code's own output lands on the same stdout as the test
+		// framework's. A test that reported a failure detected the mutation,
+		// so a signature it printed itself must not launder the kill into a
+		// non-result — this kills the negation of the `--- FAIL: ` guard.
+		{"reported test failure beats infrastructure signature", anyErr, false, nil,
+			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", "", mutator.StatusKilled},
+		// The shape issue #79 actually produces: the OOM-killer takes the test
+		// binary (the biggest RSS in the cgroup), not the `go` process
+		// supervising it, so `go test` survives to report the death on stdout
+		// and exits 1. runErr says nothing.
+		{"go test reports the binary's SIGKILL on stdout => infra error", anyErr, false, nil,
+			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", "", mutator.StatusInfraError},
+		// Anchored to the line start, because the tested code writes to this
+		// stream too: quoted inside a test's own message it is just text.
+		{"a test quoting signal: killed mid-line stays killed", anyErr, false, nil,
+			"    x_test.go:9: exec failed: signal: killed\n", "", mutator.StatusKilled},
+		// A panic outside the test goroutine aborts the binary before `go test`
+		// can print a per-test failure line, so `--- FAIL: ` alone would read a
+		// detected mutation as a host problem.
+		{"goroutine panic quoting a host error stays killed", anyErr, false, nil,
+			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", "", mutator.StatusKilled},
+		// The runtime's own abort is not a panic and must still be readable as
+		// the host failure it is.
+		{"runtime fatal error is not vetoed as a panic", anyErr, false, nil,
+			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", "", mutator.StatusInfraError},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr)
+			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr, false)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// opaqueWrappedErr rewrites the message of the error it wraps while keeping
+// it reachable through errors.Is — what a caller that reports its own context
+// (`fmt.Errorf("staging mutant %d: %v", id, err)` and friends) leaves behind.
+type opaqueWrappedErr struct{ err error }
+
+func (o opaqueWrappedErr) Error() string { return "staging the mutant failed" }
+func (o opaqueWrappedErr) Unwrap() error { return o.err }
+
+// TestIsInfrastructureErrSeesThroughRewrittenMessages pins what the errno
+// comparison buys over the message scan: every recognized errno must still be
+// found when the text no longer names it. Without it the scan alone decides,
+// which is exactly the spoofable matching this classifier avoids.
+func TestIsInfrastructureErrSeesThroughRewrittenMessages(t *testing.T) {
+	for _, errno := range infrastructureErrnos {
+		t.Run(subtestName.Replace(errno.Error()), func(t *testing.T) {
+			if !isInfrastructureErr(opaqueWrappedErr{errno}) {
+				t.Errorf("errno %v hidden behind a rewritten message was not recognized", errno)
+			}
+		})
+	}
+	t.Run("unrelated error stays unrecognized", func(t *testing.T) {
+		if isInfrastructureErr(opaqueWrappedErr{errors.New("bad overlay JSON")}) {
+			t.Error("an ordinary wrapped error must not read as an infrastructure failure")
+		}
+	})
+}
+
+func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
+	for _, signature := range testPhaseInfraSignatures {
+		signatureName := subtestName.Replace(signature)
+		for _, stream := range []struct {
+			name           string
+			stdout, stderr string
+		}{
+			{"stdout", "go test: " + strings.ToUpper(signature), ""},
+			{"stderr", "", "go test: " + strings.ToUpper(signature)},
+		} {
+			t.Run(signatureName+"/"+stream.name, func(t *testing.T) {
+				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr, false)
+				if got != mutator.StatusInfraError {
+					t.Errorf("got %v, want InfraError in %s", got, stream.name)
+				}
+			})
+		}
+	}
+}
+
+// TestClassifyTestOutcomeBuildPhaseSignatures covers the wider tier: before
+// the test binary runs there is no code-under-test output on the streams, so
+// wordings that would be ambiguous during a test run are unambiguous here.
+// The cases are the two real-world failures the qualified list alone reports
+// as KILLED, which is the bug this status exists to fix.
+func TestClassifyTestOutcomeBuildPhaseSignatures(t *testing.T) {
+	anyErr := errors.New("exit status 1")
+	tests := []struct {
+		name           string
+		stdout, stderr string
+		want           mutator.MutantStatus
+	}{
+		{"toolchain cannot fork the compiler (EAGAIN)",
+			"FAIL\ttestmod [build failed]\n",
+			"go: fork/exec /usr/local/go/pkg/tool/darwin_arm64/compile: resource temporarily unavailable\n",
+			mutator.StatusInfraError},
+		{"linker OOM, unprefixed wording",
+			"FAIL\ttestmod [build failed]\n",
+			"/usr/bin/ld: out of memory allocating 8388608 bytes\n",
+			mutator.StatusInfraError},
+		{"setup phase counts too",
+			"FAIL\ttestmod [setup failed]\n", "out of memory\n",
+			mutator.StatusInfraError},
+		// The same generic wording without a build/setup marker came from a
+		// running test binary and must not be trusted — this is the case the
+		// tier split exists to keep apart, and it kills the `buildPhase &&`
+		// conjunction on the wide-list branch.
+		{"same wording during a test run stays killed",
+			"", "resource temporarily unavailable\n", mutator.StatusKilled},
+		{"build failure with no signature stays killed",
+			"FAIL\ttestmod [build failed]\n", "some other build problem\n", mutator.StatusKilled},
+		// A reported test failure outranks the build-phase tier: some test
+		// detected the mutation, so this is a kill regardless. The markers
+		// are only text on stdout, and a suite that processes `go test`
+		// output prints them as fixture data — this kills a reordering that
+		// lets the wide list see test-authored text.
+		{"reported test failure outranks the build-phase tier",
+			"--- FAIL: TestX\nFAIL\ttestmod [build failed]\n", "out of memory\n",
+			mutator.StatusKilled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr, false)
 			if got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}

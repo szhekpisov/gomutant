@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/szhekpisov/gomutants/internal/coverage"
@@ -60,8 +62,14 @@ const maxCapturedOutput = 1 << 20 // 1 MiB
 
 // cappedBuffer accumulates writes up to cap bytes and silently drops the rest.
 // Compile-error detection only needs early output; later noise is useless.
+//
+// Dropping is recorded because the infrastructure classifier reasons about
+// what is *absent* from the output: a missing `--- FAIL: ` line is read as
+// "no test reported a failure", which is only sound if the whole stream was
+// seen. See infraFromOutput.
 type cappedBuffer struct {
-	buf []byte
+	buf       []byte
+	truncated bool
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
@@ -71,6 +79,11 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	// to the same observable result on the equality cases.
 	take := min(len(p), max(0, maxCapturedOutput-len(c.buf)))
 	c.buf = append(c.buf, p[:take]...)
+	// take is capped at len(p), so != is exactly "some bytes were dropped"
+	// without introducing an ordering comparison for the boundary mutator.
+	if take != len(p) {
+		c.truncated = true
+	}
 	return len(p), nil
 }
 
@@ -78,13 +91,273 @@ func (c *cappedBuffer) String() string { return string(c.buf) }
 
 var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 
-// writeFileFunc and execCommandContext are package-level indirections to
-// os.WriteFile and exec.CommandContext respectively. Swapping them in tests
-// lets us hit the unhappy paths in NewWorker / Worker.Test (write failure,
-// fork/exec failure) without contriving filesystem or PATH state.
+// testPhaseInfraSignatures are host resource failures recognizable in output
+// that may have been produced while the test binary was running.
+//
+// Everything here has to survive a hostile reading, because `go test` merges
+// the test binary's output into its own stdout: the phrase could have been
+// printed by the code under test rather than by a failing host, and matching
+// it would launder a genuine kill into a non-result. Generic wordings are
+// therefore qualified with the prefix only the real failure produces ("out of
+// memory" alone is an ordinary application error message; "fatal error: out
+// of memory" is the Go runtime dying). A bare "signal: killed" is absent for
+// a different reason: `go test` does write it to this stream when the test
+// binary is signalled, but always alone on a line, so it is matched with the
+// line anchoring a substring scan cannot express — see unexplainedKill.
+//
+// The runtime-abort wordings stay despite a mutation being able to provoke
+// them in principle, which is a deliberate call rather than an oversight. To
+// reach one, a mutated value has to feed a single oversized allocation: an
+// allocation that grows across iterations trips the RSS monitor and returns
+// TIMED OUT before the runtime gives up. The failure on the other side is
+// wider — N parallel `go test` children exhausting a small runner is the
+// exact report behind this status — and it lands as a KILLED that gets
+// cached, so it outlives the bad host. Between a rare non-result that is
+// re-run every time and a common false kill that is never revisited, this
+// list prefers the non-result.
+var testPhaseInfraSignatures = []string{
+	"no space left on device",
+	"disk quota exceeded",
+	"cannot allocate memory",
+	"fatal error: out of memory",
+	"runtime: out of memory",
+	"runtime: failed to create new os thread",
+	"too many open files",
+	"read-only file system",
+	"input/output error",
+	"text file busy",
+}
+
+// buildPhaseInfraSignatures are wordings too generic to trust from a running
+// test, but unambiguous before one starts. `go: fork/exec …/compile:
+// resource temporarily unavailable` (the toolchain unable to spawn the
+// compiler) and `ld: out of memory allocating …` are host failures with no
+// other reading; both are invisible to the qualified list above.
+//
+// They are matched only in the build/setup phase, where every byte on the
+// captured streams was written by the Go toolchain because the code under
+// test has not run yet.
+var buildPhaseInfraSignatures = []string{
+	"out of memory",
+	"resource temporarily unavailable",
+}
+
+// infrastructureErrnos are the same class of failures as typed syscall
+// errors, for the paths where gomutants itself holds an error value (its
+// per-mutant temp-file writes, cmd.Start) instead of a subprocess's text.
+// errors.Is on the errno is exact, survives wrapping that rewrites the
+// message, and cannot be spoofed by the tested code, so it carries the
+// signatures that are too generic to match as free text.
+var infrastructureErrnos = []error{
+	syscall.ENOSPC,  // no space left on device
+	syscall.EDQUOT,  // disk quota exceeded (how a quota'd CI host runs out)
+	syscall.ENOMEM,  // cannot allocate memory
+	syscall.EMFILE,  // too many open files (per-process limit)
+	syscall.ENFILE,  // too many open files (system-wide limit)
+	syscall.EROFS,   // read-only file system
+	syscall.EIO,     // input/output error
+	syscall.EAGAIN,  // fork/thread exhaustion
+	syscall.ETXTBSY, // text file busy
+}
+
+// testFailureMarker is the per-test line `go test` prints when a test
+// function itself reported a failure. Its presence means a test ran and
+// detected the mutation, so an infrastructure signature elsewhere in the same
+// output is the test's own text rather than the host failing — the mutant
+// stays KILLED. A genuine host failure aborts the binary with a runtime
+// `fatal error:` or a toolchain message and no per-test failure line. It is
+// not the only shape a detected mutation takes, though — see panicMarker.
+const testFailureMarker = "--- FAIL: "
+
+// panicMarker begins the runtime's report for a panic that reached the top of
+// a goroutine. It settles a mutant as killed for the same reason
+// testFailureMarker does, and covers what that marker misses: a panic outside
+// the test's own goroutine — a background worker, TestMain, package init —
+// aborts the binary on the spot, so `go test` never reaches the point where
+// it would print a per-test failure line, and the whole run ends with nothing
+// but `FAIL\tpkg\t0.3s`.
+//
+// Without this, a mutation that provokes such a panic *through* a host
+// resource is scored as an environment problem rather than the kill it is:
+// drop a `defer f.Close()` and a background goroutine panics with
+// "too many open files", which the test-phase list matches. Genuine host
+// failures never arrive in this shape — the Go runtime aborts with
+// `fatal error:` and an OOM-killer leaves `signal: killed`, neither of which
+// starts a line with `panic: `.
+const panicMarker = "panic: "
+
+// sigkillMessage is what os/exec reports when the process died on SIGKILL,
+// and — because `go test` reports its child the same way — also the line
+// `go test` prints when the test binary alone was signalled. Matching the
+// text keeps this portable: reading the signal off ProcessState needs a
+// syscall.WaitStatus, which does not exist on every platform we build for.
+const sigkillMessage = "signal: killed"
+
+// killVetoed reports whether the captured output settles the mutant as a kill
+// before any host-failure reasoning runs. Both host-failure paths — a
+// signature in the output and an unexplained SIGKILL — consult it, because
+// both are claims about a stream the code under test also writes to.
+//
+// A `--- FAIL: ` line or a `panic: ` line means the mutation was detected,
+// which is a kill whatever happened to the process afterwards. Truncation
+// makes their absence meaningless (see infraFromOutput), so a clipped stream
+// declines to classify as well.
+func killVetoed(stdout string, truncated bool) bool {
+	return truncated ||
+		strings.Contains(stdout, testFailureMarker) ||
+		hasLineWithPrefix(stdout, panicMarker)
+}
+
+// hasLineWithPrefix reports whether any line of s starts with prefix.
+//
+// Line anchoring is what separates the two authors of `go test`'s stdout for
+// the phrases that carry no qualifying prefix of their own. The toolchain and
+// the runtime write theirs at column zero; a test quoting the same words puts
+// them inside a message that `go test` indents under a `--- FAIL: ` header,
+// or mid-line in its own logging. A plain substring scan cannot tell those
+// apart, which is why the phrases matched here are absent from the signature
+// lists above.
+func hasLineWithPrefix(s, prefix string) bool {
+	for line := range strings.Lines(s) {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// unexplainedKill reports whether the test process died on a SIGKILL that
+// gomutants did not send. Both signals it does send are classified earlier:
+// the RSS monitor's kill arrives as memKilled and the per-mutant deadline as
+// context.DeadlineExceeded, and each returns TIMED OUT before this is
+// reached. What is left came from outside the run — a cgroup or kernel
+// OOM-killer reaping the test binary, or the CI runner tearing the job down.
+//
+// It takes two readings because the signal lands on one of two processes and
+// only one of them is the process gomutants waits on:
+//
+//   - The `go` parent is signalled (a teardown that sweeps the tree). cmd.Wait
+//     reports the death directly, so runErr carries os/exec's "signal: killed".
+//   - The test binary alone is signalled. This is the usual shape, because the
+//     kernel OOM-killer picks the largest RSS in the cgroup and that is the
+//     binary, not the `go` process supervising it. `go test` survives, prints
+//     "signal: killed" on a line of its own, and exits 1 — leaving runErr as a
+//     bare "exit status 1" with all of the evidence on stdout.
+//
+// The second is the failure issue #79 reported, and it is the one the RSS
+// monitor cannot see: the monitor SIGKILLs at its own 2 GiB ceiling on a 1 s
+// poll, so a container whose limit is lower is always killed by the kernel
+// first, well before memKilled is ever set. Classified as KILLED it would be
+// cached, and cached kills are never revisited — the false score outlives the
+// bad host.
+//
+// Reading stdout means reading a stream the tested code also writes to, so
+// the phrase counts only at the start of a line, where `go test` puts it (see
+// hasLineWithPrefix). The caller pairs that with killVetoed for the rest.
+//
+// runErr is never nil here: classifyTestOutcome returns LIVED on a nil error
+// long before this is reached, so a nil guard would be dead code (and an
+// equivalent mutant).
+func unexplainedKill(runErr error, stdout string) bool {
+	return strings.Contains(runErr.Error(), sigkillMessage) ||
+		hasLineWithPrefix(stdout, sigkillMessage)
+}
+
+// matchesAnySignature reports whether already-lowercased text contains any of
+// the signatures. Subprocess output and OS errors vary in capitalization, so
+// callers lowercase once and match case-insensitively.
+func matchesAnySignature(lower string, signatures []string) bool {
+	for _, signature := range signatures {
+		if strings.Contains(lower, signature) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildOrSetupFailed reports whether `go test` gave up before running any
+// test, which is also what tells us who wrote the captured output.
+func buildOrSetupFailed(stdout string) bool {
+	return strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")
+}
+
+// infraFromOutput reports whether subprocess output carries a recognized host
+// failure. Which signatures count depends on the phase the output came from,
+// because the two phases have different authors:
+//
+//   - Build/setup: the test binary never ran, so every byte came from the Go
+//     toolchain and even the generic wordings are unambiguous.
+//   - Test run: `go test` merges the test binary's output into its own
+//     stdout, so the tested code could have printed the phrase itself. Only
+//     the qualified signatures count.
+//
+// A reported test failure settles it before either tier: a test detected the
+// mutation, which is a kill no matter what else the output holds. That check
+// has to come first rather than only in the test-run branch, because the
+// build/setup markers are themselves just text on stdout — a project whose
+// tests process `go test` output (gomutants' own suite does) prints
+// `[build failed]` as fixture data, and reading that as "the toolchain wrote
+// this" would hand test-authored text to the wide list. Checking the marker
+// before lowercasing also keeps the common killed path from paying for a scan
+// of up to 2 MiB of captured output.
+//
+// truncated says stdout lost bytes to maxCapturedOutput, which makes the
+// marker check unsound in the one direction that matters: a verbose suite
+// (`-v`, or a mutation that turns the code under test chatty) can push the
+// `--- FAIL: ` line past the cap while an infra-looking phrase the test
+// printed earlier survives in the retained head, laundering a genuine kill
+// into a non-result. Absence of the marker only means "no test failed" when
+// the whole stream was seen, so a truncated stream declines to classify and
+// the caller falls through to KILLED.
+func infraFromOutput(stdout, stderr string, truncated bool) bool {
+	if killVetoed(stdout, truncated) {
+		return false
+	}
+	lower := strings.ToLower(stdout + "\n" + stderr)
+	if buildOrSetupFailed(stdout) && matchesAnySignature(lower, buildPhaseInfraSignatures) {
+		return true
+	}
+	return matchesAnySignature(lower, testPhaseInfraSignatures)
+}
+
+// isInfrastructureErr reports whether err is, or wraps, a recognized host
+// resource failure. The errno comparison is authoritative; the message scan
+// is a fallback for errors that lost their errno on the way up (a wrapper
+// that reformatted the text rather than chaining it). Both signature lists
+// apply: an error value from gomutants' own syscalls is never authored by the
+// code under test, so the generic wordings are safe here too.
+func isInfrastructureErr(err error) bool {
+	for _, errno := range infrastructureErrnos {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return matchesAnySignature(lower, buildPhaseInfraSignatures) ||
+		matchesAnySignature(lower, testPhaseInfraSignatures)
+}
+
+// setupErrorStatus classifies a failure in one of gomutants' own per-mutant
+// setup steps (staging the patched source, the overlay, or starting the test
+// process). A recognized host failure becomes InfraError — the mutation was
+// never actually tested, so it must not be cached or scored. Anything else
+// keeps the historical NotViable: the mutant could not be staged either way,
+// and NotViable already means "no verdict, excluded from efficacy".
+func setupErrorStatus(err error) mutator.MutantStatus {
+	if isInfrastructureErr(err) {
+		return mutator.StatusInfraError
+	}
+	return mutator.StatusNotViable
+}
+
+// writeFileFunc, execCommandContext, and startCommandFunc are package-level
+// indirections around process/file operations. Swapping them in tests lets us
+// hit the unhappy paths in NewWorker / Worker.Test (write failure, fork/exec
+// failure) without contriving filesystem, PATH, or host resource state.
 var (
 	writeFileFunc      = os.WriteFile
 	execCommandContext = exec.CommandContext
+	startCommandFunc   = func(cmd *exec.Cmd) error { return cmd.Start() }
 )
 
 // shortFlagFromEnv reports whether the inner `go test` should be invoked
@@ -190,7 +463,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 
 	// 3. Write patched source to worker's temp file.
 	if err := writeFileFunc(w.tmpSrcPath, patched, 0o644); err != nil {
-		m.Status = mutator.StatusNotViable
+		m.Status = setupErrorStatus(err)
 		m.Duration = nonZeroSince(start)
 		return m
 	}
@@ -199,7 +472,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	ov := overlay{Replace: map[string]string{m.File: w.tmpSrcPath}}
 	ovBytes, _ := json.Marshal(ov)
 	if err := writeFileFunc(w.overlayPath, ovBytes, 0o644); err != nil {
-		m.Status = mutator.StatusNotViable
+		m.Status = setupErrorStatus(err)
 		m.Duration = nonZeroSince(start)
 		return m
 	}
@@ -219,8 +492,9 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// 6. Run each covering package's invocation in turn, short-circuiting on
 	// the first non-Lived outcome (a kill, timeout, or compile failure). A
 	// mutant is Lived only if every covering package's tests pass. A
-	// cmd.Start failure surfaces as NotViable from runMutantTest, which the
-	// non-Lived check below returns just like any other terminal outcome.
+	// cmd.Start failure surfaces as NotViable or InfraError from
+	// runMutantTest, which the non-Lived check below returns just like any
+	// other terminal outcome.
 	for _, args := range w.testInvocations(m, shortFlagFromEnv(), timeout) {
 		status := w.runMutantTest(testCtx, args)
 		// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
@@ -248,17 +522,18 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 // runMutantTest runs one `go test` invocation under the RSS monitor and
 // returns its classified status. A cmd.Start failure (an infrastructure
 // problem — exec/fork failure, PATH misconfig, rlimit — not a mutant-viability
-// signal) is reported as NotViable, which the caller treats as a terminal
-// outcome like any other.
+// signal) is reported as InfraError when it carries a recognized signature,
+// or NotViable otherwise. The caller treats either as a terminal outcome.
 //
 // Extracted from Worker.Test so the integration path can drive it once per
 // covering package while sharing a single per-mutant deadline.
 func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.MutantStatus {
 	cmd, stdout, stderr := w.makeTestCmd(testCtx, args)
 
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as NotViable: %v\n", w.id, err)
-		return mutator.StatusNotViable
+	if err := startCommandFunc(cmd); err != nil {
+		status := setupErrorStatus(err)
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as %s: %v\n", w.id, status, err)
+		return status
 	}
 
 	// Resolve the process-group "handle" we'll later kill if RSS runs away.
@@ -304,7 +579,11 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 	// `go test -race`).
 	<-monitorExited
 
-	return classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String())
+	// Only stdout's truncation flag is passed on: the `--- FAIL: ` marker that
+	// vetoes infra classification is printed on stdout, so a dropped tail
+	// there is what makes its absence unsound. Losing the tail of stderr can
+	// only hide a signature, which fails safe as KILLED.
+	return classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String(), stdout.truncated)
 }
 
 // makeTestCmd builds the *exec.Cmd that runs the mutated `go test` plus
@@ -476,8 +755,18 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
 //  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
 //     `[build failed]` / `[setup failed]` → NotViable.
-//  5. Otherwise → Killed.
-func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string) mutator.MutantStatus {
+//  5. output carries a recognized infrastructure signature for the phase it
+//     came from, and was captured whole (see infraFromOutput) → InfraError.
+//     Step 4 running first is what makes the build-phase tier safe: a build
+//     that failed *with* a compile diagnostic is the mutation's doing and has
+//     already returned, so what reaches step 5 is a build that broke with
+//     nothing to say about the code.
+//  6. the `go` process or the test binary under it died on a SIGKILL
+//     gomutants did not send (see unexplainedKill) → InfraError. Steps 1 and
+//     3 have already taken both signals it does send, so this is an outside
+//     hand.
+//  7. Otherwise → Killed.
+func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string, truncated bool) mutator.MutantStatus {
 	if memKilled {
 		return mutator.StatusTimedOut
 	}
@@ -487,9 +776,14 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if testCtxErr == context.DeadlineExceeded {
 		return mutator.StatusTimedOut
 	}
-	if compileErrorRe.MatchString(stderr) &&
-		(strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")) {
+	if compileErrorRe.MatchString(stderr) && buildOrSetupFailed(stdout) {
 		return mutator.StatusNotViable
+	}
+	if infraFromOutput(stdout, stderr, truncated) {
+		return mutator.StatusInfraError
+	}
+	if unexplainedKill(runErr, stdout) && !killVetoed(stdout, truncated) {
+		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
 }

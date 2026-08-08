@@ -1357,12 +1357,41 @@ func TestMutantStatusString(t *testing.T) {
 		{mutator.StatusNotViable, "NOT VIABLE"},
 		{mutator.StatusTimedOut, "TIMED OUT"},
 		{mutator.StatusEquivalent, "EQUIVALENT"},
+		{mutator.StatusInfraError, "INFRA ERROR"},
 		{mutator.MutantStatus(99), "UNKNOWN"},
 	}
 	for _, tc := range tests {
 		got := tc.status.String()
 		if got != tc.want {
 			t.Errorf("MutantStatus(%d).String() = %q, want %q", tc.status, got, tc.want)
+		}
+	}
+}
+
+// TestMutantStatusStringsAreUnique pins the invariant the persisted formats
+// actually depend on: a status is written to the cache and to every report as
+// its String(), and read back by matching that text (cache.parseStatus). Two
+// statuses sharing a spelling would make a cache round-trip return the wrong
+// verdict — silently, since both sides would still parse.
+func TestMutantStatusStringsAreUnique(t *testing.T) {
+	all := []mutator.MutantStatus{
+		mutator.StatusPending,
+		mutator.StatusKilled,
+		mutator.StatusLived,
+		mutator.StatusNotCovered,
+		mutator.StatusNotViable,
+		mutator.StatusTimedOut,
+		mutator.StatusEquivalent,
+		mutator.StatusInfraError,
+	}
+	seen := make(map[string]mutator.MutantStatus, len(all))
+	for _, s := range all {
+		if prev, dup := seen[s.String()]; dup {
+			t.Errorf("MutantStatus(%d) and MutantStatus(%d) both stringify to %q", prev, s, s.String())
+		}
+		seen[s.String()] = s
+		if s.String() == "UNKNOWN" {
+			t.Errorf("MutantStatus(%d) has no String() case; it would persist as UNKNOWN", s)
 		}
 	}
 }

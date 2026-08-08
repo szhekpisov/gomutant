@@ -12,6 +12,7 @@ const (
 	StatusNotViable               // Mutant causes compile error.
 	StatusTimedOut                // Test execution timed out.
 	StatusEquivalent              // Mutant provably equivalent to the original (TCE).
+	StatusInfraError              // Test could not run because of an infrastructure failure.
 )
 
 func (s MutantStatus) String() string {
@@ -30,6 +31,8 @@ func (s MutantStatus) String() string {
 		return "TIMED OUT"
 	case StatusEquivalent:
 		return "EQUIVALENT"
+	case StatusInfraError:
+		return "INFRA ERROR"
 	default:
 		return "UNKNOWN"
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/szhekpisov/gomutants/internal/report"
 	"github.com/szhekpisov/gomutants/internal/runner"
 )
 
@@ -1104,6 +1105,24 @@ func TestRunThresholdMcover(t *testing.T) {
 	var ee *exitError
 	if !errors.As(err, &ee) || ee.code != exitCodeMutantCoverage {
 		t.Errorf("expected exitError code 11 (gremlins-compat), got: %v", err)
+	}
+}
+
+// TestWarnInfraErrors pins the stderr note that keeps a partial run from
+// looking complete in CI, where the terminal summary (stdout) is often
+// discarded and only the exit code and the JSON report survive.
+func TestWarnInfraErrors(t *testing.T) {
+	var buf bytes.Buffer
+	warnInfraErrors(&buf, &report.Report{MutantsInfraError: 3, MutantsTotal: 40})
+	got := buf.String()
+	if !strings.Contains(got, "3 of 40 mutants ended in INFRA ERROR") {
+		t.Errorf("expected the infra-error warning with both counts, got %q", got)
+	}
+
+	buf.Reset()
+	warnInfraErrors(&buf, &report.Report{MutantsTotal: 40})
+	if buf.Len() != 0 {
+		t.Errorf("expected silence when no mutant hit an infrastructure error, got %q", buf.String())
 	}
 }
 

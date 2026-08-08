@@ -235,6 +235,9 @@ func (t *Terminal) Summary(r *Report) {
 	fmt.Fprintf(t.w, "  Not covered:  %d\n", r.MutantsNotCovered)
 	fmt.Fprintf(t.w, "  Not viable:   %d\n", r.MutantsNotViable)
 	fmt.Fprintf(t.w, "  Timed out:    %d\n", r.MutantsTimedOut)
+	if r.MutantsInfraError > 0 {
+		fmt.Fprintf(t.w, "  Infra errors: %d  (environment failure, not a mutant result — rerun to confirm)\n", r.MutantsInfraError)
+	}
 	if r.MutantsCached > 0 {
 		fmt.Fprintf(t.w, "  Cached:       %d  (skipped)\n", r.MutantsCached)
 	}

@@ -98,7 +98,8 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 	// If no worker could be created, abort cleanly rather than deadlocking
 	// on a feeder blocked forever sending into `work` with no readers.
 	if len(workers) == 0 {
-		fmt.Fprintln(os.Stderr, "gomutants: no workers could be started; skipping mutation run")
+		fmt.Fprintln(os.Stderr, "gomutants: no workers could be started; no mutant could be tested")
+		failPending(mutants, pending, onResult)
 		return
 	}
 
@@ -149,6 +150,25 @@ func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult Resul
 		}
 		if onResult != nil {
 			onResult(result)
+		}
+	}
+}
+
+// failPending marks every still-pending mutant as an infrastructure error and
+// reports it through onResult, for the case where the run could not start at
+// all. Leaving them Pending is what makes a dead host look like a clean run:
+// Pending falls into no bucket in the report, so the count is invisible, the
+// stderr warning never fires, and the thresholds are evaluated over whatever
+// the cache happened to supply — a green gate on a run that tested nothing.
+//
+// InfraError rather than NotViable because the mutants themselves were never
+// in question: gomutants could not stage its own scratch files. NotViable is
+// cacheable and would freeze that verdict into the next run.
+func failPending(mutants []mutator.Mutant, pending []int, onResult ResultCallback) {
+	for _, idx := range pending {
+		mutants[idx].Status = mutator.StatusInfraError
+		if onResult != nil {
+			onResult(mutants[idx])
 		}
 	}
 }
