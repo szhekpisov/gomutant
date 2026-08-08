@@ -62,8 +62,14 @@ const maxCapturedOutput = 1 << 20 // 1 MiB
 
 // cappedBuffer accumulates writes up to cap bytes and silently drops the rest.
 // Compile-error detection only needs early output; later noise is useless.
+//
+// Dropping is recorded because the infrastructure classifier reasons about
+// what is *absent* from the output: a missing `--- FAIL: ` line is read as
+// "no test reported a failure", which is only sound if the whole stream was
+// seen. See infraFromOutput.
 type cappedBuffer struct {
-	buf []byte
+	buf       []byte
+	truncated bool
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
@@ -73,6 +79,11 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	// to the same observable result on the equality cases.
 	take := min(len(p), max(0, maxCapturedOutput-len(c.buf)))
 	c.buf = append(c.buf, p[:take]...)
+	// take is capped at len(p), so != is exactly "some bytes were dropped"
+	// without introducing an ordering comparison for the boundary mutator.
+	if take != len(p) {
+		c.truncated = true
+	}
 	return len(p), nil
 }
 
@@ -93,8 +104,20 @@ var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 // "signal: killed") is excluded for the same reason — a mutated test can
 // cause that on its own, and a real OOM kill already surfaces as TIMED OUT
 // via the RSS monitor.
+//
+// The runtime-abort wordings stay despite a mutation being able to provoke
+// them in principle, which is a deliberate call rather than an oversight. To
+// reach one, a mutated value has to feed a single oversized allocation: an
+// allocation that grows across iterations trips the RSS monitor and returns
+// TIMED OUT before the runtime gives up. The failure on the other side is
+// wider — N parallel `go test` children exhausting a small runner is the
+// exact report behind this status — and it lands as a KILLED that gets
+// cached, so it outlives the bad host. Between a rare non-result that is
+// re-run every time and a common false kill that is never revisited, this
+// list prefers the non-result.
 var testPhaseInfraSignatures = []string{
 	"no space left on device",
+	"disk quota exceeded",
 	"cannot allocate memory",
 	"fatal error: out of memory",
 	"runtime: out of memory",
@@ -127,6 +150,7 @@ var buildPhaseInfraSignatures = []string{
 // signatures that are too generic to match as free text.
 var infrastructureErrnos = []error{
 	syscall.ENOSPC,  // no space left on device
+	syscall.EDQUOT,  // disk quota exceeded (how a quota'd CI host runs out)
 	syscall.ENOMEM,  // cannot allocate memory
 	syscall.EMFILE,  // too many open files (per-process limit)
 	syscall.ENFILE,  // too many open files (system-wide limit)
@@ -181,8 +205,17 @@ func buildOrSetupFailed(stdout string) bool {
 // this" would hand test-authored text to the wide list. Checking the marker
 // before lowercasing also keeps the common killed path from paying for a scan
 // of up to 2 MiB of captured output.
-func infraFromOutput(stdout, stderr string) bool {
-	if strings.Contains(stdout, testFailureMarker) {
+//
+// truncated says stdout lost bytes to maxCapturedOutput, which makes the
+// marker check unsound in the one direction that matters: a verbose suite
+// (`-v`, or a mutation that turns the code under test chatty) can push the
+// `--- FAIL: ` line past the cap while an infra-looking phrase the test
+// printed earlier survives in the retained head, laundering a genuine kill
+// into a non-result. Absence of the marker only means "no test failed" when
+// the whole stream was seen, so a truncated stream declines to classify and
+// the caller falls through to KILLED.
+func infraFromOutput(stdout, stderr string, truncated bool) bool {
+	if truncated || strings.Contains(stdout, testFailureMarker) {
 		return false
 	}
 	lower := strings.ToLower(stdout + "\n" + stderr)
@@ -451,7 +484,11 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 	// `go test -race`).
 	<-monitorExited
 
-	return classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String())
+	// Only stdout's truncation flag is passed on: the `--- FAIL: ` marker that
+	// vetoes infra classification is printed on stdout, so a dropped tail
+	// there is what makes its absence unsound. Losing the tail of stderr can
+	// only hide a signature, which fails safe as KILLED.
+	return classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String(), stdout.truncated)
 }
 
 // makeTestCmd builds the *exec.Cmd that runs the mutated `go test` plus
@@ -624,13 +661,13 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
 //     `[build failed]` / `[setup failed]` → NotViable.
 //  5. output carries a recognized infrastructure signature for the phase it
-//     came from (see infraFromOutput) → InfraError. Step 4 running first is
-//     what makes the build-phase tier safe: a build that failed *with* a
-//     compile diagnostic is the mutation's doing and has already returned,
-//     so what reaches step 5 is a build that broke with nothing to say about
-//     the code.
+//     came from, and was captured whole (see infraFromOutput) → InfraError.
+//     Step 4 running first is what makes the build-phase tier safe: a build
+//     that failed *with* a compile diagnostic is the mutation's doing and has
+//     already returned, so what reaches step 5 is a build that broke with
+//     nothing to say about the code.
 //  6. Otherwise → Killed.
-func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string) mutator.MutantStatus {
+func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string, truncated bool) mutator.MutantStatus {
 	if memKilled {
 		return mutator.StatusTimedOut
 	}
@@ -643,7 +680,7 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if compileErrorRe.MatchString(stderr) && buildOrSetupFailed(stdout) {
 		return mutator.StatusNotViable
 	}
-	if infraFromOutput(stdout, stderr) {
+	if infraFromOutput(stdout, stderr, truncated) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled

@@ -34,6 +34,13 @@ func TestInfraClassificationCorpus(t *testing.T) {
 			"FAIL\ttestmod [build failed]\n",
 			"write /tmp/go-build123/b001/x.o: no space left on device\n",
 			mutator.StatusInfraError},
+		// The quota'd sibling of ENOSPC: on a shared CI host with per-user
+		// quotas this is how the box runs out of writable space, and it is
+		// what gomutants' own temp-file writes hit first (EDQUOT).
+		{"disk quota exhausted while the toolchain writes",
+			"FAIL\ttestmod [build failed]\n",
+			"write /tmp/go-build123/b001/x.o: disk quota exceeded\n",
+			mutator.StatusInfraError},
 		{"toolchain cannot fork the compiler",
 			"FAIL\ttestmod [build failed]\n",
 			"go: fork/exec /usr/local/go/pkg/tool/darwin_arm64/compile: resource temporarily unavailable\n",
@@ -93,7 +100,7 @@ func TestInfraClassificationCorpus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr); got != tc.want {
+			if got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr, false); got != tc.want {
 				t.Errorf("classified %v, want %v\nstdout: %q\nstderr: %q", got, tc.want, tc.stdout, tc.stderr)
 			}
 		})
@@ -105,10 +112,41 @@ func TestInfraClassificationCorpus(t *testing.T) {
 // environment problem to be excused.
 func TestInfraClassificationCorpusPrecedence(t *testing.T) {
 	oom := "fatal error: out of memory\n"
-	if got := classifyTestOutcome(errors.New("signal: killed"), true, nil, oom, ""); got != mutator.StatusTimedOut {
+	if got := classifyTestOutcome(errors.New("signal: killed"), true, nil, oom, "", false); got != mutator.StatusTimedOut {
 		t.Errorf("memKilled with an OOM signature = %v, want TimedOut", got)
 	}
-	if got := classifyTestOutcome(nil, false, nil, oom, ""); got != mutator.StatusLived {
+	if got := classifyTestOutcome(nil, false, nil, oom, "", false); got != mutator.StatusLived {
 		t.Errorf("passing tests with an OOM signature = %v, want Lived", got)
+	}
+}
+
+// A stream that lost its tail to maxCapturedOutput cannot be read as "no test
+// reported a failure": the `--- FAIL: ` line may be among the dropped bytes
+// while an infra-looking phrase the test printed earlier survives. Such a
+// mutant stays KILLED rather than being excused as an environment problem.
+func TestInfraClassificationTruncatedOutputStaysKilled(t *testing.T) {
+	anyErr := errors.New("exit status 1")
+	chatty := "some_test.go:12: got \"no space left on device\"\n"
+	if got := classifyTestOutcome(anyErr, false, nil, chatty, "", true); got != mutator.StatusKilled {
+		t.Errorf("truncated stdout with an infra signature = %v, want Killed", got)
+	}
+	// The same stream captured whole has nothing vetoing the signature.
+	if got := classifyTestOutcome(anyErr, false, nil, chatty, "", false); got != mutator.StatusInfraError {
+		t.Errorf("whole stdout with an infra signature = %v, want InfraError", got)
+	}
+}
+
+// cappedBuffer must set truncated exactly when it drops bytes — the flag is
+// what the classifier above trusts, so an off-by-one here would silently
+// re-enable the laundering it prevents.
+func TestCappedBufferReportsTruncation(t *testing.T) {
+	var whole cappedBuffer
+	whole.Write(make([]byte, maxCapturedOutput))
+	if whole.truncated {
+		t.Error("a write that exactly fills the cap reported truncation")
+	}
+	whole.Write([]byte("x"))
+	if !whole.truncated {
+		t.Error("a write past the cap did not report truncation")
 	}
 }

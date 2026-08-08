@@ -1108,12 +1108,6 @@ func TestRunThresholdMcover(t *testing.T) {
 	}
 }
 
-// TestRunThresholdSkipsOnEmptyDiscovery pins the deviation from gremlins:
-// when a threshold's denominator is zero (no mutants to evaluate), the
-// gate is *skipped* with a stderr note rather than failing with a
-// misleading "0% below N%" message. A function with no arithmetic
-// operators yields zero ARITHMETIC_BASE mutants, so both K+L and
-// K+L+NC are zero and both gates skip.
 // TestWarnInfraErrors pins the stderr note that keeps a partial run from
 // looking complete in CI, where the terminal summary (stdout) is often
 // discarded and only the exit code and the JSON report survive.
@@ -1132,6 +1126,12 @@ func TestWarnInfraErrors(t *testing.T) {
 	}
 }
 
+// TestRunThresholdSkipsOnEmptyDiscovery pins the deviation from gremlins:
+// when a threshold's denominator is zero (no mutants to evaluate), the
+// gate is *skipped* with a stderr note rather than failing with a
+// misleading "0% below N%" message. A function with no arithmetic
+// operators yields zero ARITHMETIC_BASE mutants, so both K+L and
+// K+L+NC are zero and both gates skip.
 func TestRunThresholdSkipsOnEmptyDiscovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")

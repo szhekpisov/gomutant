@@ -1214,7 +1214,7 @@ func TestClassifyTestOutcome(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr)
+			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr, false)
 			if got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
@@ -1260,7 +1260,7 @@ func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
 			{"stderr", "", "go test: " + strings.ToUpper(signature)},
 		} {
 			t.Run(signatureName+"/"+stream.name, func(t *testing.T) {
-				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr)
+				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr, false)
 				if got != mutator.StatusInfraError {
 					t.Errorf("got %v, want InfraError in %s", got, stream.name)
 				}
@@ -1311,7 +1311,7 @@ func TestClassifyTestOutcomeBuildPhaseSignatures(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr)
+			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr, false)
 			if got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
