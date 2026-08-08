@@ -52,6 +52,8 @@ const (
 	InvertLogical            MutationType = "INVERT_LOGICAL"
 	InvertLoopCtrl           MutationType = "INVERT_LOOP_CTRL"
 	RemoveSelfAssignments    MutationType = "REMOVE_SELF_ASSIGNMENTS"
+	RemoveLogicalNot         MutationType = "REMOVE_LOGICAL_NOT"
+	ErrorfWrap               MutationType = "ERRORF_WRAP"
 	BranchIf                 MutationType = "BRANCH_IF"
 	BranchElse               MutationType = "BRANCH_ELSE"
 	BranchCase               MutationType = "BRANCH_CASE"

@@ -495,6 +495,433 @@ func f() {
 	}
 }
 
+func TestRemoveLogicalNot(t *testing.T) {
+	src := `package p
+func f(ok bool, s string) bool {
+	if !ok {
+		return false
+	}
+	_ = !isEmpty(s)
+	return !ok
+}
+
+func isEmpty(s string) bool { return s == "" }
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.RemoveLogicalNot)
+	candidates := m.Discover(fset, file, srcBytes)
+
+	if len(candidates) != 3 {
+		t.Fatalf("expected 3 candidates (!ok, !isEmpty(s), !ok), got %d", len(candidates))
+	}
+	for i, c := range candidates {
+		if c.Original != "!" {
+			t.Errorf("candidate %d: original=%q, want %q", i, c.Original, "!")
+		}
+		if c.Replacement != "" {
+			t.Errorf("candidate %d: replacement=%q, want empty", i, c.Replacement)
+		}
+		if got := string(srcBytes[c.StartOffset:c.EndOffset]); got != "!" {
+			t.Errorf("candidate %d: source at [%d:%d) is %q, want %q", i, c.StartOffset, c.EndOffset, got, "!")
+		}
+	}
+}
+
+// TestRemoveLogicalNotSkipsNegatedComparison covers the dedup against
+// CONDITIONALS_NEGATION: `!(a == b)` and `!(a != b)` produce the same
+// behaviour under either mutator, so only one of them may emit.
+func TestRemoveLogicalNotSkipsNegatedComparison(t *testing.T) {
+	src := `package p
+func f(a, b int) {
+	_ = !(a == b)
+	_ = !(a != b)
+	_ = !(a < b)
+	_ = !(a <= b)
+	_ = !(a > b)
+	_ = !(a >= b)
+	_ = !((a == b))
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.RemoveLogicalNot)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for negated comparisons, got %d", len(got))
+	}
+}
+
+// TestRemoveLogicalNotMutatesNegatedLogical guards the other side of that
+// dedup: `&&` / `||` are not in the negation-swap set, so negating a logical
+// expression is not a duplicate and must still emit.
+func TestRemoveLogicalNotMutatesNegatedLogical(t *testing.T) {
+	src := `package p
+func f(a, b bool) {
+	_ = !(a && b)
+	_ = !(a || b)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.RemoveLogicalNot)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 2 {
+		t.Errorf("expected 2 candidates for negated logical exprs, got %d", len(got))
+	}
+}
+
+// TestRemoveLogicalNotSkipsUnaryMinus keeps the mutator off arithmetic
+// negation, which is INVERT_NEGATIVES' territory.
+func TestRemoveLogicalNotSkipsUnaryMinus(t *testing.T) {
+	src := `package p
+func f(a int) int {
+	b := -a
+	c := ^a
+	return b + c
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.RemoveLogicalNot)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for unary minus/xor, got %d", len(got))
+	}
+}
+
+// TestRemoveLogicalNotDescendsPastSkippedNodes pins the visitor's traversal.
+// Each early return in the callback must keep walking the subtree: a
+// negation nests freely inside a unary expression of another operator,
+// inside a negated comparison that is itself skipped, and inside the operand
+// of a negation that was just emitted.
+func TestRemoveLogicalNotDescendsPastSkippedNodes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"inside another negation's operand", `_ = !count(!ok)`, 2},
+		{"inside a non-NOT unary expression", `_ = -count(!ok)`, 1},
+		{"inside a skipped negated comparison", `_ = !(count(!ok) == 0)`, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "package p\n\nfunc count(b bool) int { return 0 }\n\nfunc f(ok bool) {\n\t" + tt.body + "\n}\n"
+			fset, file, srcBytes := parse(t, src)
+			m := findMutator(t, mutator.RemoveLogicalNot)
+			if got := m.Discover(fset, file, srcBytes); len(got) != tt.want {
+				t.Errorf("expected %d candidates, got %d", tt.want, len(got))
+			}
+		})
+	}
+}
+
+// TestRemoveLogicalNotPatchCompiles asserts the byte range is exactly the
+// `!`, so splicing it out leaves parseable source even with a space between
+// the operator and its operand.
+func TestRemoveLogicalNotPatchCompiles(t *testing.T) {
+	src := `package p
+func f(ok bool) bool {
+	if ! ok {
+		return false
+	}
+	return true
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.RemoveLogicalNot)
+	candidates := m.Discover(fset, file, srcBytes)
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	c := candidates[0]
+	mutated := string(srcBytes[:c.StartOffset]) + c.Replacement + string(srcBytes[c.EndOffset:])
+	if !strings.Contains(mutated, "if  ok {") {
+		t.Errorf("mutated source lost the operand: %q", mutated)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "mutated.go", mutated, 0); err != nil {
+		t.Errorf("mutated source does not parse: %v\n%s", err, mutated)
+	}
+}
+
+func TestErrorfWrap(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(err error) error {
+	return fmt.Errorf("load config: %w", err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	candidates := m.Discover(fset, file, srcBytes)
+
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	c := candidates[0]
+	if c.Original != "%w" || c.Replacement != "%v" {
+		t.Errorf("got %q→%q, want %q→%q", c.Original, c.Replacement, "%w", "%v")
+	}
+	if got := string(srcBytes[c.StartOffset:c.EndOffset]); got != "%w" {
+		t.Errorf("source at [%d:%d) is %q, want %q", c.StartOffset, c.EndOffset, got, "%w")
+	}
+	if c.Pos.Line != 6 {
+		t.Errorf("line=%d, want 6", c.Pos.Line)
+	}
+}
+
+func TestErrorfWrapMultipleVerbs(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(a, b error) error {
+	return fmt.Errorf("both: %w and %w", a, b)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	candidates := m.Discover(fset, file, srcBytes)
+
+	if len(candidates) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(candidates))
+	}
+	if candidates[0].StartOffset >= candidates[1].StartOffset {
+		t.Errorf("candidates not in source order: %d, %d", candidates[0].StartOffset, candidates[1].StartOffset)
+	}
+	for i, c := range candidates {
+		if got := string(srcBytes[c.StartOffset:c.EndOffset]); got != "%w" {
+			t.Errorf("candidate %d: source at [%d:%d) is %q, want %q", i, c.StartOffset, c.EndOffset, got, "%w")
+		}
+	}
+}
+
+// TestErrorfWrapSkipsEscapedPercent covers the `%%` scan: `%%w` formats as a
+// literal "%w" and wraps nothing, so rewriting it would be a message-only
+// change no test should have to catch.
+func TestErrorfWrapSkipsEscapedPercent(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f() error {
+	return fmt.Errorf("literal %%w only")
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for %%%%w, got %d", len(got))
+	}
+}
+
+// TestErrorfWrapEscapedThenReal makes sure consuming `%%` does not swallow a
+// following genuine verb: `%%%w` is a literal percent then a wrap verb.
+func TestErrorfWrapEscapedThenReal(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(err error) error {
+	return fmt.Errorf("100%%%w", err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	candidates := m.Discover(fset, file, srcBytes)
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	if got := string(srcBytes[candidates[0].StartOffset:candidates[0].EndOffset]); got != "%w" {
+		t.Errorf("source at candidate offsets is %q, want %q", got, "%w")
+	}
+}
+
+func TestErrorfWrapSkipsNonWrappingCalls(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(err error) error {
+	fmt.Printf("progress %w", err)
+	_ = fmt.Sprintf("value %w", err)
+	return fmt.Errorf("no verbs here")
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates, got %d", len(got))
+	}
+}
+
+// TestErrorfWrapMatchesAlternativeShapes covers the syntactic match: a bare
+// `Errorf` ident, an aliased/third-party package selector, and the
+// context-first argument order all reach the same format string.
+func TestErrorfWrapMatchesAlternativeShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"bare ident", `return Errorf("x: %w", err)`},
+		{"aliased package", `return xerrors.Errorf("x: %w", err)`},
+		{"context first", `return log.Errorf(ctx, "x: %w", err)`},
+		{"method on receiver", `return e.wrapper.Errorf("x: %w", err)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "package p\nfunc f() error {\n\t" + tt.body + "\n}\n"
+			fset, file, srcBytes := parse(t, src)
+			m := findMutator(t, mutator.ErrorfWrap)
+			if got := m.Discover(fset, file, srcBytes); len(got) != 1 {
+				t.Errorf("expected 1 candidate, got %d", len(got))
+			}
+		})
+	}
+}
+
+// TestErrorfWrapSkipsNonLiteralFormat covers the case where the format
+// string is not statically known — there is no source range to patch.
+func TestErrorfWrapSkipsNonLiteralFormat(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+const format = "x: %w"
+
+func f(err error) error {
+	return fmt.Errorf(format, err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for non-literal format, got %d", len(got))
+	}
+}
+
+// TestErrorfWrapUsesFirstStringArgOnly guards against mutating a `%w` that
+// appears in a format *operand* rather than the format string, where it is
+// literal text and changes the message without affecting wrapping.
+func TestErrorfWrapUsesFirstStringArgOnly(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(err error) error {
+	return fmt.Errorf("%s: %w", "literal %w text", err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	candidates := m.Discover(fset, file, srcBytes)
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	// The one candidate must be inside the format string, which ends before
+	// the second argument begins.
+	secondArg := strings.Index(src, `"literal`)
+	if candidates[0].StartOffset > secondArg {
+		t.Errorf("candidate at offset %d is in the operand, not the format string", candidates[0].StartOffset)
+	}
+}
+
+// TestErrorfWrapDescendsPastSkippedNodes pins the visitor's traversal: every
+// early return in the callback must keep walking the subtree, because a
+// wrapping Errorf is routinely nested inside a node the callback rejects.
+func TestErrorfWrapDescendsPastSkippedNodes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		// Rejected because the outer node is not an Errorf call at all.
+		{"inside a non-Errorf call", `return wrap(fmt.Errorf("inner: %w", err))`},
+		// Rejected because the outer Errorf's format is not a literal.
+		{"inside a non-literal-format Errorf", `return fmt.Errorf(format, fmt.Errorf("inner: %w", err))`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "package p\n\nimport \"fmt\"\n\nvar format string\n\nfunc wrap(e error) error { return e }\n\nfunc f(err error) error {\n\t" + tt.body + "\n}\n"
+			fset, file, srcBytes := parse(t, src)
+			m := findMutator(t, mutator.ErrorfWrap)
+			if got := m.Discover(fset, file, srcBytes); len(got) != 1 {
+				t.Errorf("expected the nested Errorf to be found, got %d candidates", len(got))
+			}
+		})
+	}
+}
+
+// TestErrorfWrapNestedErrorfCalls covers descent past a *matched* call: the
+// callback must keep walking after emitting, or a wrapped Errorf inside the
+// arguments of another Errorf goes unseen.
+func TestErrorfWrapNestedErrorfCalls(t *testing.T) {
+	src := `package p
+
+import "fmt"
+
+func f(err error) error {
+	return fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", err))
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 2 {
+		t.Errorf("expected 2 candidates (outer and inner), got %d", len(got))
+	}
+}
+
+// TestErrorfWrapNonErrorfIdent covers the bare-ident arm of isErrorfCall
+// rejecting a name that is not Errorf.
+func TestErrorfWrapNonErrorfIdent(t *testing.T) {
+	src := `package p
+
+func annotate(format string, err error) error { return err }
+
+func f(err error) error {
+	return annotate("x: %w", err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for a non-Errorf ident call, got %d", len(got))
+	}
+}
+
+// TestErrorfWrapUncallableFunShape covers the default arm of isErrorfCall:
+// a call whose Fun is neither an ident nor a selector has no name to match.
+func TestErrorfWrapUncallableFunShape(t *testing.T) {
+	src := `package p
+
+var handlers []func(string, error) error
+
+func f(err error) error {
+	return handlers[0]("x: %w", err)
+}
+`
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	if got := m.Discover(fset, file, srcBytes); len(got) != 0 {
+		t.Errorf("expected 0 candidates for an indexed call target, got %d", len(got))
+	}
+}
+
+// TestErrorfWrapRawStringPosition checks the token.Pos arithmetic: inside a
+// multi-line raw string the reported line must be the verb's line, not the
+// literal's opening line.
+func TestErrorfWrapRawStringPosition(t *testing.T) {
+	src := "package p\n\nimport \"fmt\"\n\nfunc f(err error) error {\n\treturn fmt.Errorf(`multi\nline: %w`, err)\n}\n"
+	fset, file, srcBytes := parse(t, src)
+	m := findMutator(t, mutator.ErrorfWrap)
+	candidates := m.Discover(fset, file, srcBytes)
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	c := candidates[0]
+	if c.Pos.Line != 7 {
+		t.Errorf("line=%d, want 7 (the verb's line, not the literal's start)", c.Pos.Line)
+	}
+	if got := string(srcBytes[c.StartOffset:c.EndOffset]); got != "%w" {
+		t.Errorf("source at [%d:%d) is %q, want %q", c.StartOffset, c.EndOffset, got, "%w")
+	}
+}
+
 // --- Block-level mutators ---
 
 func TestBranchIf(t *testing.T) {
@@ -1067,8 +1494,8 @@ func TestRegistryEnabledMutators(t *testing.T) {
 	reg := mutator.NewRegistry()
 
 	all := reg.Mutators()
-	if len(all) != 26 {
-		t.Fatalf("expected 26 mutators, got %d", len(all))
+	if len(all) != 28 {
+		t.Fatalf("expected 28 mutators, got %d", len(all))
 	}
 
 	only := reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil)
@@ -1077,8 +1504,8 @@ func TestRegistryEnabledMutators(t *testing.T) {
 	}
 
 	disabled := reg.EnabledMutators(nil, []string{"ARITHMETIC_BASE", "BRANCH_IF"})
-	if len(disabled) != 24 {
-		t.Fatalf("expected 24 after disabling 2, got %d", len(disabled))
+	if len(disabled) != 26 {
+		t.Fatalf("expected 26 after disabling 2, got %d", len(disabled))
 	}
 }
 
@@ -1092,6 +1519,8 @@ func TestOffsetsMatchSource(t *testing.T) {
 	// Source covers every mutator's target construct so each mutator produces
 	// at least one candidate and this test exercises its offset computation.
 	src := `package p
+
+import "fmt"
 
 func f(a, b int) int {
 	if a > 0 {
@@ -1146,10 +1575,21 @@ func f(a, b int) int {
 	}
 	// Float literal — Float{Increment,Decrement}.
 	_ = 3.14
+	// Negated non-comparison — RemoveLogicalNot. A negated comparison
+	// would be skipped as a duplicate of ConditionalsNegation.
+	ok := a > b
+	if !ok {
+		return b
+	}
 	return 0
 }
 
 var errRich error
+
+// Wrapping verb — ErrorfWrap.
+func h() error {
+	return fmt.Errorf("rich: %w", errRich)
+}
 
 // Return slots — ReturnErrorNil / ReturnZero / ReturnTrue / ReturnFalse.
 // The literal ` + "`true`" + ` is skipped by ReturnTrue and the literal ` + "`nil`" + ` by
@@ -2292,8 +2732,8 @@ func TestReturnZeroEquivalenceCorpus(t *testing.T) {
 func TestRegistryEnabledMutatorsNoFilter(t *testing.T) {
 	reg := mutator.NewRegistry()
 	all := reg.EnabledMutators(nil, nil)
-	if len(all) != 26 {
-		t.Errorf("expected 26, got %d", len(all))
+	if len(all) != 28 {
+		t.Errorf("expected 28, got %d", len(all))
 	}
 }
 

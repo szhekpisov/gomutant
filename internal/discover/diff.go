@@ -53,12 +53,40 @@ func looksLikeBadRevision(stderr string) bool {
 		strings.Contains(stderr, "bad revision")
 }
 
-// RunGitDiff executes `git diff --unified=0 <ref>` in dir and returns the
-// changed line ranges per file (paths relative to the git root). Lines
-// only deleted at a position (count=0) produce no range — there is nothing
-// to mutate. Renames use the new (b/) path.
+// resolveMergeBase returns the merge base of ref and HEAD — the commit the
+// current branch forked from. Diffing against that instead of the ref's tip
+// is what makes the range match the set of lines a pull request shows: on a
+// branch that is behind its base, `git diff <ref>` also reports every line
+// that landed on the base after the fork, attributing other people's work to
+// this run.
+//
+// Falls back to ref itself on any non-zero exit — no merge base exists
+// (unrelated histories, a repo with no commits), or ref doesn't resolve. In
+// that last case the caller's `git diff` reproduces the failure and owns the
+// diagnostic, so there is nothing to report from here.
+func resolveMergeBase(ctx context.Context, dir, ref string) string {
+	cmd := exec.CommandContext(ctx, "git", "merge-base", ref, "HEAD")
+	cmd.Dir = dir
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return ref
+	}
+	// A zero exit means git printed exactly one commit id, so the trimmed
+	// output is never empty and needs no separate guard.
+	return strings.TrimRight(stdout.String(), "\n")
+}
+
+// RunGitDiff executes `git diff --unified=0 <merge-base(ref, HEAD)>` in dir
+// and returns the changed line ranges per file (paths relative to the git
+// root). Lines only deleted at a position (count=0) produce no range — there
+// is nothing to mutate. Renames use the new (b/) path.
+//
+// Errors name the ref the caller passed, not the resolved merge base, which
+// is an implementation detail they never typed.
 func RunGitDiff(ctx context.Context, dir, ref string) (map[string][]LineRange, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", ref)
+	base := resolveMergeBase(ctx, dir, ref)
+	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", base)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

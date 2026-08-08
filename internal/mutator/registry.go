@@ -34,6 +34,8 @@ func NewRegistry() *Registry {
 		&invertLogical{},
 		&invertLoopCtrl{},
 		&removeSelfAssignments{},
+		&removeLogicalNot{},
+		&errorfWrap{},
 		&branchIf{},
 		&branchElse{},
 		&branchCase{},

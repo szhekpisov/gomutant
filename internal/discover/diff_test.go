@@ -469,6 +469,124 @@ func TestRunGitDiffBadRef(t *testing.T) {
 	}
 }
 
+// TestRunGitDiffUsesMergeBase is the regression test for scoping a run to a
+// pull request's own lines. It builds a repo where `main` has moved on after
+// the feature branch forked, modifying a line in a file the branch also has.
+// Against main's *tip* that line reads as changed — the branch still holds
+// the pre-modification version — and gets attributed to work the branch
+// never did. Against the merge base it is correctly absent.
+//
+// The edit on main has to modify an existing shared file rather than add a
+// new one: a file absent from the branch shows up in a two-dot diff as a
+// deletion, which contributes no ranges and would make this test vacuous.
+func TestRunGitDiffUsesMergeBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	ctx := context.Background()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("init", "-q", "-b", "main")
+	write("ours.go", "package p\n\nfunc A() int { return 1 }\n")
+	write("theirs.go", "package p\n\nfunc B() int { return 2 }\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "init")
+
+	// Fork the feature branch here.
+	run("checkout", "-q", "-b", "feature")
+
+	// main moves on, editing a file the branch also carries.
+	run("checkout", "-q", "main")
+	write("theirs.go", "package p\n\nfunc B() int { return 22 }\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "their work")
+
+	// The branch changes one line of its own, and stays behind main.
+	run("checkout", "-q", "feature")
+	write("ours.go", "package p\n\nfunc A() int { return 99 }\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "our work")
+
+	got, err := RunGitDiff(ctx, dir, "main")
+	if err != nil {
+		t.Fatalf("RunGitDiff: %v", err)
+	}
+	if len(got["ours.go"]) == 0 {
+		t.Errorf("expected the branch's own change to ours.go, got %v", got)
+	}
+	if ranges, ok := got["theirs.go"]; ok {
+		t.Errorf("theirs.go landed on main after the fork and must not be attributed to this branch, got %v", ranges)
+	}
+}
+
+// TestRunGitDiffUnrelatedHistoriesFallsBack covers the merge-base fallback:
+// with no common ancestor there is nothing to resolve, and the diff must
+// still run against the ref itself rather than failing.
+func TestRunGitDiffUnrelatedHistoriesFallsBack(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	ctx := context.Background()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run("init", "-q", "-b", "main")
+	write("f.go", "package p\n\nfunc A() int { return 1 }\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "init")
+
+	// An orphan branch shares no ancestor with main.
+	run("checkout", "-q", "--orphan", "orphan")
+	write("f.go", "package p\n\nfunc A() int { return 2 }\n")
+	run("add", ".")
+	run("commit", "-q", "-m", "orphan root")
+
+	got, err := RunGitDiff(ctx, dir, "main")
+	if err != nil {
+		t.Fatalf("RunGitDiff with unrelated histories: %v", err)
+	}
+	if len(got["f.go"]) == 0 {
+		t.Errorf("expected a full diff against the ref itself, got %v", got)
+	}
+}
+
 // TestRunGitDiffNonRepoErrorNoHint: when git fails for a reason other
 // than a bad ref (e.g. not a git repo), we don't append the fetch hint.
 func TestRunGitDiffNonRepoErrorNoHint(t *testing.T) {
