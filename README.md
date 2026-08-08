@@ -1,5 +1,4 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/szhekpisov/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants)
-[![Go Report Card](https://goreportcard.com/badge/github.com/szhekpisov/gomutants)](https://goreportcard.com/report/github.com/szhekpisov/gomutants)
 [![codecov](https://codecov.io/gh/szhekpisov/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/szhekpisov/gomutants)
 [![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fszhekpisov%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/szhekpisov/gomutants/main)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=szhekpisov_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=szhekpisov_gomutants)
@@ -9,18 +8,19 @@
 
 # gomutants
 
-  A fast mutation tester for Go for those who love flexibility and hate to wait.
+**Mutation testing for Go, fast enough to run on every edit.**
 
-  - Best for CI — test only mutants on lines changed vs the parent branch.
-  - Best for local testing — incremental cache that makes warm reruns ~120× faster.
-  - Fully configurable — specify mutators, packages, and tests you want to run.
-  - Built with performance in mind — adaptive timeouts, OOM safety net, and bounded per-worker concurrency that keeps parallel mutants from oversubscribing CPU.
+Coverage tells you a line ran. gomutants tells you whether a test would have caught it breaking — the gap that opens widest when tests are written at machine speed.
+
+- **Warm reruns in 2.7–19s** on real projects whose cold runs take 6–46 minutes. The content-addressed cache short-circuits every mutant whose source bytes and covering tests are unchanged, so the loop stays tight enough to run after each edit. [benchmarks](#benchmark-snapshot)
+- **Scoped to your diff.** `--changed-since <ref>` mutates only changed lines, routes each mutant to only the tests that cover it, gates on a threshold, and annotates surviving mutants on the PR.
+- **Survivors come back as test proposals**, not a report to triage — the Claude Code plugin turns each one into a concrete `*_test.go` case without editing your repository.
+- **26 mutators including block-level and return-value operators**, surfacing the weak-assertion gaps that token-only mutation misses.
+- **Built to survive its own parallelism** — adaptive timeouts, an OOM safety net, and bounded per-worker concurrency that keeps parallel mutants from oversubscribing CPU. [how it works](#how-it-works)
 
 ## Table of Contents
 
 - [Why gomutants?](#why-gomutants)
-- [Where gomutants isn't the fit?](#where-gomutants-isnt-the-fit)
-- [How It Compares](#how-it-compares)
 - [Installation](#installation)
   - [Go Install](#go-install)
   - [GitHub Action](#github-action)
@@ -28,6 +28,10 @@
   - [From Source](#from-source)
   - [Verifying Releases](#verifying-releases)
 - [Quick Start](#quick-start)
+- [Where gomutants isn't the fit?](#where-gomutants-isnt-the-fit)
+- [How It Compares](#how-it-compares)
+  - [Mutator-set equivalence](#mutator-set-equivalence)
+  - [Benchmark snapshot](#benchmark-snapshot)
 - [Features](#features)
 - [Usage](#usage)
   - [PR-Scoped Mode](#pr-scoped-mode)
@@ -49,72 +53,15 @@
 
 ## Why gomutants?
 
-* **Built for PR gates.** `--changed-since <ref>` runs mutants on lines added or modified since the given git ref — fast enough to gate every pull request without re-running the full mutation suite on untouched code.
+* **A passing suite is not a working suite.** Passing tests only show that code and tests agree with each other. A surviving mutant shows a plausible behavioral defect the suite cannot detect — a test that would stay green while the code broke. That gap is widest in test suites written at machine speed, where line coverage climbs faster than assertion strength.
 
-* **Fastest at scale.** On full-module runs with many mutants, gomutants is ~20% faster wall-clock and ~1.7× faster per tested mutant than the nearest Go mutation tester — and warm reruns with the incremental cache enabled finish 120–150× faster than cold runs (e.g. a 46-minute `prometheus/tsdb` cold run becomes 19s warm). See [`docs/performance.md`](docs/performance.md) for methodology and external-target benchmarks.
+* **The rerun is the number that matters.** Mutation testing gets used when it fits inside the edit/test loop, not when it runs overnight. Warm reruns land at 2.7s (cobra), 2.8s (prometheus labels), and 19s (prometheus tsdb-4) against cold runs of 6.8, 5.7, and 46 minutes — 120–150× faster, because the content-addressed cache re-executes only the mutants whose source bytes or covering tests actually changed. On cold full-module runs gomutants is ~20% faster wall-clock and ~1.7× faster per tested mutant than the nearest Go mutation tester. See [`docs/performance.md`](docs/performance.md) for methodology and external-target benchmarks.
 
-* **Gets mutation testing right.** Per-test coverage routing runs each mutant only against the tests whose coverage touches the mutated line, not the whole suite. Adaptive per-mutant timeouts kill infinite-loop mutants in seconds, not minutes. Byte-level patches via `go test -overlay` preserve generics and never modify the source tree. 26 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface weak-assertion test gaps that token-level mutation misses.
+* **Every PR, not every quarter.** `--changed-since <ref>` mutates only lines added or modified since a git ref; per-test coverage routing runs each mutant against only the tests whose coverage touches the mutated line; thresholds gate the change; GitHub annotations place survivors directly on the diff; and JSON, Stryker, and self-contained HTML reports preserve the result.
 
-## Where gomutants isn't the fit?
+* **Survivors are findings, not homework.** The `/gomutants:mutants` slash command runs gomutants on changed code and proposes the specific test cases that would kill each surviving mutant, leaving the repository untouched. 26 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface the weak-assertion gaps that token-level mutation misses.
 
-One-off manual runs or thin test suites (<70% line coverage) — the one-time setup cost (coverage collection, baseline measurement, per-test coverage map build) only pays off when many mutants share it.
-
-## How It Compares
-
-| Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
-|---|---|---|---|
-| Mutators (default set) | 26 | 5 | 6 |
-| Block-level mutators | yes | no | no |
-| Generics support | yes (byte-patching) | partial[^1] | no |
-| `--changed-since <ref>` | first-class | no | no |
-| Per-test coverage routing | yes | no | no |
-| Incremental cache | yes (on by default) | no | no |
-| `NOT_VIABLE` classification | yes | no[^2] | partial |
-| Equivalent-mutant detection (TCE) | yes (opt-in) | no | no |
-| OOM-safe subprocess control | 2 GiB RSS cap, process group | no | no |
-| gremlins-compatible JSON | yes | (native) | no |
-| Stryker dashboard format | yes | no | no |
-| Self-contained HTML report | yes | no | no |
-| Per-mutant timeout | yes (adaptive) | yes (fixed) | yes (fixed) |
-| Active maintenance | yes | yes | minimal |
-
-[^1]: gremlins uses AST rewriting; some generic constructs round-trip incorrectly.
-[^2]: Compile-failing mutants are silently dropped, so they don't appear in the report at all — they neither contribute to the kill count nor surface as a separate category.
-
-### Mutator-set equivalence
-
-gomutants is a strict superset of [ooze](https://github.com/gtramontina/ooze) v0.2.0 and [gremlins](https://github.com/go-gremlins/gremlins) v0.6.0: more mutators overall, and on the mutators they share it generates the same positions (or more, for ooze). Position-level reports: ooze on [uuid](docs/equivalence/ooze/uuid.md); gremlins on [uuid](docs/equivalence/gremlins/uuid.md) and [cobra](docs/equivalence/gremlins/cobra.md).
-
-### Benchmark snapshot
-
-Four real-world Go projects on Apple M1 Pro 10-core, gomutants v0.2.2 vs gremlins v0.6.0, matched 5-operator set (gremlins' defaults), `workers=10`, `--cache=off`, `GOTOOLCHAIN=go1.25.7` (gremlins is broken on Go 1.26.x). Engine and gremlins rows are 3-run medians; cold-OOB rows on the larger targets are single-run.
-
-**Engine wall-clock (cold cache, like-for-like operators):**
-
-| Target | gremlins | gomutants | Speedup |
-|---|---:|---:|---:|
-| google/uuid (~2.3k LOC, 1 pkg) | 27.5 s | 29.7 s | 0.93× |
-| spf13/cobra (~6k LOC, 1 pkg) | 129 s | **73 s** | **1.78×** |
-| prometheus/model/labels (~4k LOC, 1 pkg) | 139 s | **90 s** | **1.55×** |
-| prometheus tsdb-4 (~24k LOC, 4 pkgs) | 951 s¹ | 855 s | 1.11× |
-
-¹ gremlins's `unleash` accepts only one target argument, so its tsdb-4 row sums 4 per-subpackage invocations; gomutants's row is a single multi-package run.
-
-**Warm-cache rerun (full out-of-the-box workload, cache on)** — the inner edit/test loop where gomutants short-circuits unchanged mutants via the content-addressed cache. gremlins has no equivalent.
-
-| Target | Cold OOB | Warm rerun | Speedup |
-|---|---:|---:|---:|
-| google/uuid | 77 s | 3.2 s | ~24× |
-| spf13/cobra | 410 s | **2.7 s** | **~150×** |
-| prometheus/model/labels | 342 s | **2.8 s** | **~120×** |
-| prometheus tsdb-4 | 2768 s (~46 min) | **19 s** | **~145×** |
-
-**Reading the numbers:**
-
-- **Engine ordering depends on package size.** Roughly tied on uuid (~120 mutants), 1.5–1.8× faster on medium single-package targets where gomutants's pre-built test binary amortizes across many mutants, tied again on the 4-package multi-target where one-shot setup balances against gremlins's per-subpackage setup paid 4×.
-- **Adaptive per-mutant timeouts win on contended runs.** Gremlins ran 26% of uuid mutants into its `--timeout-coefficient=20` ceiling under worker contention; gomutants ran 2.5%. Same pattern on tsdb-4 (196 vs 45 timeouts).
-
-See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT_COVERED interpretation differences, Go 1.26 compatibility notes, and reproduction commands. The in-repo [`benchmarks/results.md`](benchmarks/results.md) covers `./testdata/simple/` and other in-repo targets.
+* **Built not to lie to you.** Compile-failing mutants surface as `NOT_VIABLE` instead of inflating the score, `--detect-equivalent` drops provably unkillable mutants out of the denominator, adaptive per-mutant timeouts kill infinite-loop mutants in seconds rather than minutes, and byte-level `go test -overlay` patches preserve generics and never modify your source tree.
 
 ## Installation
 
@@ -232,6 +179,67 @@ gomutants unleash ./...
 # Use in CI — exit code 10 if efficacy falls below the threshold:
 gomutants --threshold-efficacy 80 ./...
 ```
+
+## Where gomutants isn't the fit?
+
+One-off manual runs or thin test suites (<70% line coverage) — the one-time setup cost (coverage collection, baseline measurement, per-test coverage map build) only pays off when many mutants share it.
+
+## How It Compares
+
+| Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
+|---|---|---|---|
+| Mutators (default set) | 26 | 5 | 6 |
+| Block-level mutators | yes | no | no |
+| Generics support | yes (byte-patching) | partial[^1] | no |
+| `--changed-since <ref>` | first-class | no | no |
+| Per-test coverage routing | yes | no | no |
+| Incremental cache | yes (on by default) | no | no |
+| `NOT_VIABLE` classification | yes | no[^2] | partial |
+| Equivalent-mutant detection (TCE) | yes (opt-in) | no | no |
+| OOM-safe subprocess control | 2 GiB RSS cap, process group | no | no |
+| gremlins-compatible JSON | yes | (native) | no |
+| Stryker dashboard format | yes | no | no |
+| Self-contained HTML report | yes | no | no |
+| Per-mutant timeout | yes (adaptive) | yes (fixed) | yes (fixed) |
+| Active maintenance | yes | yes | minimal |
+
+[^1]: gremlins uses AST rewriting; some generic constructs round-trip incorrectly.
+[^2]: Compile-failing mutants are silently dropped, so they don't appear in the report at all — they neither contribute to the kill count nor surface as a separate category.
+
+### Mutator-set equivalence
+
+gomutants is a strict superset of [ooze](https://github.com/gtramontina/ooze) v0.2.0 and [gremlins](https://github.com/go-gremlins/gremlins) v0.6.0: more mutators overall, and on the mutators they share it generates the same positions (or more, for ooze). Position-level reports: ooze on [uuid](docs/equivalence/ooze/uuid.md); gremlins on [uuid](docs/equivalence/gremlins/uuid.md) and [cobra](docs/equivalence/gremlins/cobra.md).
+
+### Benchmark snapshot
+
+Four real-world Go projects on Apple M1 Pro 10-core, gomutants v0.2.2 vs gremlins v0.6.0, matched 5-operator set (gremlins' defaults), `workers=10`, `--cache=off`, `GOTOOLCHAIN=go1.25.7` (gremlins is broken on Go 1.26.x). Engine and gremlins rows are 3-run medians; cold-OOB rows on the larger targets are single-run.
+
+**Engine wall-clock (cold cache, like-for-like operators):**
+
+| Target | gremlins | gomutants | Speedup |
+|---|---:|---:|---:|
+| google/uuid (~2.3k LOC, 1 pkg) | 27.5 s | 29.7 s | 0.93× |
+| spf13/cobra (~6k LOC, 1 pkg) | 129 s | **73 s** | **1.78×** |
+| prometheus/model/labels (~4k LOC, 1 pkg) | 139 s | **90 s** | **1.55×** |
+| prometheus tsdb-4 (~24k LOC, 4 pkgs) | 951 s¹ | 855 s | 1.11× |
+
+¹ gremlins's `unleash` accepts only one target argument, so its tsdb-4 row sums 4 per-subpackage invocations; gomutants's row is a single multi-package run.
+
+**Warm-cache rerun (full out-of-the-box workload, cache on)** — the inner edit/test loop where gomutants short-circuits unchanged mutants via the content-addressed cache. gremlins has no equivalent.
+
+| Target | Cold OOB | Warm rerun | Speedup |
+|---|---:|---:|---:|
+| google/uuid | 77 s | 3.2 s | ~24× |
+| spf13/cobra | 410 s | **2.7 s** | **~150×** |
+| prometheus/model/labels | 342 s | **2.8 s** | **~120×** |
+| prometheus tsdb-4 | 2768 s (~46 min) | **19 s** | **~145×** |
+
+**Reading the numbers:**
+
+- **Engine ordering depends on package size.** Roughly tied on uuid (~120 mutants), 1.5–1.8× faster on medium single-package targets where gomutants's pre-built test binary amortizes across many mutants, tied again on the 4-package multi-target where one-shot setup balances against gremlins's per-subpackage setup paid 4×.
+- **Adaptive per-mutant timeouts win on contended runs.** Gremlins ran 26% of uuid mutants into its `--timeout-coefficient=20` ceiling under worker contention; gomutants ran 2.5%. Same pattern on tsdb-4 (196 vs 45 timeouts).
+
+See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT_COVERED interpretation differences, Go 1.26 compatibility notes, and reproduction commands. The in-repo [`benchmarks/results.md`](benchmarks/results.md) covers `./testdata/simple/` and other in-repo targets.
 
 ## Features
 
