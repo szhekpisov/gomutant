@@ -80,23 +80,20 @@ func (c *cappedBuffer) String() string { return string(c.buf) }
 
 var compileErrorRe = regexp.MustCompile(`\.go:\d+:\d+:`)
 
-// infrastructureOutputSignatures are operating-system/resource failures that
-// prevent gomutants from obtaining a meaningful verdict for a mutant, as they
-// appear in a subprocess's *output*.
+// testPhaseInfraSignatures are host resource failures recognizable in output
+// that may have been produced while the test binary was running.
 //
-// Keep matching deliberately conservative. This list is scanned against `go
-// test` stdout, which also carries the tested code's own output, so any
-// phrase a failing test could plausibly print itself would launder a genuine
-// kill into a non-result. Generic wordings are therefore qualified with the
-// runtime prefix only the real host failure produces ("out of memory" alone
-// is a common application error message; "fatal error: out of memory" is the
-// Go runtime dying). EAGAIN's "resource temporarily unavailable" is left out
-// entirely for the same reason — it stays in infrastructureErrnos, where the
-// error is typed and cannot be forged by test output. An unexplained signal
-// (including "signal: killed") is likewise excluded: a mutated test can cause
-// that on its own, and a real OOM kill already surfaces as TIMED OUT via the
-// RSS monitor.
-var infrastructureOutputSignatures = []string{
+// Everything here has to survive a hostile reading, because `go test` merges
+// the test binary's output into its own stdout: the phrase could have been
+// printed by the code under test rather than by a failing host, and matching
+// it would launder a genuine kill into a non-result. Generic wordings are
+// therefore qualified with the prefix only the real failure produces ("out of
+// memory" alone is an ordinary application error message; "fatal error: out
+// of memory" is the Go runtime dying). An unexplained signal (including
+// "signal: killed") is excluded for the same reason — a mutated test can
+// cause that on its own, and a real OOM kill already surfaces as TIMED OUT
+// via the RSS monitor.
+var testPhaseInfraSignatures = []string{
 	"no space left on device",
 	"cannot allocate memory",
 	"fatal error: out of memory",
@@ -106,6 +103,20 @@ var infrastructureOutputSignatures = []string{
 	"read-only file system",
 	"input/output error",
 	"text file busy",
+}
+
+// buildPhaseInfraSignatures are wordings too generic to trust from a running
+// test, but unambiguous before one starts. `go: fork/exec …/compile:
+// resource temporarily unavailable` (the toolchain unable to spawn the
+// compiler) and `ld: out of memory allocating …` are host failures with no
+// other reading; both are invisible to the qualified list above.
+//
+// They are matched only in the build/setup phase, where every byte on the
+// captured streams was written by the Go toolchain because the code under
+// test has not run yet.
+var buildPhaseInfraSignatures = []string{
+	"out of memory",
+	"resource temporarily unavailable",
 }
 
 // infrastructureErrnos are the same class of failures as typed syscall
@@ -133,32 +144,69 @@ var infrastructureErrnos = []error{
 // `fatal error:` or a toolchain message and no per-test failure line.
 const testFailureMarker = "--- FAIL: "
 
-// hasInfrastructureError reports whether any input contains a recognized
-// infrastructure signature. Subprocess output and OS errors vary in
-// capitalization, so matching is case-insensitive.
-func hasInfrastructureError(values ...string) bool {
-	for _, value := range values {
-		lower := strings.ToLower(value)
-		for _, signature := range infrastructureOutputSignatures {
-			if strings.Contains(lower, signature) {
-				return true
-			}
+// matchesAnySignature reports whether already-lowercased text contains any of
+// the signatures. Subprocess output and OS errors vary in capitalization, so
+// callers lowercase once and match case-insensitively.
+func matchesAnySignature(lower string, signatures []string) bool {
+	for _, signature := range signatures {
+		if strings.Contains(lower, signature) {
+			return true
 		}
 	}
 	return false
 }
 
+// buildOrSetupFailed reports whether `go test` gave up before running any
+// test, which is also what tells us who wrote the captured output.
+func buildOrSetupFailed(stdout string) bool {
+	return strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")
+}
+
+// infraFromOutput reports whether subprocess output carries a recognized host
+// failure. Which signatures count depends on the phase the output came from,
+// because the two phases have different authors:
+//
+//   - Build/setup: the test binary never ran, so every byte came from the Go
+//     toolchain and even the generic wordings are unambiguous.
+//   - Test run: `go test` merges the test binary's output into its own
+//     stdout, so the tested code could have printed the phrase itself. Only
+//     the qualified signatures count.
+//
+// A reported test failure settles it before either tier: a test detected the
+// mutation, which is a kill no matter what else the output holds. That check
+// has to come first rather than only in the test-run branch, because the
+// build/setup markers are themselves just text on stdout — a project whose
+// tests process `go test` output (gomutants' own suite does) prints
+// `[build failed]` as fixture data, and reading that as "the toolchain wrote
+// this" would hand test-authored text to the wide list. Checking the marker
+// before lowercasing also keeps the common killed path from paying for a scan
+// of up to 2 MiB of captured output.
+func infraFromOutput(stdout, stderr string) bool {
+	if strings.Contains(stdout, testFailureMarker) {
+		return false
+	}
+	lower := strings.ToLower(stdout + "\n" + stderr)
+	if buildOrSetupFailed(stdout) && matchesAnySignature(lower, buildPhaseInfraSignatures) {
+		return true
+	}
+	return matchesAnySignature(lower, testPhaseInfraSignatures)
+}
+
 // isInfrastructureErr reports whether err is, or wraps, a recognized host
 // resource failure. The errno comparison is authoritative; the message scan
 // is a fallback for errors that lost their errno on the way up (a wrapper
-// that reformatted the text rather than chaining it).
+// that reformatted the text rather than chaining it). Both signature lists
+// apply: an error value from gomutants' own syscalls is never authored by the
+// code under test, so the generic wordings are safe here too.
 func isInfrastructureErr(err error) bool {
 	for _, errno := range infrastructureErrnos {
 		if errors.Is(err, errno) {
 			return true
 		}
 	}
-	return hasInfrastructureError(err.Error())
+	lower := strings.ToLower(err.Error())
+	return matchesAnySignature(lower, buildPhaseInfraSignatures) ||
+		matchesAnySignature(lower, testPhaseInfraSignatures)
 }
 
 // setupErrorStatus classifies a failure in one of gomutants' own per-mutant
@@ -575,8 +623,12 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
 //  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
 //     `[build failed]` / `[setup failed]` → NotViable.
-//  5. stdout or stderr carries a recognized infrastructure signature and no
-//     test reported a failure of its own → InfraError.
+//  5. output carries a recognized infrastructure signature for the phase it
+//     came from (see infraFromOutput) → InfraError. Step 4 running first is
+//     what makes the build-phase tier safe: a build that failed *with* a
+//     compile diagnostic is the mutation's doing and has already returned,
+//     so what reaches step 5 is a build that broke with nothing to say about
+//     the code.
 //  6. Otherwise → Killed.
 func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string) mutator.MutantStatus {
 	if memKilled {
@@ -588,15 +640,10 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if testCtxErr == context.DeadlineExceeded {
 		return mutator.StatusTimedOut
 	}
-	if compileErrorRe.MatchString(stderr) &&
-		(strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")) {
+	if compileErrorRe.MatchString(stderr) && buildOrSetupFailed(stdout) {
 		return mutator.StatusNotViable
 	}
-	// A test that reported its own failure detected the mutation, so the
-	// signature belongs to that test's output, not to a dying host. Ordering
-	// the marker check first also keeps the common killed path from paying
-	// for the case-insensitive scan of up to 2 MiB of captured output.
-	if !strings.Contains(stdout, testFailureMarker) && hasInfrastructureError(stdout, stderr) {
+	if infraFromOutput(stdout, stderr) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled

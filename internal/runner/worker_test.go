@@ -558,10 +558,17 @@ func infraInjections() []infraInjection {
 			err:  &fs.PathError{Op: "write", Path: "worker-0.go", Err: errno},
 		})
 	}
-	return append(out, infraInjection{
-		name: "message_only_no_errno",
-		err:  errors.New("INJECTED: NO SPACE LEFT ON DEVICE"),
-	})
+	return append(out,
+		infraInjection{
+			name: "message_only_no_errno",
+			err:  errors.New("INJECTED: NO SPACE LEFT ON DEVICE"),
+		},
+		// Generic wording: safe to match here because an error value from
+		// gomutants' own syscall is never authored by the code under test.
+		infraInjection{
+			name: "message_only_generic_wording",
+			err:  errors.New("INJECTED: OUT OF MEMORY"),
+		})
 }
 
 func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
@@ -1215,8 +1222,35 @@ func TestClassifyTestOutcome(t *testing.T) {
 	}
 }
 
+// opaqueWrappedErr rewrites the message of the error it wraps while keeping
+// it reachable through errors.Is — what a caller that reports its own context
+// (`fmt.Errorf("staging mutant %d: %v", id, err)` and friends) leaves behind.
+type opaqueWrappedErr struct{ err error }
+
+func (o opaqueWrappedErr) Error() string { return "staging the mutant failed" }
+func (o opaqueWrappedErr) Unwrap() error { return o.err }
+
+// TestIsInfrastructureErrSeesThroughRewrittenMessages pins what the errno
+// comparison buys over the message scan: every recognized errno must still be
+// found when the text no longer names it. Without it the scan alone decides,
+// which is exactly the spoofable matching this classifier avoids.
+func TestIsInfrastructureErrSeesThroughRewrittenMessages(t *testing.T) {
+	for _, errno := range infrastructureErrnos {
+		t.Run(subtestName.Replace(errno.Error()), func(t *testing.T) {
+			if !isInfrastructureErr(opaqueWrappedErr{errno}) {
+				t.Errorf("errno %v hidden behind a rewritten message was not recognized", errno)
+			}
+		})
+	}
+	t.Run("unrelated error stays unrecognized", func(t *testing.T) {
+		if isInfrastructureErr(opaqueWrappedErr{errors.New("bad overlay JSON")}) {
+			t.Error("an ordinary wrapped error must not read as an infrastructure failure")
+		}
+	})
+}
+
 func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
-	for _, signature := range infrastructureOutputSignatures {
+	for _, signature := range testPhaseInfraSignatures {
 		signatureName := subtestName.Replace(signature)
 		for _, stream := range []struct {
 			name           string
@@ -1232,6 +1266,56 @@ func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestClassifyTestOutcomeBuildPhaseSignatures covers the wider tier: before
+// the test binary runs there is no code-under-test output on the streams, so
+// wordings that would be ambiguous during a test run are unambiguous here.
+// The cases are the two real-world failures the qualified list alone reports
+// as KILLED, which is the bug this status exists to fix.
+func TestClassifyTestOutcomeBuildPhaseSignatures(t *testing.T) {
+	anyErr := errors.New("exit status 1")
+	tests := []struct {
+		name           string
+		stdout, stderr string
+		want           mutator.MutantStatus
+	}{
+		{"toolchain cannot fork the compiler (EAGAIN)",
+			"FAIL\ttestmod [build failed]\n",
+			"go: fork/exec /usr/local/go/pkg/tool/darwin_arm64/compile: resource temporarily unavailable\n",
+			mutator.StatusInfraError},
+		{"linker OOM, unprefixed wording",
+			"FAIL\ttestmod [build failed]\n",
+			"/usr/bin/ld: out of memory allocating 8388608 bytes\n",
+			mutator.StatusInfraError},
+		{"setup phase counts too",
+			"FAIL\ttestmod [setup failed]\n", "out of memory\n",
+			mutator.StatusInfraError},
+		// The same generic wording without a build/setup marker came from a
+		// running test binary and must not be trusted — this is the case the
+		// tier split exists to keep apart, and it kills the `buildPhase &&`
+		// conjunction on the wide-list branch.
+		{"same wording during a test run stays killed",
+			"", "resource temporarily unavailable\n", mutator.StatusKilled},
+		{"build failure with no signature stays killed",
+			"FAIL\ttestmod [build failed]\n", "some other build problem\n", mutator.StatusKilled},
+		// A reported test failure outranks the build-phase tier: some test
+		// detected the mutation, so this is a kill regardless. The markers
+		// are only text on stdout, and a suite that processes `go test`
+		// output prints them as fixture data — this kills a reordering that
+		// lets the wide list see test-authored text.
+		{"reported test failure outranks the build-phase tier",
+			"--- FAIL: TestX\nFAIL\ttestmod [build failed]\n", "out of memory\n",
+			mutator.StatusKilled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
