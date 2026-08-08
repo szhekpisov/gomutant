@@ -489,6 +489,52 @@ func TestWorkerTestWriteFailures(t *testing.T) {
 	}
 }
 
+// infraWriteCase is one (signature, failing write) pair for
+// TestWorkerTestInfrastructureWriteFailures. failOnIndex is the 1-based
+// writeFileFunc call to fail: 1 is the patched source, 2 is the overlay.
+type infraWriteCase struct {
+	srcPath     string
+	src         []byte
+	root        string
+	signature   string
+	failOnIndex int32
+}
+
+// runInfraWriteFailure asserts that a write failure carrying an
+// infrastructure signature classifies the mutant as InfraError rather than
+// NotViable. Split out of the test body so the nested loops and closures
+// don't stack into one over-complex function.
+func runInfraWriteFailure(t *testing.T, tc infraWriteCase) {
+	t.Helper()
+
+	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, map[string][]byte{tc.srcPath: tc.src}, tc.root, nil)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+
+	origWrite := writeFileFunc
+	defer func() { writeFileFunc = origWrite }()
+	var calls atomic.Int32
+	writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
+		if calls.Add(1) == tc.failOnIndex {
+			return errors.New("INJECTED: " + strings.ToUpper(tc.signature))
+		}
+		return os.WriteFile(name, data, perm)
+	}
+
+	result := w.Test(context.Background(), mutator.Mutant{
+		ID: 1, File: tc.srcPath, Pkg: "p",
+		StartOffset: len(tc.src) - 1, EndOffset: len(tc.src),
+		Replacement: "X", Status: mutator.StatusPending,
+	})
+	if result.Status != mutator.StatusInfraError {
+		t.Errorf("Status=%v, want InfraError", result.Status)
+	}
+	if result.Duration <= 0 {
+		t.Errorf("Duration=%v, want > 0", result.Duration)
+	}
+}
+
 func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "f.go")
@@ -497,42 +543,25 @@ func TestWorkerTestInfrastructureWriteFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	nameOf := strings.NewReplacer(" ", "_", "/", "_")
+	writes := []struct {
+		name        string
+		failOnIndex int32
+	}{
+		{"patched source", 1},
+		{"overlay", 2},
+	}
+
 	for _, signature := range infrastructureErrorSignatures {
-		signatureName := strings.NewReplacer(" ", "_", "/", "_").Replace(signature)
-		for _, write := range []struct {
-			name        string
-			failOnIndex int32
-		}{
-			{"patched source", 1},
-			{"overlay", 2},
-		} {
-			t.Run(signatureName+"/"+write.name, func(t *testing.T) {
-				w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 5 * time.Second}, map[string][]byte{srcPath: src}, dir, nil)
-				if err != nil {
-					t.Fatalf("NewWorker: %v", err)
-				}
-
-				origWrite := writeFileFunc
-				defer func() { writeFileFunc = origWrite }()
-				var calls atomic.Int32
-				writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
-					if calls.Add(1) == write.failOnIndex {
-						return errors.New("INJECTED: " + strings.ToUpper(signature))
-					}
-					return os.WriteFile(name, data, perm)
-				}
-
-				result := w.Test(context.Background(), mutator.Mutant{
-					ID: 1, File: srcPath, Pkg: "p",
-					StartOffset: len(src) - 1, EndOffset: len(src),
-					Replacement: "X", Status: mutator.StatusPending,
+		for _, write := range writes {
+			t.Run(nameOf.Replace(signature)+"/"+write.name, func(t *testing.T) {
+				runInfraWriteFailure(t, infraWriteCase{
+					srcPath:     srcPath,
+					src:         src,
+					root:        dir,
+					signature:   signature,
+					failOnIndex: write.failOnIndex,
 				})
-				if result.Status != mutator.StatusInfraError {
-					t.Errorf("Status=%v, want InfraError", result.Status)
-				}
-				if result.Duration <= 0 {
-					t.Errorf("Duration=%v, want > 0", result.Duration)
-				}
 			})
 		}
 	}
