@@ -100,15 +100,30 @@ func firstStringLit(args []ast.Expr) (*ast.BasicLit, bool) {
 // and then reading a lookahead byte. Once the code has established that s[i]
 // is a `%`, a lookahead index is pinned to a value it already knows, and a
 // mutation folding that index back onto s[i] is one no test can distinguish.
+//
+// It ranges over a fixed bound and carries the escape across iterations in a
+// flag, rather than walking a cursor it advances itself. A self-advanced
+// cursor gives every mutation of the advance — dropping the post statement,
+// inverting the increment — a loop that never terminates, and since the body
+// appends, those mutants allocate without bound until the host runs out of
+// memory. Under the RSS cap that reads as a timeout; on a memory-tight CI
+// runner it takes the job down with it. A range bound cannot be mutated into
+// non-termination, so every mutant here returns a wrong answer a test can
+// catch instead.
 func wrapVerbOffsets(s string) []int {
 	var out []int
-	for i := 0; i+1 < len(s); i++ {
+	escaped := false
+	for i := range len(s) - 1 {
+		if escaped {
+			escaped = false
+			continue
+		}
 		pair := s[i : i+2]
 		if pair == "%w" {
 			out = append(out, i)
 		}
 		if pair == "%%" {
-			i++
+			escaped = true
 		}
 	}
 	return out
