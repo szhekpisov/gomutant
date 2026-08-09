@@ -77,9 +77,11 @@ type Config struct {
 	// RunMutantID narrows the run to the single mutant with this stable
 	// id (the `id` field of a JSON report entry); a unique prefix is
 	// accepted. Sits beside ChangedSince because both are mutant filters,
-	// though this one is CLI-shaped — a committed config pinning one
-	// mutant would make every later run a no-op.
-	RunMutantID string `yaml:"run-mutant-id"`
+	// but unlike every other field here it is deliberately not YAML-backed:
+	// applyStringFlags only overrides on a non-empty flag, so a committed
+	// `run-mutant-id` would pin every later run to one mutant with no way
+	// to switch it off from the CLI. It is set from --run-mutant-id only.
+	RunMutantID string `yaml:"-"`
 	Cache       string `yaml:"cache"`
 	// CheckpointInterval is how often completed mutant outcomes are
 	// flushed to the cache file mid-run, so a hard kill (OOM, CI timeout,

@@ -860,3 +860,22 @@ func TestApplyFlagsExcludeCallsDefaults(t *testing.T) {
 		t.Error("unset flag wrongly overrode the config value")
 	}
 }
+
+func TestLoadIgnoresRunMutantID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".gomutants.yml")
+	// --run-mutant-id is CLI-only. applyStringFlags only overrides on a
+	// non-empty flag, so a committed key would pin every later run to one
+	// mutant with no CLI value that turns it back off.
+	if err := os.WriteFile(path, []byte("run-mutant-id: \"a.go:F:ARITHMETIC_BASE#1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RunMutantID != "" {
+		t.Errorf("RunMutantID=%q, want empty — the config key must be ignored", cfg.RunMutantID)
+	}
+}

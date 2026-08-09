@@ -821,6 +821,14 @@ Two declarations in one file that render to the same name — most often a secon
 
 The suffix counts occurrences in source order, so inserting a third `func init()` *above* the other two shifts them to `init~2` and `init~3` and hands the new declaration the bare `init` anchor. Unlike a rename, this does not retire the old IDs: they still resolve, but to mutants in a different declaration, so a report diff across that edit reads them as the same mutant changing status. Compare by line as well when a file gains or loses an `init`. Nothing else collides — two same-named functions are a compile error, and a method's anchor carries its receiver type.
 
+`mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
+
+`mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
+
+`mutants_infra_error` is omitted when zero; it counts mutants whose tests could not produce a reliable verdict because gomutants recognized an environmental resource or I/O failure. They stay in `mutants_total` and `mutations_coverage`, but count as neither killed nor lived and are not cached. Per-mutant entries use the status `INFRA ERROR`; Stryker and HTML reports map it to `RuntimeError`.
+
+Because those mutants leave both threshold denominators, a run that hit them is an *incomplete* measurement rather than a passing one. When the count is non-zero gomutants prints a warning on **stderr** before evaluating the gates, so a CI job that keeps only the exit code and the JSON report still sees that the run needs a rerun.
+
 ### Re-running a single mutant
 
 `--run-mutant-id` narrows a run to exactly one mutant, named by the `id` from a previous report. That turns "did the test I just wrote kill it?" into one `go test` instead of the whole package's worth:
@@ -834,7 +842,7 @@ jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
 gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
 ```
 
-A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. Both exit **2**, the same as any other bad invocation.
+A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. All of those exit **2**, the same as any other bad invocation. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
 
 Pair it with a threshold to get a scriptable answer:
 
@@ -842,18 +850,11 @@ Pair it with a threshold to get a scriptable answer:
 gomutants --run-mutant-id "$ID" --threshold-efficacy 100 ./...   # exit 0 = killed, 10 = still alive
 ```
 
-Two behaviors worth knowing:
+Three behaviors worth knowing:
 
 - **The incremental cache is bypassed for that mutant.** A cache hit would replay the previous verdict rather than run anything, which is exactly the wrong answer when you have just edited a test. The fresh verdict is still written back to the cache.
-- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is N mutant test runs instead of one, which is the part that grows with the package.
-
-`mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
-
-`mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
-
-`mutants_infra_error` is omitted when zero; it counts mutants whose tests could not produce a reliable verdict because gomutants recognized an environmental resource or I/O failure. They stay in `mutants_total` and `mutations_coverage`, but count as neither killed nor lived and are not cached. Per-mutant entries use the status `INFRA ERROR`; Stryker and HTML reports map it to `RuntimeError`.
-
-Because those mutants leave both threshold denominators, a run that hit them is an *incomplete* measurement rather than a passing one. When the count is non-zero gomutants prints a warning on **stderr** before evaluating the gates, so a CI job that keeps only the exit code and the JSON report still sees that the run needs a rerun.
+- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is one mutant test run instead of N, which is the part that grows with the package.
+- **A missing verdict exits 1, not 0.** `KILLED` and `LIVED` are the only two statuses that answer the question. If the named mutant comes back `NOT COVERED`, `NOT VIABLE`, `TIMED OUT`, `EQUIVALENT` or `INFRA ERROR`, the thresholds above would see an empty denominator, skip the gate and exit 0 — so a single-mutant run instead fails with the status it got. Ordinary whole-package runs keep the skip-the-gate behavior.
 
 ## Self-efficacy (gomutants on itself)
 

@@ -98,13 +98,15 @@ For up to ~10 surviving mutants (prioritise files with the most survivors):
    ```
    ```
 
-4. If the user accepts a suggestion and adds the test, you can verify it actually kills that mutant without re-running the suite:
+4. If the user accepts a suggestion and adds the test, you can verify it actually kills that mutant without re-testing every other one. Setup is not skipped — coverage collection and the baseline measurement still run the suite — but only the one named mutant is tested after that:
 
    ```
-   gomutants --run-mutant-id '<id>' --threshold-efficacy 100 <same package arg>
+   <gomutants> -quiet \
+     -output /tmp/gomutants-one-mutant.json \
+     --run-mutant-id '<id>' --threshold-efficacy 100 <same package arg>
    ```
 
-   Exit 0 means killed, 10 means it still survives. Report which one you got rather than assuming the test worked.
+   Exit 0 means killed, 10 means it still survives, and any other code means the run produced no verdict — read the error before reporting anything. Report which one you got rather than assuming the test worked. Keep `-output` pointed at `/tmp`: without it the run writes `mutation-report.json` into the user's repo (or overwrites the path their config sets).
 
 ## Step 5 — wrap up
 

@@ -18,6 +18,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/report"
 	"github.com/szhekpisov/gomutants/internal/runner"
 )
@@ -2230,5 +2231,113 @@ func TestRunMutantIDBypassesCache(t *testing.T) {
 	if got.MutantsKilled+got.MutantsLived != 1 {
 		t.Errorf("the mutant should have a fresh verdict, got killed=%d lived=%d",
 			got.MutantsKilled, got.MutantsLived)
+	}
+}
+
+// writeModuleWithFiles creates a module rooted at a temp dir from the
+// given file map, with go.mod written for the caller.
+func writeModuleWithFiles(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	files["go.mod"] = "module testmod\n\ngo 1.26\n"
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func TestRunMutantIDSuppressedIsUsageError(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n" +
+			"\treturn a + b // gomutants:disable ARITHMETIC_BASE reason=\"checked elsewhere\"\n}\n",
+		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	})
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// The id resolves — the directive filter runs after FilterByStableID —
+	// so without the guard this run would test nothing and exit 0.
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (checked elsewhere)`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunMutantIDWithoutVerdictIsError(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		// Sub has no test, so its mutant comes back NOT COVERED: a status
+		// that leaves the efficacy denominator empty and would otherwise
+		// exit 0 through the skipped gate.
+		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n" +
+			"func Sub(a, b int) int {\n\treturn a - b\n}\n",
+		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	})
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Sub:ARITHMETIC_BASE#1",
+		"--threshold-efficacy", "100",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	// Exit 1, not 2: the invocation was fine, the measurement was not.
+	requireExitCode(t, err, exitCodeRuntimeError)
+	want := `--run-mutant-id "add.go:Sub:ARITHMETIC_BASE#1" produced no verdict: the mutant is NOT COVERED`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunMutantDroppedError(t *testing.T) {
+	suppression := func(reason string) []discover.Suppression {
+		return []discover.Suppression{{
+			Mutant: mutator.Mutant{RelFile: "pkg/a.go", Line: 12},
+			Reason: reason,
+		}}
+	}
+	tests := []struct {
+		name         string
+		changedSince string
+		suppressed   []discover.Suppression
+		want         string
+	}{
+		{
+			name:       "suppressed with reason",
+			suppressed: suppression("commutative"),
+			want:       `the mutant matching --run-mutant-id "a#1" is suppressed at pkg/a.go:12 (commutative)`,
+		},
+		{
+			name:       "suppressed without reason",
+			suppressed: suppression(""),
+			want:       `the mutant matching --run-mutant-id "a#1" is suppressed at pkg/a.go:12 (no reason)`,
+		},
+		{
+			name:         "outside the diff",
+			changedSince: "origin/main",
+			want:         `the mutant matching --run-mutant-id "a#1" is not on any line changed since "origin/main"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runMutantDroppedError("a#1", tt.changedSince, tt.suppressed)
+			if got.Error() != tt.want {
+				t.Errorf("error = %q, want %q", got.Error(), tt.want)
+			}
+		})
 	}
 }

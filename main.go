@@ -691,6 +691,13 @@ func run(ctx context.Context, args []string) error {
 				s.Mutant.Type, s.Mutant.RelFile, s.Mutant.Line, reason)
 		}
 	}
+	// FilterByStableID resolved the id, but a later filter can still drop
+	// what it found. Without this the run would test nothing, print
+	// "0 found" and exit 0 — indistinguishable, to a script reading the
+	// exit code, from the mutant having been killed.
+	if cfg.RunMutantID != "" && len(mutants) == 0 {
+		return usageError(runMutantDroppedError(cfg.RunMutantID, cfg.ChangedSince, suppressed))
+	}
 
 	pendingCount := 0
 	notCoveredCount := 0
@@ -944,6 +951,19 @@ func run(ctx context.Context, args []string) error {
 	// mutants fall out the same way, but unlike EQUIVALENT they represent a
 	// *missing* measurement, so the run warns before evaluating the gates.
 	warnInfraErrors(stderr, r)
+	// --run-mutant-id exists to answer one question — "did the test I just
+	// wrote kill this mutant?" — from an exit code. Every status other than
+	// KILLED and LIVED leaves that unanswered, and the gates below would
+	// still exit 0: those statuses drop out of the efficacy denominator,
+	// and a zero denominator skips the gate entirely. Report the non-answer
+	// rather than let a script read it as a kill. mutants holds exactly the
+	// one FilterByStableID returned; anything that empties it has already
+	// returned above.
+	if cfg.RunMutantID != "" {
+		if s := mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
+			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", cfg.RunMutantID, s)
+		}
+	}
 	tested := r.MutantsKilled + r.MutantsLived
 	mcoverDenom := tested + r.MutantsNotCovered
 	mcover := 0.0
@@ -972,6 +992,23 @@ func run(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+// runMutantDroppedError explains which filter dropped the mutant that
+// --run-mutant-id had already resolved. A suppression carries its own
+// reason, written either at the site or by --exclude-calls; when nothing
+// was suppressed, --changed-since is what narrowed the run.
+func runMutantDroppedError(id, changedSince string, suppressed []discover.Suppression) error {
+	if len(suppressed) > 0 {
+		reason := suppressed[0].Reason
+		if reason == "" {
+			reason = "no reason"
+		}
+		return fmt.Errorf("the mutant matching --run-mutant-id %q is suppressed at %s:%d (%s)",
+			id, suppressed[0].Mutant.RelFile, suppressed[0].Mutant.Line, reason)
+	}
+	return fmt.Errorf("the mutant matching --run-mutant-id %q is not on any line changed since %q",
+		id, changedSince)
 }
 
 // warnInfraErrors notes on stderr that part of the run never produced a
