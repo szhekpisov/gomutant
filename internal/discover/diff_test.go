@@ -377,7 +377,6 @@ func TestFilterByDiffPathOutsideGitRoot(t *testing.T) {
 // works on a machine with no global git config, such as a CI runner.
 type gitRepo struct {
 	t   *testing.T
-	ctx context.Context
 	dir string
 }
 
@@ -388,16 +387,18 @@ func newGitRepo(t *testing.T) *gitRepo {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	r := &gitRepo{t: t, ctx: context.Background(), dir: t.TempDir()}
+	r := &gitRepo{t: t, dir: t.TempDir()}
 	r.git("init", "-q", "-b", "main")
 	return r
 }
 
 // git runs one git command in the repository, failing the test if it exits
-// non-zero.
+// non-zero. The context is created per call rather than held on the struct:
+// a stored Context outlives the call it belongs to and cannot be scoped or
+// cancelled by the caller.
 func (r *gitRepo) git(args ...string) {
 	r.t.Helper()
-	cmd := exec.CommandContext(r.ctx, "git", args...)
+	cmd := exec.CommandContext(context.Background(), "git", args...)
 	cmd.Dir = r.dir
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
@@ -433,7 +434,7 @@ func TestRunGitDiffIntegration(t *testing.T) {
 	// Edit line 2 in working tree.
 	r.write("f.go", "package p\nfunc F() int { return 3 + 4 }\n")
 
-	got, err := RunGitDiff(r.ctx, r.dir, "HEAD")
+	got, err := RunGitDiff(context.Background(), r.dir, "HEAD")
 	if err != nil {
 		t.Fatalf("RunGitDiff: %v", err)
 	}
@@ -445,7 +446,7 @@ func TestRunGitDiffIntegration(t *testing.T) {
 	}
 
 	// GitRoot should resolve to dir (canonicalized — macOS /private/ etc.).
-	root, err := GitRoot(r.ctx, r.dir)
+	root, err := GitRoot(context.Background(), r.dir)
 	if err != nil {
 		t.Fatalf("GitRoot: %v", err)
 	}
@@ -462,7 +463,7 @@ func TestRunGitDiffBadRef(t *testing.T) {
 	r.write("f.go", "package p\n")
 	r.commit("init")
 
-	_, err := RunGitDiff(r.ctx, r.dir, "definitely-not-a-real-ref")
+	_, err := RunGitDiff(context.Background(), r.dir, "definitely-not-a-real-ref")
 	if err == nil {
 		t.Fatal("expected error for nonexistent ref")
 	}
@@ -505,7 +506,7 @@ func TestRunGitDiffUsesMergeBase(t *testing.T) {
 	r.write("ours.go", "package p\n\nfunc A() int { return 99 }\n")
 	r.commit("our work")
 
-	got, err := RunGitDiff(r.ctx, r.dir, "main")
+	got, err := RunGitDiff(context.Background(), r.dir, "main")
 	if err != nil {
 		t.Fatalf("RunGitDiff: %v", err)
 	}
@@ -532,7 +533,7 @@ func TestRunGitDiffNoMergeBase(t *testing.T) {
 	r.write("f.go", "package p\n\nfunc A() int { return 2 }\n")
 	r.commit("orphan root")
 
-	_, err := RunGitDiff(r.ctx, r.dir, "main")
+	_, err := RunGitDiff(context.Background(), r.dir, "main")
 	if err == nil {
 		t.Fatal("expected an error when no merge base exists")
 	}
