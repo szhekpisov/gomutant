@@ -143,7 +143,8 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		}
 	}
 
-	// Sort by file, line, column, type for deterministic output.
+	// Sort into candidateLess order: deterministic output, and the total
+	// order the stable-ID ordinals below are counted in.
 	sort.Slice(allCandidates, func(i, j int) bool {
 		return candidateLess(allCandidates[i], allCandidates[j])
 	})

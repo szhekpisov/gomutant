@@ -76,8 +76,8 @@ func funcName(fn *ast.FuncDecl) string {
 // receiverType renders a receiver's type as it appears in source, minus
 // any type parameters and any parentheses: `*Runner` → "*Runner",
 // `Stack[T]` → "Stack", `(T)` → "T". An unrecognized shape yields "", so
-// the anchor degrades to "()." rather than dropping the method's identity
-// entirely.
+// the anchor degrades to "().M": the receiver is lost, but the method name
+// still separates the declaration from its neighbours.
 func receiverType(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.StarExpr:
@@ -141,9 +141,11 @@ func stableID(k ordinalKey, ordinal int) string {
 // top-level package would renumber every ID in a whole-repo report. Anchoring
 // to the module root keeps one mutant's ID the same under every scope.
 //
-// A path outside moduleRoot (or an empty moduleRoot) has no relative form;
-// falling back to absPath keeps the ID unique within the report, which is
-// what the ordinal counter depends on.
+// A path outside moduleRoot still has a relative form — "../other/a.go" —
+// and keeps it. Only a pair filepath.Rel cannot relate at all, such as an
+// empty moduleRoot against an absolute path, falls back to absPath, which
+// keeps the ID unique within the report; that uniqueness is what the
+// ordinal counter depends on.
 func stableIDFile(absPath, moduleRoot string) string {
 	rel, err := filepath.Rel(moduleRoot, absPath)
 	if err != nil {
