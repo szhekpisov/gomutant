@@ -56,6 +56,14 @@ const anchorRepeatSep = "~"
 // name in a file. The first occurrence keeps the bare name: only files that
 // actually repeat a name pay the suffix, which keeps IDs unchanged for the
 // overwhelmingly common case of every declaration being uniquely named.
+//
+// Occurrences are counted in source order, so inserting a new `func init()`
+// above the existing ones shifts their suffixes and gives the newcomer the
+// bare anchor — the old IDs then resolve to a different declaration. Any
+// disambiguator derived from source order has that property; the
+// alternatives (hashing the body, say) instead churn an unedited
+// declaration's own IDs, which is the worse trade. Documented in README.md
+// under the list of edits that change an ID.
 func anchorName(name string, occurrence int) string {
 	if occurrence == 1 {
 		return name
