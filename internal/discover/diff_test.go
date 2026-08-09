@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/token"
 	"os"
@@ -538,10 +539,12 @@ func TestRunGitDiffUsesMergeBase(t *testing.T) {
 	}
 }
 
-// TestRunGitDiffUnrelatedHistoriesFallsBack covers the merge-base fallback:
-// with no common ancestor there is nothing to resolve, and the diff must
-// still run against the ref itself rather than failing.
-func TestRunGitDiffUnrelatedHistoriesFallsBack(t *testing.T) {
+// TestRunGitDiffNoMergeBase covers the no-common-ancestor path. Reporting it
+// is the point: the alternative — quietly falling back to a diff against the
+// ref's tip — is the over-broad scope this whole change exists to remove, and
+// silently producing it would be worse than saying so. The realistic cause is
+// a shallow clone, so the error names that.
+func TestRunGitDiffNoMergeBase(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -578,12 +581,18 @@ func TestRunGitDiffUnrelatedHistoriesFallsBack(t *testing.T) {
 	run("add", ".")
 	run("commit", "-q", "-m", "orphan root")
 
-	got, err := RunGitDiff(ctx, dir, "main")
-	if err != nil {
-		t.Fatalf("RunGitDiff with unrelated histories: %v", err)
+	_, err := RunGitDiff(ctx, dir, "main")
+	if err == nil {
+		t.Fatal("expected an error when no merge base exists")
 	}
-	if len(got["f.go"]) == 0 {
-		t.Errorf("expected a full diff against the ref itself, got %v", got)
+	if !strings.Contains(err.Error(), "fetch-depth: 0") {
+		t.Errorf("error should hint at deepening a shallow clone, got: %v", err)
+	}
+	// The hint wraps git's own failure rather than replacing it, so a caller
+	// can still inspect the exit status behind the advice.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Errorf("error should unwrap to git's *exec.ExitError, got %T", err)
 	}
 }
 
@@ -601,6 +610,12 @@ func TestRunGitDiffNonRepoErrorNoHint(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "git fetch") {
 		t.Errorf("non-repo error should not carry the fetch hint, got: %v", err)
+	}
+	// Nor the shallow-clone hint: git failed before it ever looked for a
+	// merge base, so pointing at fetch-depth would send the reader the
+	// wrong way.
+	if strings.Contains(err.Error(), "fetch-depth: 0") {
+		t.Errorf("non-repo error should not carry the shallow-clone hint, got: %v", err)
 	}
 }
 

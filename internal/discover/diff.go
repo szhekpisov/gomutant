@@ -53,40 +53,28 @@ func looksLikeBadRevision(stderr string) bool {
 		strings.Contains(stderr, "bad revision")
 }
 
-// resolveMergeBase returns the merge base of ref and HEAD — the commit the
-// current branch forked from. Diffing against that instead of the ref's tip
-// is what makes the range match the set of lines a pull request shows: on a
-// branch that is behind its base, `git diff <ref>` also reports every line
-// that landed on the base after the fork, attributing other people's work to
-// this run.
-//
-// Falls back to ref itself on any non-zero exit — no merge base exists
-// (unrelated histories, a repo with no commits), or ref doesn't resolve. In
-// that last case the caller's `git diff` reproduces the failure and owns the
-// diagnostic, so there is nothing to report from here.
-func resolveMergeBase(ctx context.Context, dir, ref string) string {
-	cmd := exec.CommandContext(ctx, "git", "merge-base", ref, "HEAD")
-	cmd.Dir = dir
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return ref
-	}
-	// A zero exit means git printed exactly one commit id, so the trimmed
-	// output is never empty and needs no separate guard.
-	return strings.TrimRight(stdout.String(), "\n")
+// looksLikeMissingMergeBase reports whether stderr indicates git found no
+// common ancestor for ref and HEAD. In practice that means a shallow clone
+// whose history was truncated above the fork point, which is worth naming
+// because the fix is a checkout setting rather than anything about the ref.
+func looksLikeMissingMergeBase(stderr string) bool {
+	return strings.Contains(stderr, "no merge base")
 }
 
-// RunGitDiff executes `git diff --unified=0 <merge-base(ref, HEAD)>` in dir
-// and returns the changed line ranges per file (paths relative to the git
-// root). Lines only deleted at a position (count=0) produce no range — there
-// is nothing to mutate. Renames use the new (b/) path.
+// RunGitDiff executes `git diff --unified=0 --merge-base <ref>` in dir and
+// returns the changed line ranges per file (paths relative to the git root).
+// Lines only deleted at a position (count=0) produce no range — there is
+// nothing to mutate. Renames use the new (b/) path.
 //
-// Errors name the ref the caller passed, not the resolved merge base, which
-// is an implementation detail they never typed.
+// `--merge-base` is what makes the range match the set of lines a pull
+// request shows. It diffs from the commit ref and HEAD diverged at rather
+// than from ref's tip, so a branch that is behind its base does not pick up
+// the lines that landed on the base after the fork — which a plain
+// `git diff <ref>` reports as changed, attributing other people's work to
+// this run. The working tree is still one side of the comparison, so
+// uncommitted edits are included exactly as before.
 func RunGitDiff(ctx context.Context, dir, ref string) (map[string][]LineRange, error) {
-	base := resolveMergeBase(ctx, dir, ref)
-	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", base)
+	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", "--merge-base", ref)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -95,6 +83,9 @@ func RunGitDiff(ctx context.Context, dir, ref string) (map[string][]LineRange, e
 		stderrStr := stderr.String()
 		if looksLikeBadRevision(stderrStr) {
 			return nil, fmt.Errorf("git diff %s: %w\n%s\nhint: %q is not a valid revision in this repo — if it's a remote branch, try `git fetch`", ref, err, stderrStr, ref)
+		}
+		if looksLikeMissingMergeBase(stderrStr) {
+			return nil, fmt.Errorf("git diff %s: %w\n%s\nhint: no common ancestor of %q and HEAD is present — if this is a shallow clone, deepen it (`fetch-depth: 0` on actions/checkout)", ref, err, stderrStr, ref)
 		}
 		return nil, fmt.Errorf("git diff %s: %w\n%s", ref, err, stderrStr)
 	}

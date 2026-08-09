@@ -35,14 +35,22 @@ func TestWrapVerbOffsets(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("wrapVerbOffsets(%q) = %v, want %v", tt.in, got, tt.want)
 			}
-			for _, off := range got {
-				if off < 0 || off+2 > len(tt.in) {
-					t.Fatalf("offset %d out of range for %d-byte input", off, len(tt.in))
-				}
-				if tt.in[off:off+2] != "%w" {
-					t.Errorf("offset %d points at %q, want %q", off, tt.in[off:off+2], "%w")
-				}
-			}
+			assertOffsetsPointAtWrapVerb(t, tt.in, got)
 		})
+	}
+}
+
+// assertOffsetsPointAtWrapVerb checks that every returned offset addresses a
+// real `%w` in s, which is the property the mutator relies on to build a
+// patch range.
+func assertOffsetsPointAtWrapVerb(t *testing.T, s string, offsets []int) {
+	t.Helper()
+	for _, off := range offsets {
+		if off < 0 || off+2 > len(s) {
+			t.Fatalf("offset %d out of range for %d-byte input", off, len(s))
+		}
+		if s[off:off+2] != "%w" {
+			t.Errorf("offset %d points at %q, want %q", off, s[off:off+2], "%w")
+		}
 	}
 }
