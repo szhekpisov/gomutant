@@ -804,9 +804,18 @@ Each entry under `files[].mutations[]` looks like this:
 }
 ```
 
-`id` is a stable handle for one mutant, formatted `file:function:TYPE#n`. The function segment is the enclosing declaration — `(*T).Method` for methods, empty for package-level declarations, and the enclosing function (not the literal) for mutants inside a closure. `n` counts mutants sharing those three fields, in source order.
+`id` is a stable handle for one mutant, formatted `file:function:TYPE#n`. The file segment is the path relative to the module root. Unlike the enclosing entry's `file_name`, which stays gremlins-compatible by dropping the import-path prefix shared by the packages in the run, it does not depend on which packages you asked for — so the same mutant carries the same `id` under `gomutants ./...` and under `gomutants ./internal/runner/`. The function segment is the enclosing declaration — `(*T).Method` for methods, empty for package-level declarations, and the enclosing function (not the literal) for mutants inside a closure. `n` counts mutants sharing those three fields, in source order.
 
-Because the ID is anchored to a function rather than a line, it survives edits elsewhere in the file: adding imports, reformatting, or changing a neighbouring function all leave it untouched, so two runs' reports can be diffed entry by entry to see which mutants are *still* alive. It does change when the enclosing function is renamed, or when a same-type mutation point is added or removed earlier in that same function. IDs are unique within a report. The Stryker and HTML reports use the same string as their mutant `id`.
+Because the ID is anchored to a function rather than a line, it survives edits elsewhere in the file: adding imports, reformatting, or changing a neighbouring function all leave it untouched, so two runs' reports can be diffed entry by entry to see which mutants are *still* alive. IDs are unique within a report. The Stryker and HTML reports use the same string as their mutant `id`.
+
+An ID does change when:
+
+- the enclosing function is renamed, or its receiver type changes;
+- a same-type mutation point is added or removed earlier in that same function;
+- the file is renamed or moved;
+- a same-type mutation point is added or removed earlier in the same file, for the package-level declarations that share the empty function segment. Mutants inside functions are unaffected.
+
+Two declarations in one file that render to the same name — most often a second `func init()` — are told apart by an occurrence suffix: `init`, then `init~2`. They do not share a counter, so an edit inside the first leaves the second's IDs alone.
 
 `mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 

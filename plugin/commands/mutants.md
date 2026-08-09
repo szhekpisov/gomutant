@@ -71,7 +71,7 @@ Read `/tmp/gomutants-report.json`. Schema:
 }
 ```
 
-`id` is a stable per-mutant handle, formatted `file:function:TYPE#n`. It is anchored to the enclosing function rather than to a line, so it stays the same across runs even when the file is reformatted or edited elsewhere — carry it into your output so the user can match a suggestion to the same mutant on a later run.
+`id` is a stable per-mutant handle, formatted `file:function:TYPE#n`, where the file part is relative to the module root. It is anchored to the enclosing function rather than to a line, and does not depend on which packages the run was scoped to, so it stays the same across runs even when the file is reformatted, edited elsewhere, or covered by a different package argument — carry it into your output so the user can match a suggestion to the same mutant on a later run.
 
 Filter to `status == "LIVED"`. Note the `NOT COVERED` count per file separately as a secondary signal — those mutants no test even exercises. Count `INFRA ERROR` entries separately as an incomplete environmental outcome; they are intentionally excluded from test proposals and the incremental cache.
 

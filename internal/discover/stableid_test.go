@@ -157,7 +157,7 @@ func TestAnchorForNoSpans(t *testing.T) {
 }
 
 func TestStableIDFormat(t *testing.T) {
-	k := ordinalKey{relFile: "internal/cli/cli.go", anchor: "parseArgs", typ: mutator.ConditionalsBoundary}
+	k := ordinalKey{file: "internal/cli/cli.go", anchor: "parseArgs", typ: mutator.ConditionalsBoundary}
 	want := "internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2"
 	if got := stableID(k, 2); got != want {
 		t.Errorf("stableID=%q, want %q", got, want)
@@ -299,5 +299,165 @@ func G() int {
 			t.Errorf("mutants[%d].StableID changed across a line shift: %q → %q",
 				i, before[i].StableID, after[i].StableID)
 		}
+	}
+}
+
+func TestAnchorName(t *testing.T) {
+	// The first occurrence is bare; only a repeat pays the suffix.
+	if got := anchorName("init", 1); got != "init" {
+		t.Errorf("anchorName(init, 1)=%q, want %q", got, "init")
+	}
+	if got := anchorName("init", 2); got != "init~2" {
+		t.Errorf("anchorName(init, 2)=%q, want %q", got, "init~2")
+	}
+	if got := anchorName("(*B).Same", 3); got != "(*B).Same~3" {
+		t.Errorf("anchorName((*B).Same, 3)=%q, want %q", got, "(*B).Same~3")
+	}
+}
+
+func TestFuncSpansDisambiguatesRepeatedNames(t *testing.T) {
+	// Two `func init()` are legal Go and render to the same name. Left
+	// sharing an anchor they would also share an ordinal counter, so an
+	// edit inside the first would renumber the second's mutants.
+	fset, f := parseSrc(t, "p.go", `package p
+
+func init() {}
+
+func F() {}
+
+func init() {}
+`)
+	spans := funcSpans(fset, f)
+	want := []string{"init", "F", "init~2"}
+	if len(spans) != len(want) {
+		t.Fatalf("len(spans)=%d, want %d", len(spans), len(want))
+	}
+	for i, w := range want {
+		if spans[i].name != w {
+			t.Errorf("spans[%d].name=%q, want %q", i, spans[i].name, w)
+		}
+	}
+}
+
+func TestDiscoverStableIDsSurviveEditsToASameNamedNeighbour(t *testing.T) {
+	// Adding a mutation point to the *first* init() must leave the second
+	// init()'s ID alone — the guarantee the README states for edits outside
+	// a function.
+	before := discoverArithmetic(t, map[string]string{"p.go": `package p
+
+func init() { _ = 1 + 2 }
+
+func init() { _ = 3 + 4 }
+`})
+	after := discoverArithmetic(t, map[string]string{"p.go": `package p
+
+func init() { _ = 1 + 2; _ = 5 + 6 }
+
+func init() { _ = 3 + 4 }
+`})
+
+	if len(before) != 2 {
+		t.Fatalf("len(before)=%d, want 2", len(before))
+	}
+	if len(after) != 3 {
+		t.Fatalf("len(after)=%d, want 3", len(after))
+	}
+	if before[0].StableID != "p.go:init:ARITHMETIC_BASE#1" {
+		t.Errorf("before[0].StableID=%q, want %q", before[0].StableID, "p.go:init:ARITHMETIC_BASE#1")
+	}
+	if before[1].StableID != "p.go:init~2:ARITHMETIC_BASE#1" {
+		t.Errorf("before[1].StableID=%q, want %q", before[1].StableID, "p.go:init~2:ARITHMETIC_BASE#1")
+	}
+	// The added mutant takes #2 inside the first init(); the second init()
+	// keeps #1 because it counts against its own anchor.
+	if after[1].StableID != "p.go:init:ARITHMETIC_BASE#2" {
+		t.Errorf("after[1].StableID=%q, want %q", after[1].StableID, "p.go:init:ARITHMETIC_BASE#2")
+	}
+	if after[2].StableID != before[1].StableID {
+		t.Errorf("second init()'s StableID shifted: %q → %q", before[1].StableID, after[2].StableID)
+	}
+}
+
+func TestStableIDFile(t *testing.T) {
+	// The ordinary case: a path under the module root renders relative.
+	if got := stableIDFile(filepath.Join("/mod", "internal", "a", "a.go"), "/mod"); got != "internal/a/a.go" {
+		t.Errorf("stableIDFile under root=%q, want %q", got, "internal/a/a.go")
+	}
+	// An empty module root has no relative form, so the absolute path stands
+	// in. It still differs per file, which is all the ordinal counter needs.
+	abs := filepath.Join("/elsewhere", "a.go")
+	if got := stableIDFile(abs, ""); got != filepath.ToSlash(abs) {
+		t.Errorf("stableIDFile with empty root=%q, want %q", got, filepath.ToSlash(abs))
+	}
+}
+
+// discoverArithmeticMulti runs Discover over a module root holding one
+// package per entry of pkgFiles (keyed by directory relative to the root),
+// scoped to the named packages. It exists to vary the *package argument*
+// while holding the source fixed.
+func discoverArithmeticMulti(t *testing.T, pkgFiles map[string]map[string]string, scope []string) []mutator.Mutant {
+	t.Helper()
+	root := t.TempDir()
+	byDir := make(map[string]Package, len(pkgFiles))
+	for dir, files := range pkgFiles {
+		abs := filepath.Join(root, dir)
+		if err := os.MkdirAll(abs, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(files))
+		for name, src := range files {
+			if err := os.WriteFile(filepath.Join(abs, name), []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, name)
+		}
+		byDir[dir] = Package{Dir: abs, ImportPath: "example.com/test/" + dir, GoFiles: names}
+	}
+
+	pkgs := make([]Package, 0, len(scope))
+	for _, dir := range scope {
+		pkgs = append(pkgs, byDir[dir])
+	}
+	reg := mutator.NewRegistry()
+	fset := token.NewFileSet()
+	return Discover(fset, pkgs, reg.EnabledMutators([]string{"ARITHMETIC_BASE"}, nil), root, "example.com/test").Mutants
+}
+
+func TestDiscoverStableIDsAreIndependentOfThePackageArgument(t *testing.T) {
+	// Same source, two scopes: the narrow run mirrors `gomutants ./a/`, the
+	// wide one `gomutants ./...`. RelFile is a gremlins-compat path derived
+	// from the packages in the run, so it differs between them; the stable
+	// ID must not, or an id copied out of a whole-repo report would not
+	// resolve under a per-package run.
+	files := map[string]map[string]string{
+		"a":   {"a.go": "package a\n\nfunc F() int {\n\treturn 1 + 2\n}\n"},
+		"cmd": {"main.go": "package cmd\n\nfunc G() int {\n\treturn 3 + 4\n}\n"},
+	}
+
+	narrow := discoverArithmeticMulti(t, files, []string{"a"})
+	wide := discoverArithmeticMulti(t, files, []string{"a", "cmd"})
+
+	if len(narrow) != 1 {
+		t.Fatalf("len(narrow)=%d, want 1", len(narrow))
+	}
+	if len(wide) != 2 {
+		t.Fatalf("len(wide)=%d, want 2", len(wide))
+	}
+
+	const wantID = "a/a.go:F:ARITHMETIC_BASE#1"
+	if narrow[0].StableID != wantID {
+		t.Errorf("narrow StableID=%q, want %q", narrow[0].StableID, wantID)
+	}
+	if wide[0].StableID != wantID {
+		t.Errorf("wide StableID=%q, want %q", wide[0].StableID, wantID)
+	}
+
+	// The gremlins-compat RelFile is left alone, and still varies with the
+	// scope — which is exactly why the ID needed its own path.
+	if narrow[0].RelFile != "a.go" {
+		t.Errorf("narrow RelFile=%q, want %q", narrow[0].RelFile, "a.go")
+	}
+	if wide[0].RelFile != "a/a.go" {
+		t.Errorf("wide RelFile=%q, want %q", wide[0].RelFile, "a/a.go")
 	}
 }

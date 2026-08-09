@@ -176,9 +176,9 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		coverageFile := pkg + "/" + filepath.Base(absPath)
 
 		key := ordinalKey{
-			relFile: relPath,
-			anchor:  anchorFor(spansByFile[absPath], c.Pos.Offset),
-			typ:     c.Type,
+			file:   stableIDFile(absPath, moduleRoot),
+			anchor: anchorFor(spansByFile[absPath], c.Pos.Offset),
+			typ:    c.Type,
 		}
 		ordinals[key]++
 
