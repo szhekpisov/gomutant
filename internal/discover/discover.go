@@ -225,8 +225,20 @@ func parseFile(fset *token.FileSet, path string) ([]byte, *ast.File, error) {
 	return src, file, nil
 }
 
-// candidateLess orders candidates by (file, line, column, type) so
-// Discover produces deterministic output regardless of the AST-walk order.
+// candidateLess orders candidates by (file, line, column, type, end offset,
+// replacement) so Discover produces deterministic output regardless of the
+// AST-walk order.
+//
+// The last two fields make the order total, which the stable-ID ordinals
+// depend on. Position and type alone do not separate every candidate: in a
+// nested boolean expression like `a && b && c`, EXPRESSION_REMOVE emits one
+// candidate for the outer left operand (`a && b`) and one for the inner
+// (`a`), both starting at `a`. Left tied, sort.Slice — which is not stable —
+// could order them either way, and the two would swap the `#1` and `#2`
+// suffixes of an otherwise identical ID, so the same string would name a
+// different mutation from run to run. End offset separates them by span,
+// innermost first; replacement is a final backstop for same-type candidates
+// covering the identical span.
 //
 // Each field is compared with a < / > pair (no `!=` guard). The pattern
 // keeps every `<` mutation observable: a guarded `if a != b { return a < b }`
@@ -251,7 +263,19 @@ func candidateLess(a, b mutator.MutantCandidate) bool {
 	if a.Pos.Column > b.Pos.Column {
 		return false
 	}
-	return a.Type < b.Type
+	if a.Type < b.Type {
+		return true
+	}
+	if a.Type > b.Type {
+		return false
+	}
+	if a.EndOffset < b.EndOffset {
+		return true
+	}
+	if a.EndOffset > b.EndOffset {
+		return false
+	}
+	return a.Replacement < b.Replacement
 }
 
 // computeRelFile produces a gremlins-compatible module-relative path.

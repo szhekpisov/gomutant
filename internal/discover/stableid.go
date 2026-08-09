@@ -74,13 +74,16 @@ func funcName(fn *ast.FuncDecl) string {
 }
 
 // receiverType renders a receiver's type as it appears in source, minus
-// any type parameters: `*Runner` → "*Runner", `Stack[T]` → "Stack".
-// An unrecognized shape yields "", so the anchor degrades to "()." rather
-// than dropping the method's identity entirely.
+// any type parameters and any parentheses: `*Runner` → "*Runner",
+// `Stack[T]` → "Stack", `(T)` → "T". An unrecognized shape yields "", so
+// the anchor degrades to "()." rather than dropping the method's identity
+// entirely.
 func receiverType(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.StarExpr:
 		return "*" + receiverType(t.X)
+	case *ast.ParenExpr: // Legal but rare: func (x (T)) M().
+		return receiverType(t.X)
 	case *ast.IndexExpr: // Generic receiver: Stack[T].
 		return receiverType(t.X)
 	case *ast.IndexListExpr: // Generic receiver: Pair[K, V].

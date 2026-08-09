@@ -945,6 +945,11 @@ func TestCandidateLessTieBreakers(t *testing.T) {
 			Pos:  mutator.Position{Filename: file, Line: line, Column: col},
 		}
 	}
+	withEnd := func(c mutator.MutantCandidate, end int, repl string) mutator.MutantCandidate {
+		c.EndOffset = end
+		c.Replacement = repl
+		return c
+	}
 	tests := []struct {
 		name string
 		a, b mutator.MutantCandidate
@@ -968,6 +973,10 @@ func TestCandidateLessTieBreakers(t *testing.T) {
 		// Column `>` is decisive (equal file/line, a.col > b.col);
 		// BRANCH_IF on its body would fall through to type-`<` and return true.
 		{"eqLine aColGtTypeLt", mk("/f", 4, 9, mutator.ArithmeticBase), mk("/f", 4, 1, mutator.InvertNegatives), false},
+		// Type `>` is decisive (equal position, a.type > b.type); BRANCH_IF
+		// on its body would fall through to end-offset-`<` and return true.
+		{"eqPos aTypeGtEndLt", withEnd(mk("/f", 4, 5, mutator.InvertNegatives), 10, ""),
+			withEnd(mk("/f", 4, 5, mutator.ArithmeticBase), 20, ""), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -989,7 +998,44 @@ func TestCandidateLessEqualCandidates(t *testing.T) {
 		Pos:  mutator.Position{Filename: "/abs/f.go", Line: 4, Column: 11},
 	}
 	if got := candidateLess(a, a); got {
-		t.Errorf("candidateLess(x, x) = true, want false — CONDITIONALS_BOUNDARY on the final `a.Type < b.Type` flips equal to true")
+		t.Errorf("candidateLess(x, x) = true, want false — CONDITIONALS_BOUNDARY on the final `a.Replacement < b.Replacement` flips equal to true")
+	}
+}
+
+// TestCandidateLessSpanTieBreakers covers the two comparisons that make the
+// order total. They are what stops two candidates at the same position and
+// type from tying, which an unstable sort would then be free to order either
+// way — swapping the ordinal suffixes of their stable IDs.
+func TestCandidateLessSpanTieBreakers(t *testing.T) {
+	mk := func(end int, repl string) mutator.MutantCandidate {
+		return mutator.MutantCandidate{
+			Type:        mutator.ExpressionRemove,
+			Pos:         mutator.Position{Filename: "/f.go", Line: 4, Column: 9},
+			EndOffset:   end,
+			Replacement: repl,
+		}
+	}
+	tests := []struct {
+		name string
+		a, b mutator.MutantCandidate
+		want bool
+	}{
+		// Equal position and type: the narrower span sorts first.
+		{"aEndLt", mk(48, "true"), mk(53, "true"), true},
+		{"aEndGt", mk(53, "true"), mk(48, "true"), false},
+		// End offset `>` is decisive; BRANCH_IF on its body would fall
+		// through to the replacement compare and return true here.
+		{"aEndGtReplLt", mk(53, "aaa"), mk(48, "zzz"), false},
+		// Identical span: replacement is the last resort.
+		{"eqSpanReplLt", mk(48, "false"), mk(48, "true"), true},
+		{"eqSpanReplGt", mk(48, "true"), mk(48, "false"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := candidateLess(tt.a, tt.b); got != tt.want {
+				t.Errorf("candidateLess = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

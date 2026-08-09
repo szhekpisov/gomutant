@@ -116,6 +116,31 @@ func TestReceiverTypeUnrecognized(t *testing.T) {
 	}
 }
 
+func TestReceiverTypeParenthesized(t *testing.T) {
+	// `func (x (T)) M()` and `func (x (*T)) M()` are legal Go; the parser
+	// hands back an *ast.ParenExpr. Without unwrapping it the receiver falls
+	// to the unrecognized branch, so every parenthesized receiver in a file
+	// collapses onto the same "().M" anchor and shares one ordinal counter.
+	fset, f := parseSrc(t, "p.go", `package p
+
+type T struct{}
+
+func (x (T)) M() int { return 1 + 2 }
+
+func (y (*T)) N() int { return 3 + 4 }
+`)
+	spans := funcSpans(fset, f)
+	want := []string{"(T).M", "(*T).N"}
+	if len(spans) != len(want) {
+		t.Fatalf("len(spans)=%d, want %d", len(spans), len(want))
+	}
+	for i, w := range want {
+		if spans[i].name != w {
+			t.Errorf("spans[%d].name=%q, want %q", i, spans[i].name, w)
+		}
+	}
+}
+
 func TestAnchorFor(t *testing.T) {
 	spans := []funcSpan{
 		{start: 10, end: 20, name: "f"},
@@ -298,6 +323,51 @@ func G() int {
 		if before[i].StableID != after[i].StableID {
 			t.Errorf("mutants[%d].StableID changed across a line shift: %q → %q",
 				i, before[i].StableID, after[i].StableID)
+		}
+	}
+}
+
+func TestDiscoverStableIDsSeparateNestedBooleanOperands(t *testing.T) {
+	// `a && b && c` parses as `(a && b) && c`, so EXPRESSION_REMOVE emits a
+	// candidate for the outer left operand (`a && b`) and one for the inner
+	// (`a`) — same file, line, column and type. Position alone cannot order
+	// them, and sort.Slice is not stable, so without the span tiebreak the
+	// #1/#2 suffixes could swap and each id would name a different mutation
+	// from run to run.
+	dir := t.TempDir()
+	src := `package p
+
+func F(a, b, c bool) bool {
+	return a && b && c
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "p.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgs := []Package{{Dir: dir, ImportPath: "example.com/test/p", GoFiles: []string{"p.go"}}}
+	reg := mutator.NewRegistry()
+	mutants := Discover(token.NewFileSet(), pkgs,
+		reg.EnabledMutators([]string{"EXPRESSION_REMOVE"}, nil), dir, "example.com/test").Mutants
+
+	if len(mutants) != 4 {
+		t.Fatalf("len(mutants)=%d, want 4", len(mutants))
+	}
+
+	// The narrower span takes #1: `a` before `a && b`, both starting at
+	// column 9. Pinning Original alongside the id is what makes a swap fail
+	// here rather than silently rename the two mutants.
+	want := []struct{ id, original string }{
+		{"p.go:F:EXPRESSION_REMOVE#1", "a"},
+		{"p.go:F:EXPRESSION_REMOVE#2", "a && b"},
+		{"p.go:F:EXPRESSION_REMOVE#3", "b"},
+		{"p.go:F:EXPRESSION_REMOVE#4", "c"},
+	}
+	for i, w := range want {
+		if mutants[i].StableID != w.id {
+			t.Errorf("mutants[%d].StableID=%q, want %q", i, mutants[i].StableID, w.id)
+		}
+		if mutants[i].Original != w.original {
+			t.Errorf("mutants[%d].Original=%q, want %q", i, mutants[i].Original, w.original)
 		}
 	}
 }
