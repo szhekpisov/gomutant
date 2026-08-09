@@ -266,6 +266,7 @@ func run(ctx context.Context, args []string) error {
 		excludeFiles      string
 		excludeCalls      string
 		changedSince      string
+		runMutantID       string
 		cachePath         string
 		annotations       string
 		strykerOutput     string
@@ -353,6 +354,10 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	})
 	fs.StringVar(&changedSince, "changed-since", "", "only test mutants on lines changed vs git ref (e.g. main, HEAD~1)")
+	// The back-quoted `id` is the value placeholder flag's UnquoteUsage
+	// prints in --help; see the --test-flags comment above for why its
+	// position within the string matters.
+	fs.StringVar(&runMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
 	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source and tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
 	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
 	fs.StringVar(&strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
@@ -415,6 +420,7 @@ func run(ctx context.Context, args []string) error {
 		ExcludeFiles:       excludeFiles,
 		ExcludeCalls:       excludeCalls,
 		ChangedSince:       changedSince,
+		RunMutantID:        runMutantID,
 		Cache:              cachePath,
 		DryRun:             dryRun,
 		Verbose:            verbose,
@@ -644,6 +650,16 @@ func run(ctx context.Context, args []string) error {
 	fset := token.NewFileSet()
 	discovered := discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
 	mutants := discovered.Mutants
+	// --run-mutant-id runs before every other filter so that "no mutant
+	// matches this id" is diagnosed against the full discovered set rather
+	// than against whatever --changed-since happened to leave behind.
+	// Both drop mutants, so the order doesn't change the intersection.
+	if cfg.RunMutantID != "" {
+		mutants, err = discover.FilterByStableID(mutants, cfg.RunMutantID)
+		if err != nil {
+			return usageError(err)
+		}
+	}
 	if cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, projectDir)
 		if err != nil {
@@ -766,7 +782,17 @@ func run(ctx context.Context, args []string) error {
 			return files
 		}
 
-		if hits := loadedCache.Lookup(mutants, hasher, testFilesFor); hits > 0 {
+		// --run-mutant-id skips the lookup, not the resolver above: the
+		// point of naming one mutant is to measure it again after editing
+		// a test, and a cache hit would replay the previous verdict
+		// instead of running anything. testFilesFor is still needed by
+		// checkpoint's loadedCache.Update, so the fresh verdict lands in
+		// the cache file as usual.
+		hits := 0
+		if cfg.RunMutantID == "" {
+			hits = loadedCache.Lookup(mutants, hasher, testFilesFor)
+		}
+		if hits > 0 {
 			pendingCount -= hits
 			// When equivalence detection is off this run, a cached EQUIVALENT
 			// must not surface — report the survivor honestly as LIVED. The

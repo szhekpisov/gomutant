@@ -229,6 +229,7 @@ func TestApplyFlags(t *testing.T) {
 		Only:               "ARITHMETIC_BASE",
 		ExcludeFiles:       "vendor/, _gen\\.go",
 		ChangedSince:       "main",
+		RunMutantID:        "a.go:F:ARITHMETIC_BASE#1",
 		Cache:              "cache.json",
 		DryRun:             true,
 		Verbose:            true,
@@ -280,6 +281,9 @@ func TestApplyFlags(t *testing.T) {
 	}
 	if cfg.ChangedSince != "main" {
 		t.Errorf("ChangedSince=%q, want main", cfg.ChangedSince)
+	}
+	if cfg.RunMutantID != "a.go:F:ARITHMETIC_BASE#1" {
+		t.Errorf("RunMutantID=%q", cfg.RunMutantID)
 	}
 	if cfg.Cache != "cache.json" {
 		t.Errorf("Cache=%q, want cache.json", cfg.Cache)

@@ -2108,3 +2108,127 @@ func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
 		t.Errorf("error should name the flag, got: %v", err)
 	}
 }
+
+func TestRunUnknownMutantIDIsUsageError(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	// Exit 2, not 1: naming a mutant that doesn't exist is a bad
+	// invocation, in the same class as an unknown flag.
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("error should explain the id matched nothing, got: %v", err)
+	}
+}
+
+func TestRunAmbiguousMutantIDIsUsageError(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// setupTinyProject's Add has one `+`, so widen the mutator set to get
+	// several mutants under one file prefix.
+	err := run(context.Background(), []string{
+		"--run-mutant-id", "add.go:",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error should report the prefix as ambiguous, got: %v", err)
+	}
+}
+
+func TestRunMutantIDNarrowsToOneMutant(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// First a full run, to learn a real id from the report rather than
+	// hard-coding one the anchoring scheme might later change.
+	full := filepath.Join(dir, "full.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache=off", "-o", full, "testmod",
+	}); err != nil {
+		t.Fatalf("full run: %v", err)
+	}
+	r := loadReport(t, full)
+	if len(r.Files) == 0 || len(r.Files[0].Mutations) == 0 {
+		t.Fatalf("full run produced no mutations: %+v", r.Files)
+	}
+	id := r.Files[0].Mutations[0].ID
+
+	one := filepath.Join(dir, "one.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache=off",
+		"--run-mutant-id", id, "-o", one, "testmod",
+	}); err != nil {
+		t.Fatalf("single-mutant run: %v", err)
+	}
+
+	got := loadReport(t, one)
+	total := 0
+	for _, f := range got.Files {
+		total += len(f.Mutations)
+	}
+	if total != 1 {
+		t.Fatalf("single-mutant run reported %d mutations, want 1", total)
+	}
+	if got.Files[0].Mutations[0].ID != id {
+		t.Errorf("reported id=%q, want %q", got.Files[0].Mutations[0].ID, id)
+	}
+	if got.MutantsTotal != 1 {
+		t.Errorf("MutantsTotal=%d, want 1", got.MutantsTotal)
+	}
+}
+
+func TestRunMutantIDBypassesCache(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	cachePath := filepath.Join(dir, "cache.json")
+	full := filepath.Join(dir, "full.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache", cachePath, "-o", full, "testmod",
+	}); err != nil {
+		t.Fatalf("warming run: %v", err)
+	}
+	id := loadReport(t, full).Files[0].Mutations[0].ID
+
+	// Same source, warm cache: an ordinary re-run would replay the stored
+	// verdict. --run-mutant-id must measure it again instead, or the
+	// write-a-test/did-it-die loop would report stale results.
+	one := filepath.Join(dir, "one.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache", cachePath,
+		"--run-mutant-id", id, "-o", one, "testmod",
+	}); err != nil {
+		t.Fatalf("single-mutant run: %v", err)
+	}
+
+	got := loadReport(t, one)
+	if got.MutantsCached != 0 {
+		t.Errorf("MutantsCached=%d, want 0 — --run-mutant-id must skip the cache lookup", got.MutantsCached)
+	}
+	if got.MutantsTotal != 1 {
+		t.Fatalf("MutantsTotal=%d, want 1", got.MutantsTotal)
+	}
+	if got.MutantsKilled+got.MutantsLived != 1 {
+		t.Errorf("the mutant should have a fresh verdict, got killed=%d lived=%d",
+			got.MutantsKilled, got.MutantsLived)
+	}
+}

@@ -98,6 +98,14 @@ For up to ~10 surviving mutants (prioritise files with the most survivors):
    ```
    ```
 
+4. If the user accepts a suggestion and adds the test, you can verify it actually kills that mutant without re-running the suite:
+
+   ```
+   gomutants --run-mutant-id '<id>' --threshold-efficacy 100 <same package arg>
+   ```
+
+   Exit 0 means killed, 10 means it still survives. Report which one you got rather than assuming the test worked.
+
 ## Step 5 — wrap up
 
 End with a two-line summary:

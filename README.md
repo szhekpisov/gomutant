@@ -598,6 +598,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--exclude-calls` | | | Comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. `log.Print*,*.Debug`). Anchored; `*` is the only metacharacter. Extends the built-in stdlib-logging set. Suppressed mutants are dropped before any test runs. See [Call-Site Exclusion](#call-site-exclusion). |
 | `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
 | `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
+| `--run-mutant-id` | | | Run only the mutant with this stable `id` (the `id` field of a report entry); a unique prefix is accepted. Skips the incremental cache for that mutant. See [Re-running a single mutant](#re-running-a-single-mutant) |
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
@@ -819,6 +820,32 @@ An ID does change when:
 Two declarations in one file that render to the same name — most often a second `func init()` — are told apart by an occurrence suffix: `init`, then `init~2`. They do not share a counter, so an edit inside the first leaves the second's IDs alone.
 
 The suffix counts occurrences in source order, so inserting a third `func init()` *above* the other two shifts them to `init~2` and `init~3` and hands the new declaration the bare `init` anchor. Unlike a rename, this does not retire the old IDs: they still resolve, but to mutants in a different declaration, so a report diff across that edit reads them as the same mutant changing status. Compare by line as well when a file gains or loses an `init`. Nothing else collides — two same-named functions are a compile error, and a method's anchor carries its receiver type.
+
+### Re-running a single mutant
+
+`--run-mutant-id` narrows a run to exactly one mutant, named by the `id` from a previous report. That turns "did the test I just wrote kill it?" into one `go test` instead of the whole package's worth:
+
+```sh
+# 1. Full run. Pick a survivor's id out of the report.
+gomutants -o report.json ./...
+jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
+
+# 2. Write a test, then re-run just that mutant.
+gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
+```
+
+A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. Both exit **2**, the same as any other bad invocation.
+
+Pair it with a threshold to get a scriptable answer:
+
+```sh
+gomutants --run-mutant-id "$ID" --threshold-efficacy 100 ./...   # exit 0 = killed, 10 = still alive
+```
+
+Two behaviors worth knowing:
+
+- **The incremental cache is bypassed for that mutant.** A cache hit would replay the previous verdict rather than run anything, which is exactly the wrong answer when you have just edited a test. The fresh verdict is still written back to the cache.
+- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is N mutant test runs instead of one, which is the part that grows with the package.
 
 `mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 

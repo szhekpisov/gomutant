@@ -74,7 +74,13 @@ type Config struct {
 	// false to narrow or fully replace the built-ins.
 	ExcludeCallsDefaults *bool  `yaml:"exclude-calls-defaults"`
 	ChangedSince         string `yaml:"changed-since"`
-	Cache                string `yaml:"cache"`
+	// RunMutantID narrows the run to the single mutant with this stable
+	// id (the `id` field of a JSON report entry); a unique prefix is
+	// accepted. Sits beside ChangedSince because both are mutant filters,
+	// though this one is CLI-shaped — a committed config pinning one
+	// mutant would make every later run a no-op.
+	RunMutantID string `yaml:"run-mutant-id"`
+	Cache       string `yaml:"cache"`
 	// CheckpointInterval is how often completed mutant outcomes are
 	// flushed to the cache file mid-run, so a hard kill (OOM, CI timeout,
 	// SIGKILL) loses at most this much progress. 0 disables periodic
@@ -356,6 +362,7 @@ type Flags struct {
 	ExcludeFiles       string
 	ExcludeCalls       string
 	ChangedSince       string
+	RunMutantID        string
 	Cache              string
 	DryRun             bool
 	Verbose            bool
@@ -432,6 +439,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.ChangedSince != "" {
 		c.ChangedSince = f.ChangedSince
+	}
+	if f.RunMutantID != "" {
+		c.RunMutantID = f.RunMutantID
 	}
 	if f.Cache != "" {
 		c.Cache = f.Cache
