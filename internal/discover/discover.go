@@ -119,6 +119,10 @@ type Result struct {
 func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string) *Result {
 	var allCandidates []mutator.MutantCandidate
 	files := make(map[string]*ParsedFile)
+	// Function spans per file, for resolving each candidate's stable-ID
+	// anchor. Kept local rather than on ParsedFile so the parse cache's
+	// contract stays unchanged.
+	spansByFile := make(map[string][]funcSpan)
 
 	for _, pkg := range pkgs {
 		for _, filename := range pkg.GoFiles {
@@ -131,6 +135,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 				continue
 			}
 			files[absPath] = &ParsedFile{Src: src, File: file}
+			spansByFile[absPath] = funcSpans(fset, file)
 			for _, m := range mutators {
 				candidates := m.Discover(fset, file, src)
 				allCandidates = append(allCandidates, candidates...)
@@ -156,8 +161,10 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 	// then RelFile for "github.com/foo/bar/pkg/diffyml/cli/cli.go" is "cli/cli.go".
 	commonPrefix := longestCommonPrefix(pkgs)
 
-	// Convert candidates to mutants.
+	// Convert candidates to mutants. The loop runs in candidateLess order,
+	// so the per-group ordinals feeding stable IDs are deterministic.
 	mutants := make([]mutator.Mutant, len(allCandidates))
+	ordinals := make(map[ordinalKey]int)
 	for i, c := range allCandidates {
 		absPath := c.Pos.Filename
 		pkg := filePkg[absPath]
@@ -168,8 +175,16 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		// Coverage profile path: ImportPath/filename.
 		coverageFile := pkg + "/" + filepath.Base(absPath)
 
+		key := ordinalKey{
+			relFile: relPath,
+			anchor:  anchorFor(spansByFile[absPath], c.Pos.Offset),
+			typ:     c.Type,
+		}
+		ordinals[key]++
+
 		mutants[i] = mutator.Mutant{
 			ID:           i + 1,
+			StableID:     stableID(key, ordinals[key]),
 			Type:         c.Type,
 			File:         absPath,
 			RelFile:      relPath,

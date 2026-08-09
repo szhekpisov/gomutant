@@ -374,19 +374,20 @@ func TestWriteStryker_SortOrdering(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 
-	mk := func(id, line, col int) mutator.Mutant {
+	mk := func(stableID string, line, col int) mutator.Mutant {
 		return mutator.Mutant{
-			ID: id, Type: mutator.ArithmeticBase, File: srcPath, RelFile: "s.go",
+			StableID: stableID, Type: mutator.ArithmeticBase, File: srcPath, RelFile: "s.go",
 			Line: line, Col: col, Status: mutator.StatusKilled,
 		}
 	}
-	// Dispatch order is intentionally jumbled.
+	// Dispatch order is intentionally jumbled. The id tiebreak is a
+	// lexicographic compare of stable IDs.
 	mutants := []mutator.Mutant{
-		mk(3, 5, 1),
-		mk(1, 2, 3),
-		mk(2, 2, 1),
-		mk(5, 2, 1),
-		mk(4, 5, 1),
+		mk("s.go:g:ARITHMETIC_BASE#3", 5, 1),
+		mk("s.go:f:ARITHMETIC_BASE#1", 2, 3),
+		mk("s.go:f:ARITHMETIC_BASE#2", 2, 1),
+		mk("s.go:f:ARITHMETIC_BASE#5", 2, 1),
+		mk("s.go:g:ARITHMETIC_BASE#4", 5, 1),
 	}
 
 	out := filepath.Join(dir, "s.json")
@@ -402,7 +403,14 @@ func TestWriteStryker_SortOrdering(t *testing.T) {
 	for _, m := range got.Files["s.go"].Mutants {
 		gotIDs = append(gotIDs, m.ID)
 	}
-	want := []string{"2", "5", "1", "3", "4"} // (2,1,2),(2,1,5),(2,3,1),(5,1,3),(5,1,4)
+	// (line 2, col 1, f#2), (2, 1, f#5), (2, 3, f#1), (5, 1, g#3), (5, 1, g#4).
+	want := []string{
+		"s.go:f:ARITHMETIC_BASE#2",
+		"s.go:f:ARITHMETIC_BASE#5",
+		"s.go:f:ARITHMETIC_BASE#1",
+		"s.go:g:ARITHMETIC_BASE#3",
+		"s.go:g:ARITHMETIC_BASE#4",
+	}
 	if !slices.Equal(gotIDs, want) {
 		t.Errorf("ID order = %v, want %v", gotIDs, want)
 	}
@@ -444,5 +452,34 @@ func TestWriteStryker_Empty(t *testing.T) {
 	}
 	if len(got.Files) != 0 {
 		t.Errorf("Files should be empty, got %d", len(got.Files))
+	}
+}
+
+func TestWriteStryker_UsesStableID(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "s.go")
+	if err := os.WriteFile(srcPath, []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// ID and StableID disagree on purpose: the Stryker id must be the
+	// cross-run handle, not the run-local sequential index, so the HTML
+	// viewer and the dashboard can track a mutant between runs.
+	mutants := []mutator.Mutant{
+		{
+			ID:       7,
+			StableID: "s.go:Add:ARITHMETIC_BASE#1",
+			Type:     mutator.ArithmeticBase,
+			File:     srcPath, RelFile: "s.go",
+			Line: 1, Col: 1, Status: mutator.StatusLived,
+		},
+	}
+
+	got := writeAndReadFirst(t, mutants, "s.go")
+	if got.ID != "s.go:Add:ARITHMETIC_BASE#1" {
+		t.Errorf("ID=%q, want the stable ID", got.ID)
+	}
+	if got.ID == "7" {
+		t.Errorf("ID fell back to the sequential Mutant.ID")
 	}
 }

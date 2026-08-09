@@ -6,7 +6,6 @@ import (
 	"os"
 	"slices"
 	"sort"
-	"strconv"
 
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
@@ -114,7 +113,7 @@ func buildStrykerReport(mutants []mutator.Mutant, projectDir, frameworkVersion s
 		}
 
 		f.Mutants = append(f.Mutants, strykerMutantResult{
-			ID:          strconv.Itoa(m.ID),
+			ID:          m.StableID,
 			MutatorName: string(m.Type),
 			Location: strykerLocation{
 				Start: strykerPosition{Line: startLine, Column: startCol},
@@ -128,7 +127,9 @@ func buildStrykerReport(mutants []mutator.Mutant, projectDir, frameworkVersion s
 	}
 
 	// Sort mutants within each file by (line, col, id) so the output is
-	// deterministic regardless of dispatch order.
+	// deterministic regardless of dispatch order. The id tiebreak is a
+	// lexicographic compare of stable IDs; it only decides ties between
+	// mutants sharing a start position, where any total order will do.
 	for k, f := range files {
 		slices.SortStableFunc(f.Mutants, func(a, b strykerMutantResult) int {
 			return cmp.Or(

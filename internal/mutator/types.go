@@ -89,7 +89,16 @@ type Position struct {
 }
 
 type Mutant struct {
-	ID           int
+	// ID is a sequential 1..N index over this run's sorted candidate
+	// list. It is run-local: adding or removing a single mutation point
+	// renumbers every mutant after it.
+	ID int
+	// StableID is a position-independent handle of the form
+	// "rel_file:anchor:TYPE#n", where anchor is the enclosing function
+	// (empty for package-level declarations) and n counts mutants sharing
+	// those three fields. It survives line shifts and edits to other
+	// functions, so consumers can refer to the same mutant across runs.
+	StableID     string
 	Type         MutationType
 	File         string // Absolute path.
 	RelFile      string // Relative to module root (for report).

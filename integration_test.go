@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -170,7 +171,30 @@ func loadReport(t *testing.T, path string) *report.Report {
 	if err := json.Unmarshal(data, &r); err != nil {
 		t.Fatalf("parsing report: %v", err)
 	}
+	assertStableIDs(t, &r)
 	return &r
+}
+
+// assertStableIDs holds the report-wide invariant every consumer of the
+// `id` field depends on: each entry carries one, and no two entries share
+// it. Run on every report the integration tests load, so any mutator or
+// anchoring change that lets two mutants collapse onto one ID fails here
+// rather than silently in a consumer.
+func assertStableIDs(t *testing.T, r *report.Report) {
+	t.Helper()
+	seen := make(map[string]string)
+	for _, f := range r.Files {
+		for _, m := range f.Mutations {
+			if m.ID == "" {
+				t.Errorf("%s:%d:%d (%s) has an empty id", f.FileName, m.Line, m.Column, m.Type)
+				continue
+			}
+			if prev, dup := seen[m.ID]; dup {
+				t.Errorf("duplicate id %q: %s and %s:%d:%d", m.ID, prev, f.FileName, m.Line, m.Column)
+			}
+			seen[m.ID] = fmt.Sprintf("%s:%d:%d", f.FileName, m.Line, m.Column)
+		}
+	}
 }
 
 // The --exclude-calls tests below run over testdata/excludecalls, where

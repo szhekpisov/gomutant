@@ -790,6 +790,24 @@ Compatible with the gremlins JSON format:
 }
 ```
 
+Each entry under `files[].mutations[]` looks like this:
+
+```json
+{
+  "id": "internal/runner/pool.go:(*Pool).dispatch:CONDITIONALS_BOUNDARY#2",
+  "type": "CONDITIONALS_BOUNDARY",
+  "status": "LIVED",
+  "line": 142,
+  "column": 9,
+  "original": "<",
+  "replacement": "<="
+}
+```
+
+`id` is a stable handle for one mutant, formatted `file:function:TYPE#n`. The function segment is the enclosing declaration — `(*T).Method` for methods, empty for package-level declarations, and the enclosing function (not the literal) for mutants inside a closure. `n` counts mutants sharing those three fields, in source order.
+
+Because the ID is anchored to a function rather than a line, it survives edits elsewhere in the file: adding imports, reformatting, or changing a neighbouring function all leave it untouched, so two runs' reports can be diffed entry by entry to see which mutants are *still* alive. It does change when the enclosing function is renamed, or when a same-type mutation point is added or removed earlier in that same function. IDs are unique within a report. The Stryker and HTML reports use the same string as their mutant `id`.
+
 `mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 
 `mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.
