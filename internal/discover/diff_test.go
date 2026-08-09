@@ -372,41 +372,68 @@ func TestFilterByDiffPathOutsideGitRoot(t *testing.T) {
 	}
 }
 
-// TestRunGitDiffIntegration constructs a tiny git repo, makes a commit, edits
-// a file in the working tree, then runs RunGitDiff against HEAD.
-func TestRunGitDiffIntegration(t *testing.T) {
+// gitRepo is a throwaway repository for the tests that need real git
+// history. The author and committer identities are pinned so `git commit`
+// works on a machine with no global git config, such as a CI runner.
+type gitRepo struct {
+	t   *testing.T
+	ctx context.Context
+	dir string
+}
+
+// newGitRepo initialises an empty repository on branch main, skipping the
+// test when git is not installed.
+func newGitRepo(t *testing.T) *gitRepo {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	dir := t.TempDir()
-	ctx := context.Background()
+	r := &gitRepo{t: t, ctx: context.Background(), dir: t.TempDir()}
+	r.git("init", "-q", "-b", "main")
+	return r
+}
 
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
+// git runs one git command in the repository, failing the test if it exits
+// non-zero.
+func (r *gitRepo) git(args ...string) {
+	r.t.Helper()
+	cmd := exec.CommandContext(r.ctx, "git", args...)
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
+}
 
-	run("init", "-q", "-b", "main")
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\nfunc F() int { return 1 + 2 }\n"), 0o644); err != nil {
-		t.Fatal(err)
+// write creates or overwrites a file in the working tree.
+func (r *gitRepo) write(name, content string) {
+	r.t.Helper()
+	if err := os.WriteFile(filepath.Join(r.dir, name), []byte(content), 0o644); err != nil {
+		r.t.Fatal(err)
 	}
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+}
+
+// commit stages the whole working tree and records it.
+func (r *gitRepo) commit(message string) {
+	r.t.Helper()
+	r.git("add", ".")
+	r.git("commit", "-q", "-m", message)
+}
+
+// TestRunGitDiffIntegration constructs a tiny git repo, makes a commit, edits
+// a file in the working tree, then runs RunGitDiff against HEAD.
+func TestRunGitDiffIntegration(t *testing.T) {
+	r := newGitRepo(t)
+	r.write("f.go", "package p\nfunc F() int { return 1 + 2 }\n")
+	r.commit("init")
 	// Edit line 2 in working tree.
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\nfunc F() int { return 3 + 4 }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	r.write("f.go", "package p\nfunc F() int { return 3 + 4 }\n")
 
-	got, err := RunGitDiff(ctx, dir, "HEAD")
+	got, err := RunGitDiff(r.ctx, r.dir, "HEAD")
 	if err != nil {
 		t.Fatalf("RunGitDiff: %v", err)
 	}
@@ -418,12 +445,12 @@ func TestRunGitDiffIntegration(t *testing.T) {
 	}
 
 	// GitRoot should resolve to dir (canonicalized — macOS /private/ etc.).
-	root, err := GitRoot(ctx, dir)
+	root, err := GitRoot(r.ctx, r.dir)
 	if err != nil {
 		t.Fatalf("GitRoot: %v", err)
 	}
-	if !strings.HasSuffix(root, filepath.Base(dir)) {
-		t.Errorf("GitRoot=%q, expected suffix %q", root, filepath.Base(dir))
+	if !strings.HasSuffix(root, filepath.Base(r.dir)) {
+		t.Errorf("GitRoot=%q, expected suffix %q", root, filepath.Base(r.dir))
 	}
 }
 
@@ -431,32 +458,11 @@ func TestRunGitDiffIntegration(t *testing.T) {
 // that doesn't exist makes git exit non-zero, and the error must wrap
 // stderr.
 func TestRunGitDiffBadRef(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	dir := t.TempDir()
-	ctx := context.Background()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	run("init", "-q", "-b", "main")
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+	r := newGitRepo(t)
+	r.write("f.go", "package p\n")
+	r.commit("init")
 
-	_, err := RunGitDiff(ctx, dir, "definitely-not-a-real-ref")
+	_, err := RunGitDiff(r.ctx, r.dir, "definitely-not-a-real-ref")
 	if err == nil {
 		t.Fatal("expected error for nonexistent ref")
 	}
@@ -481,53 +487,25 @@ func TestRunGitDiffBadRef(t *testing.T) {
 // new one: a file absent from the branch shows up in a two-dot diff as a
 // deletion, which contributes no ranges and would make this test vacuous.
 func TestRunGitDiffUsesMergeBase(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	dir := t.TempDir()
-	ctx := context.Background()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	write := func(name, content string) {
-		t.Helper()
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	run("init", "-q", "-b", "main")
-	write("ours.go", "package p\n\nfunc A() int { return 1 }\n")
-	write("theirs.go", "package p\n\nfunc B() int { return 2 }\n")
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+	r := newGitRepo(t)
+	r.write("ours.go", "package p\n\nfunc A() int { return 1 }\n")
+	r.write("theirs.go", "package p\n\nfunc B() int { return 2 }\n")
+	r.commit("init")
 
 	// Fork the feature branch here.
-	run("checkout", "-q", "-b", "feature")
+	r.git("checkout", "-q", "-b", "feature")
 
 	// main moves on, editing a file the branch also carries.
-	run("checkout", "-q", "main")
-	write("theirs.go", "package p\n\nfunc B() int { return 22 }\n")
-	run("add", ".")
-	run("commit", "-q", "-m", "their work")
+	r.git("checkout", "-q", "main")
+	r.write("theirs.go", "package p\n\nfunc B() int { return 22 }\n")
+	r.commit("their work")
 
 	// The branch changes one line of its own, and stays behind main.
-	run("checkout", "-q", "feature")
-	write("ours.go", "package p\n\nfunc A() int { return 99 }\n")
-	run("add", ".")
-	run("commit", "-q", "-m", "our work")
+	r.git("checkout", "-q", "feature")
+	r.write("ours.go", "package p\n\nfunc A() int { return 99 }\n")
+	r.commit("our work")
 
-	got, err := RunGitDiff(ctx, dir, "main")
+	got, err := RunGitDiff(r.ctx, r.dir, "main")
 	if err != nil {
 		t.Fatalf("RunGitDiff: %v", err)
 	}
@@ -545,43 +523,16 @@ func TestRunGitDiffUsesMergeBase(t *testing.T) {
 // silently producing it would be worse than saying so. The realistic cause is
 // a shallow clone, so the error names that.
 func TestRunGitDiffNoMergeBase(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	dir := t.TempDir()
-	ctx := context.Background()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	write := func(name, content string) {
-		t.Helper()
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	run("init", "-q", "-b", "main")
-	write("f.go", "package p\n\nfunc A() int { return 1 }\n")
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+	r := newGitRepo(t)
+	r.write("f.go", "package p\n\nfunc A() int { return 1 }\n")
+	r.commit("init")
 
 	// An orphan branch shares no ancestor with main.
-	run("checkout", "-q", "--orphan", "orphan")
-	write("f.go", "package p\n\nfunc A() int { return 2 }\n")
-	run("add", ".")
-	run("commit", "-q", "-m", "orphan root")
+	r.git("checkout", "-q", "--orphan", "orphan")
+	r.write("f.go", "package p\n\nfunc A() int { return 2 }\n")
+	r.commit("orphan root")
 
-	_, err := RunGitDiff(ctx, dir, "main")
+	_, err := RunGitDiff(r.ctx, r.dir, "main")
 	if err == nil {
 		t.Fatal("expected an error when no merge base exists")
 	}
