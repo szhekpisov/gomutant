@@ -53,12 +53,28 @@ func looksLikeBadRevision(stderr string) bool {
 		strings.Contains(stderr, "bad revision")
 }
 
-// RunGitDiff executes `git diff --unified=0 <ref>` in dir and returns the
-// changed line ranges per file (paths relative to the git root). Lines
-// only deleted at a position (count=0) produce no range — there is nothing
-// to mutate. Renames use the new (b/) path.
+// looksLikeMissingMergeBase reports whether stderr indicates git found no
+// common ancestor for ref and HEAD. In practice that means a shallow clone
+// whose history was truncated above the fork point, which is worth naming
+// because the fix is a checkout setting rather than anything about the ref.
+func looksLikeMissingMergeBase(stderr string) bool {
+	return strings.Contains(stderr, "no merge base")
+}
+
+// RunGitDiff executes `git diff --unified=0 --merge-base <ref>` in dir and
+// returns the changed line ranges per file (paths relative to the git root).
+// Lines only deleted at a position (count=0) produce no range — there is
+// nothing to mutate. Renames use the new (b/) path.
+//
+// `--merge-base` is what makes the range match the set of lines a pull
+// request shows. It diffs from the commit ref and HEAD diverged at rather
+// than from ref's tip, so a branch that is behind its base does not pick up
+// the lines that landed on the base after the fork — which a plain
+// `git diff <ref>` reports as changed, attributing other people's work to
+// this run. The working tree is still one side of the comparison, so
+// uncommitted edits are included exactly as before.
 func RunGitDiff(ctx context.Context, dir, ref string) (map[string][]LineRange, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", ref)
+	cmd := exec.CommandContext(ctx, "git", "diff", "--unified=0", "--no-color", "--no-ext-diff", "--merge-base", ref)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -67,6 +83,9 @@ func RunGitDiff(ctx context.Context, dir, ref string) (map[string][]LineRange, e
 		stderrStr := stderr.String()
 		if looksLikeBadRevision(stderrStr) {
 			return nil, fmt.Errorf("git diff %s: %w\n%s\nhint: %q is not a valid revision in this repo — if it's a remote branch, try `git fetch`", ref, err, stderrStr, ref)
+		}
+		if looksLikeMissingMergeBase(stderrStr) {
+			return nil, fmt.Errorf("git diff %s: %w\n%s\nhint: no common ancestor of %q and HEAD is present — if this is a shallow clone, deepen it (`fetch-depth: 0` on actions/checkout)", ref, err, stderrStr, ref)
 		}
 		return nil, fmt.Errorf("git diff %s: %w\n%s", ref, err, stderrStr)
 	}

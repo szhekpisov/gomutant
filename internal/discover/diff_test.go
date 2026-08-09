@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/token"
 	"os"
@@ -371,41 +372,69 @@ func TestFilterByDiffPathOutsideGitRoot(t *testing.T) {
 	}
 }
 
-// TestRunGitDiffIntegration constructs a tiny git repo, makes a commit, edits
-// a file in the working tree, then runs RunGitDiff against HEAD.
-func TestRunGitDiffIntegration(t *testing.T) {
+// gitRepo is a throwaway repository for the tests that need real git
+// history. The author and committer identities are pinned so `git commit`
+// works on a machine with no global git config, such as a CI runner.
+type gitRepo struct {
+	t   *testing.T
+	dir string
+}
+
+// newGitRepo initialises an empty repository on branch main, skipping the
+// test when git is not installed.
+func newGitRepo(t *testing.T) *gitRepo {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
-	dir := t.TempDir()
-	ctx := context.Background()
+	r := &gitRepo{t: t, dir: t.TempDir()}
+	r.git("init", "-q", "-b", "main")
+	return r
+}
 
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
+// git runs one git command in the repository, failing the test if it exits
+// non-zero. The context is created per call rather than held on the struct:
+// a stored Context outlives the call it belongs to and cannot be scoped or
+// cancelled by the caller.
+func (r *gitRepo) git(args ...string) {
+	r.t.Helper()
+	cmd := exec.CommandContext(context.Background(), "git", args...)
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
+}
 
-	run("init", "-q", "-b", "main")
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\nfunc F() int { return 1 + 2 }\n"), 0o644); err != nil {
-		t.Fatal(err)
+// write creates or overwrites a file in the working tree.
+func (r *gitRepo) write(name, content string) {
+	r.t.Helper()
+	if err := os.WriteFile(filepath.Join(r.dir, name), []byte(content), 0o644); err != nil {
+		r.t.Fatal(err)
 	}
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+}
+
+// commit stages the whole working tree and records it.
+func (r *gitRepo) commit(message string) {
+	r.t.Helper()
+	r.git("add", ".")
+	r.git("commit", "-q", "-m", message)
+}
+
+// TestRunGitDiffIntegration constructs a tiny git repo, makes a commit, edits
+// a file in the working tree, then runs RunGitDiff against HEAD.
+func TestRunGitDiffIntegration(t *testing.T) {
+	r := newGitRepo(t)
+	r.write("f.go", "package p\nfunc F() int { return 1 + 2 }\n")
+	r.commit("init")
 	// Edit line 2 in working tree.
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\nfunc F() int { return 3 + 4 }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	r.write("f.go", "package p\nfunc F() int { return 3 + 4 }\n")
 
-	got, err := RunGitDiff(ctx, dir, "HEAD")
+	got, err := RunGitDiff(context.Background(), r.dir, "HEAD")
 	if err != nil {
 		t.Fatalf("RunGitDiff: %v", err)
 	}
@@ -417,12 +446,12 @@ func TestRunGitDiffIntegration(t *testing.T) {
 	}
 
 	// GitRoot should resolve to dir (canonicalized — macOS /private/ etc.).
-	root, err := GitRoot(ctx, dir)
+	root, err := GitRoot(context.Background(), r.dir)
 	if err != nil {
 		t.Fatalf("GitRoot: %v", err)
 	}
-	if !strings.HasSuffix(root, filepath.Base(dir)) {
-		t.Errorf("GitRoot=%q, expected suffix %q", root, filepath.Base(dir))
+	if !strings.HasSuffix(root, filepath.Base(r.dir)) {
+		t.Errorf("GitRoot=%q, expected suffix %q", root, filepath.Base(r.dir))
 	}
 }
 
@@ -430,32 +459,11 @@ func TestRunGitDiffIntegration(t *testing.T) {
 // that doesn't exist makes git exit non-zero, and the error must wrap
 // stderr.
 func TestRunGitDiffBadRef(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	dir := t.TempDir()
-	ctx := context.Background()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(ctx, "git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
-		)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	run("init", "-q", "-b", "main")
-	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package p\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	run("add", ".")
-	run("commit", "-q", "-m", "init")
+	r := newGitRepo(t)
+	r.write("f.go", "package p\n")
+	r.commit("init")
 
-	_, err := RunGitDiff(ctx, dir, "definitely-not-a-real-ref")
+	_, err := RunGitDiff(context.Background(), r.dir, "definitely-not-a-real-ref")
 	if err == nil {
 		t.Fatal("expected error for nonexistent ref")
 	}
@@ -466,6 +474,77 @@ func TestRunGitDiffBadRef(t *testing.T) {
 	// "bad revision" → we suggest `git fetch`.
 	if !strings.Contains(err.Error(), "git fetch") {
 		t.Errorf("error should hint at `git fetch` for unknown ref, got: %v", err)
+	}
+}
+
+// TestRunGitDiffUsesMergeBase is the regression test for scoping a run to a
+// pull request's own lines. It builds a repo where `main` has moved on after
+// the feature branch forked, modifying a line in a file the branch also has.
+// Against main's *tip* that line reads as changed — the branch still holds
+// the pre-modification version — and gets attributed to work the branch
+// never did. Against the merge base it is correctly absent.
+//
+// The edit on main has to modify an existing shared file rather than add a
+// new one: a file absent from the branch shows up in a two-dot diff as a
+// deletion, which contributes no ranges and would make this test vacuous.
+func TestRunGitDiffUsesMergeBase(t *testing.T) {
+	r := newGitRepo(t)
+	r.write("ours.go", "package p\n\nfunc A() int { return 1 }\n")
+	r.write("theirs.go", "package p\n\nfunc B() int { return 2 }\n")
+	r.commit("init")
+
+	// Fork the feature branch here.
+	r.git("checkout", "-q", "-b", "feature")
+
+	// main moves on, editing a file the branch also carries.
+	r.git("checkout", "-q", "main")
+	r.write("theirs.go", "package p\n\nfunc B() int { return 22 }\n")
+	r.commit("their work")
+
+	// The branch changes one line of its own, and stays behind main.
+	r.git("checkout", "-q", "feature")
+	r.write("ours.go", "package p\n\nfunc A() int { return 99 }\n")
+	r.commit("our work")
+
+	got, err := RunGitDiff(context.Background(), r.dir, "main")
+	if err != nil {
+		t.Fatalf("RunGitDiff: %v", err)
+	}
+	if len(got["ours.go"]) == 0 {
+		t.Errorf("expected the branch's own change to ours.go, got %v", got)
+	}
+	if ranges, ok := got["theirs.go"]; ok {
+		t.Errorf("theirs.go landed on main after the fork and must not be attributed to this branch, got %v", ranges)
+	}
+}
+
+// TestRunGitDiffNoMergeBase covers the no-common-ancestor path. Reporting it
+// is the point: the alternative — quietly falling back to a diff against the
+// ref's tip — is the over-broad scope this whole change exists to remove, and
+// silently producing it would be worse than saying so. The realistic cause is
+// a shallow clone, so the error names that.
+func TestRunGitDiffNoMergeBase(t *testing.T) {
+	r := newGitRepo(t)
+	r.write("f.go", "package p\n\nfunc A() int { return 1 }\n")
+	r.commit("init")
+
+	// An orphan branch shares no ancestor with main.
+	r.git("checkout", "-q", "--orphan", "orphan")
+	r.write("f.go", "package p\n\nfunc A() int { return 2 }\n")
+	r.commit("orphan root")
+
+	_, err := RunGitDiff(context.Background(), r.dir, "main")
+	if err == nil {
+		t.Fatal("expected an error when no merge base exists")
+	}
+	if !strings.Contains(err.Error(), "fetch-depth: 0") {
+		t.Errorf("error should hint at deepening a shallow clone, got: %v", err)
+	}
+	// The hint wraps git's own failure rather than replacing it, so a caller
+	// can still inspect the exit status behind the advice.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Errorf("error should unwrap to git's *exec.ExitError, got %T", err)
 	}
 }
 
@@ -483,6 +562,12 @@ func TestRunGitDiffNonRepoErrorNoHint(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "git fetch") {
 		t.Errorf("non-repo error should not carry the fetch hint, got: %v", err)
+	}
+	// Nor the shallow-clone hint: git failed before it ever looked for a
+	// merge base, so pointing at fetch-depth would send the reader the
+	// wrong way.
+	if strings.Contains(err.Error(), "fetch-depth: 0") {
+		t.Errorf("non-repo error should not carry the shallow-clone hint, got: %v", err)
 	}
 }
 

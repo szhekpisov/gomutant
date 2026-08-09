@@ -15,7 +15,7 @@ Coverage tells you a line ran. gomutants tells you whether a test would have cau
 - **Warm reruns in 2.7–19s** on real projects whose cold runs take 6–46 minutes. The content-addressed cache short-circuits every mutant whose source bytes and covering tests are unchanged, so the loop stays tight enough to run after each edit. [benchmarks](#benchmark-snapshot)
 - **Scoped to your diff.** `--changed-since <ref>` mutates only changed lines, routes each mutant to only the tests that cover it, gates on a threshold, and annotates surviving mutants on the PR.
 - **Survivors come back as test proposals**, not a report to triage — the Claude Code plugin turns each one into a concrete `*_test.go` case without editing your repository.
-- **26 mutators including block-level and return-value operators**, surfacing the weak-assertion gaps that token-only mutation misses.
+- **28 mutators including block-level and return-value operators**, surfacing the weak-assertion gaps that token-only mutation misses.
 - **Built to survive its own parallelism** — adaptive timeouts, an OOM safety net, and bounded per-worker concurrency that keeps parallel mutants from oversubscribing CPU. [how it works](#how-it-works)
 
 ## Table of Contents
@@ -59,7 +59,7 @@ Coverage tells you a line ran. gomutants tells you whether a test would have cau
 
 * **Every PR, not every quarter.** `--changed-since <ref>` mutates only lines added or modified since a git ref; per-test coverage routing runs each mutant against only the tests whose coverage touches the mutated line; thresholds gate the change; GitHub annotations place survivors directly on the diff; and JSON, Stryker, and self-contained HTML reports preserve the result.
 
-* **Survivors are findings, not homework.** The `/gomutants:mutants` slash command runs gomutants on changed code and proposes the specific test cases that would kill each surviving mutant, leaving the repository untouched. 26 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface the weak-assertion gaps that token-level mutation misses.
+* **Survivors are findings, not homework.** The `/gomutants:mutants` slash command runs gomutants on changed code and proposes the specific test cases that would kill each surviving mutant, leaving the repository untouched. 28 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface the weak-assertion gaps that token-level mutation misses.
 
 * **Built not to lie to you.** Compile-failing mutants surface as `NOT_VIABLE` instead of inflating the score, `--detect-equivalent` drops provably unkillable mutants out of the denominator, adaptive per-mutant timeouts kill infinite-loop mutants in seconds rather than minutes, and byte-level `go test -overlay` patches preserve generics and never modify your source tree.
 
@@ -188,7 +188,7 @@ One-off manual runs or thin test suites (<70% line coverage) — the one-time se
 
 | Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
 |---|---|---|---|
-| Mutators (default set) | 26 | 5 | 6 |
+| Mutators (default set) | 28 | 5 | 6 |
 | Block-level mutators | yes | no | no |
 | Generics support | yes (byte-patching) | partial[^1] | no |
 | `--changed-since <ref>` | first-class | no | no |
@@ -249,7 +249,7 @@ See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
 - **Adaptive per-mutant timeouts** — deadlines sized from recorded per-test durations × margin, so fast tests don't wait out a multi-minute global ceiling.
 - **Byte-level patching via `go test -overlay`** — generics and all Go syntax survive intact; source tree never modified.
-- **26 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` and the return-value set `RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE` on top of 15 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement).
+- **28 mutators including block-level** — `BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK` and the return-value set `RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE` on top of 17 token-level operators (arithmetic, bitwise, comparison, logical, loop control, literal increment/decrement, logical-negation removal, error-wrap downgrade).
 - **OOM-safe** — each `go test` child runs in its own process group with a 2 GiB RSS cap; output capped at 1 MiB per stream.
 - **Multiple report formats** — gremlins-compatible JSON (default), [Stryker `mutation-testing-elements` v2](https://github.com/stryker-mutator/mutation-testing-elements) JSON, and a self-contained interactive HTML report.
 - **Conservative outcomes** — compile-failing mutants surface as `NOT_VIABLE`, while recognized host resource and I/O failures surface as `INFRA ERROR`; neither inflates efficacy or becomes a cached verdict.
@@ -278,7 +278,7 @@ gomutants --changed-since origin/main ./...
 gomutants --changed-since HEAD~1 ./...
 ```
 
-The flag runs `git diff --unified=0 <ref>` and keeps only mutants on added/modified lines. Combine with `--threshold-efficacy 100` to fail on any LIVED mutant on changed lines. A typical setup runs `--changed-since` per PR and the full tree post-merge; see [`.github/workflows/mutation.yml`](.github/workflows/mutation.yml) for an example.
+The flag runs `git diff --unified=0 --merge-base <ref>` and keeps only mutants on added/modified lines. Diffing from the **merge base** — the commit your branch forked from — rather than from the ref's tip is what makes the scope match the set of lines the pull request shows: on a branch that is behind its base, diffing against the tip also reports every line that landed on the base after you forked, failing your gate on someone else's work. Uncommitted working-tree edits are included, so a local pre-push run sees them. If no common ancestor is reachable — almost always a shallow clone — the run fails with a hint rather than silently widening the scope; `fetch-depth: 0` on `actions/checkout` fixes it. Combine with `--threshold-efficacy 100` to fail on any LIVED mutant on changed lines. A typical setup runs `--changed-since` per PR and the full tree post-merge; see [`.github/workflows/mutation.yml`](.github/workflows/mutation.yml) for an example.
 
 ### Cross-Package Mode
 
@@ -527,10 +527,16 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 | `INVERT_LOGICAL` | Swap logical operators | `&&` <-> `\|\|` |
 | `INVERT_LOOP_CTRL` | Swap loop control | `break` <-> `continue` |
 | `REMOVE_SELF_ASSIGNMENTS` | Drop op from compound assignment | `x += y` -> `x = y` |
+| `REMOVE_LOGICAL_NOT` | Drop `!` from a logical negation | `if !ok` -> `if ok` |
+| `ERRORF_WRAP` | Downgrade the error-wrapping verb | `fmt.Errorf("load: %w", err)` -> `fmt.Errorf("load: %v", err)` |
 | `INTEGER_INCREMENT` | Increment integer literal | `42` -> `43`, `0xFF` -> `256` |
 | `INTEGER_DECREMENT` | Decrement integer literal | `42` -> `41`, `0` -> `-1` |
 | `FLOAT_INCREMENT` | Increment float literal | `1.5` -> `2.5`, `0.0` -> `1.0` |
 | `FLOAT_DECREMENT` | Decrement float literal | `1.5` -> `0.5`, `1e2` -> `99.0` |
+
+`ERRORF_WRAP` leaves the formatted message byte-for-byte identical and only breaks the error chain, so `errors.Is` and `errors.As` against the cause stop matching. It survives exactly when a test asserts on `err.Error()` and never unwraps — the gap it exists to report. Matching is syntactic and covers any `Errorf` selector, so an aliased import or your own error package is reached without configuration.
+
+`REMOVE_LOGICAL_NOT` deliberately skips a negated comparison (`!(a == b)`): dropping the `!` there produces the same behaviour as the `CONDITIONALS_NEGATION` mutant on the inner operator, and two mutants that live and die together would dilute the efficacy denominator without measuring anything. It applies to everything else — `!ok`, `!strings.HasPrefix(s, p)`, `!(a && b)` — which no other mutator reaches.
 
 **Block-level:**
 
@@ -591,7 +597,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--exclude-files` | | | Comma-separated regexps; skip mutating production files whose module-relative path matches any. Unanchored (e.g. `vendor/` hits anywhere). Excluded files produce no mutants and are never parsed. |
 | `--exclude-calls` | | | Comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. `log.Print*,*.Debug`). Anchored; `*` is the only metacharacter. Extends the built-in stdlib-logging set. Suppressed mutants are dropped before any test runs. See [Call-Site Exclusion](#call-site-exclusion). |
 | `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
-| `--changed-since` | | | Only test mutants on lines changed vs git ref (e.g. `main`, `HEAD~1`); requires a git repo |
+| `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
