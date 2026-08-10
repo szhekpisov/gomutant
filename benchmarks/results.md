@@ -1,80 +1,109 @@
-# Benchmark Results: gomutants vs gremlins
+# Benchmark Results: gomutants vs Gremlins and Mutago
 
-_Generated: 2026-05-12_
+_Generated: 2026-08-10_
 
 | | |
 |---|---|
 | Host | Darwin arm64 |
 | CPU | Apple M1 Pro |
-| Go | go1.26.1 darwin/arm64 |
-| gomutants | gomutants vv0.2.3-0.20260511150126-904647358c17 (commit: 904647358c176a6a95c681384ec08a98a06287dd, built: 2026-05-11T15:01:26Z) |
-| gremlins | gremlins version dev darwin/arm64 |
+| Target Go | go1.25.7 darwin/arm64 |
+| gomutants | gomutants v0.6.0-rc1+dirty (commit: f77ee074632fd2352f6ef92878a209930b1ce938, built: 2026-08-10T00:09:54Z) |
+| Gremlins | github.com/go-gremlins/gremlins v0.6.0 |
+| Mutago | github.com/quality-gates/mutago/v2 v2.8.1 |
 | workers | 10 |
-| timeout-coefficient | 50 |
-| hyperfine runs per scenario | 5 |
+| timeout coefficient | 50 |
+| hyperfine runs per scenario | 3 |
 
-Raw hyperfine output and per-run JSON reports are in `benchmarks/out/`.
+Raw hyperfine output, warm-up logs, and final tool reports are in `benchmarks/out/` (gitignored).
 
-### small-defaults — ./testdata/simple/ with each tool's default mutators
+### small-defaults — ./testdata/simple with each tool's default mutator catalog
 
-| Metric                  | gomutants | gremlins |
-|-------------------------|----------:|---------:|
-| Wall-clock mean (s)     | 6.39 | 4.49 |
-| Mutants discovered      | 36 | 20 |
-| Killed                  | 29 | 11 |
-| Lived                   | 3 | 3 |
-| Not covered             | 0 | 6 |
-| Not viable              | 4 | 0 |
-| Timed out               | 0 | 0 |
-| Test efficacy (%)       | 90.62 | 78.57 |
-| Tested mutants (k+l)    | 32 | 14 |
-| Time per tested mutant (ms) | 200 | 321 |
+| Metric | gomutants | Gremlins | Mutago |
+|---|---:|---:|---:|
+| Wall-clock mean ± σ (s) | 11.01 ± 0.06 | 4.27 ± 0.15 | 11.33 ± 1.90 |
+| Mutants reported | 68 | 20 | 63 |
+| Killed | 55 | 11 | 54 |
+| Lived / escaped | 9 | 3 | 9 |
+| Not covered | 0 | 6 | 0 |
+| Not viable | 4 | 0 | n/a |
+| Timed out | 0 | 0 | n/a |
+| Other errors | 0 | 0 | 0¹ |
+| Skipped | 0 | 0 | 0 |
+| Tested mutants (killed + lived) | 64 | 14 | 63 |
+| Time per tested mutant (ms) | 172 | 305 | 180 |
 
-**Winner (wall-clock): gremlins — 1.42× faster**
+**Pairwise wall clock (default catalogs; workloads differ):** Gremlins was 2.58× faster than gomutants; gomutants was 1.03× faster than Mutago.
 
-### mutator-defaults — ./internal/mutator with each tool's default mutators
+### small-matched — ./testdata/simple with the matched 4-operator set
 
-| Metric                  | gomutants | gremlins |
-|-------------------------|----------:|---------:|
-| Wall-clock mean (s)     | 20.08 | 8.66 |
-| Mutants discovered      | 132 | 28 |
-| Killed                  | 119 | 28 |
-| Lived                   | 0 | 0 |
-| Not covered             | 0 | 0 |
-| Not viable              | 13 | 0 |
-| Timed out               | 0 | 0 |
-| Test efficacy (%)       | 100.00 | 100.00 |
-| Tested mutants (k+l)    | 119 | 28 |
-| Time per tested mutant (ms) | 169 | 309 |
+| Metric | gomutants | Gremlins | Mutago |
+|---|---:|---:|---:|
+| Wall-clock mean ± σ (s) | 4.25 ± 0.06 | 3.95 ± 0.03 | 4.06 ± 0.04 |
+| Mutants reported | 18 | 19 | 18 |
+| Killed | 15 | 10 | 15 |
+| Lived / escaped | 3 | 3 | 3 |
+| Not covered | 0 | 6 | 0 |
+| Not viable | 0 | 0 | n/a |
+| Timed out | 0 | 0 | n/a |
+| Other errors | 0 | 0 | 0¹ |
+| Skipped | 0 | 0 | 0 |
+| Tested mutants (killed + lived) | 18 | 13 | 18 |
+| Time per tested mutant (ms) | 236 | 304 | 226 |
 
-**Winner (wall-clock): gremlins — 2.32× faster**
+**Pairwise wall clock (matched operator semantics):** Gremlins was 1.08× faster than gomutants; Mutago was 1.05× faster than gomutants.
 
-### mutator-matched — ./internal/mutator with matched 5-mutator set (apples-to-apples)
+### mutator-matched — ./internal/mutator with the matched 4-operator set
 
-| Metric                  | gomutants | gremlins |
-|-------------------------|----------:|---------:|
-| Wall-clock mean (s)     | 6.08 | 8.74 |
-| Mutants discovered      | 28 | 28 |
-| Killed                  | 28 | 28 |
-| Lived                   | 0 | 0 |
-| Not covered             | 0 | 0 |
-| Not viable              | 0 | 0 |
-| Timed out               | 0 | 0 |
-| Test efficacy (%)       | 100.00 | 100.00 |
-| Tested mutants (k+l)    | 28 | 28 |
-| Time per tested mutant (ms) | 217 | 312 |
+| Metric | gomutants | Gremlins | Mutago |
+|---|---:|---:|---:|
+| Wall-clock mean ± σ (s) | 14.22 ± 0.13 | 23.16 ± 0.25 | 22.22 ± 7.94 |
+| Mutants reported | 84 | 89 | 71 |
+| Killed | 82 | 87 | 69 |
+| Lived / escaped | 0 | 2 | 2 |
+| Not covered | 0 | 0 | 0 |
+| Not viable | 2 | 0 | n/a |
+| Timed out | 0 | 0 | n/a |
+| Other errors | 0 | 0 | 0¹ |
+| Skipped | 0 | 0 | 0 |
+| Tested mutants (killed + lived) | 82 | 89 | 71 |
+| Time per tested mutant (ms) | 173 | 260 | 313 |
 
-**Winner (wall-clock): gomutants — 1.44× faster**
+**Pairwise wall clock (matched operator semantics):** gomutants was 1.63× faster than Gremlins; gomutants was 1.56× faster than Mutago.
+
+¹ Mutago combines compile failures, execution errors, and timeouts in one
+`errored` outcome; its timeout count cannot be separated from the summary.
 
 ## Reading the results
 
-- **Wall-clock** is what the user waits for. On out-of-the-box defaults gomutants runs more mutators (16 vs 5), so it does more total work and finishes later despite per-mutant being faster.
-- **Time per tested mutant** normalizes for that — it's the metric that isolates engine speed from the size of the workload. gomutants wins this consistently because it pre-builds and reuses test binaries; gremlins shells out a fresh `go test` per mutant.
-- The `mutator-matched` scenario removes the workload difference entirely. It's the cleanest engine-only comparison.
+- `small-defaults` measures the product-facing default mutator catalogs, not
+  equal work. Mutago coverage and per-test routing are enabled because they are
+  its strongest native execution mode; gomutants uses its default routing and
+  Gremlins always starts with package coverage.
+- The matched scenarios use the four operator semantics shared exactly by all
+  three tools: arithmetic replacement, conditional boundary, conditional
+  negation, and unary-negative inversion. `INCREMENT_DECREMENT` is excluded
+  because Mutago does not implement the same `++`/`--` swap.
+- The medium matched scenario is the cleanest engine comparison. Total counts
+  should still be read alongside wall time: discovery and viability filters can
+  differ even when operator transformations are the same.
+- Time per tested mutant normalizes wall time by KILLED + LIVED/escaped only.
+  It excludes uncovered, non-viable, timed-out, errored, and skipped mutants
+  because no completed test verdict exists for them.
 
 ## Caveats
 
-- gomutants implements 16 mutator types vs gremlins' 5 default mutators, so "defaults" scenarios compare different workloads. The `mutator-matched` scenario restricts gomutants to gremlins' five default mutators for an apples-to-apples engine comparison.
-- gomutants's one-time setup (coverage collection, baseline measurement, per-test coverage map build) adds fixed overhead that only pays off when many mutants share that cost.
-- The harness uses `--timeout-coefficient 50`. With gremlins' default of 10, gremlins silently TIMED OUT on 18/19 mutants on this machine because each mutant run shells out a fresh `go test` (no cached test binary). The lower coefficient makes gremlins look fast but the kills are missing.
-- Results are sensitive to CPU load and thermal state. Re-run under quiet conditions for publishable numbers.
+- The harness copies the two source targets into an isolated temporary module
+  with `go 1.25.7`. Pinned Gremlins v0.6.0 panics while executing these targets
+  under Go 1.26.x; running every tool through the pinned compatible toolchain
+  keeps the comparison usable.
+- Gomutants's persistent cache is disabled. Gremlins and Mutago do not provide
+  an equivalent mutant-verdict cache, so this page compares cold execution.
+- Gomutants performs one-time coverage, baseline, and per-test-map setup. That
+  fixed cost is visible on the tiny fixture and amortizes as mutant count grows.
+- The coefficient is 50 because lower Gremlins deadlines misclassify mutants on
+  fast packages under worker contention. All tools receive the same value.
+- Gooze v1.0.1 is excluded: the audited tag does not compile because its source
+  refers to missing coverage-index definitions, so it cannot produce a valid
+  end-to-end timing.
+- Wall-clock results are sensitive to CPU load, thermal state, and Go build
+  cache state. Re-run under quiet conditions before quoting the numbers.
