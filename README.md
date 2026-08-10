@@ -598,6 +598,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--exclude-calls` | | | Comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. `log.Print*,*.Debug`). Anchored; `*` is the only metacharacter. Extends the built-in stdlib-logging set. Suppressed mutants are dropped before any test runs. See [Call-Site Exclusion](#call-site-exclusion). |
 | `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
 | `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
+| `--run-mutant-id` | | | Run only the mutant with this stable `id` (the `id` field of a report entry); a unique prefix is accepted. Skips the incremental cache for that mutant. See [Re-running a single mutant](#re-running-a-single-mutant) |
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
@@ -827,6 +828,33 @@ The suffix counts occurrences in source order, so inserting a third `func init()
 `mutants_infra_error` is omitted when zero; it counts mutants whose tests could not produce a reliable verdict because gomutants recognized an environmental resource or I/O failure. They stay in `mutants_total` and `mutations_coverage`, but count as neither killed nor lived and are not cached. Per-mutant entries use the status `INFRA ERROR`; Stryker and HTML reports map it to `RuntimeError`.
 
 Because those mutants leave both threshold denominators, a run that hit them is an *incomplete* measurement rather than a passing one. When the count is non-zero gomutants prints a warning on **stderr** before evaluating the gates, so a CI job that keeps only the exit code and the JSON report still sees that the run needs a rerun.
+
+### Re-running a single mutant
+
+`--run-mutant-id` narrows a run to exactly one mutant, named by the `id` from a previous report. That turns "did the test I just wrote kill it?" into one `go test` instead of the whole package's worth:
+
+```sh
+# 1. Full run. Pick a survivor's id out of the report.
+gomutants -o report.json ./...
+jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
+
+# 2. Write a test, then re-run just that mutant.
+gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
+```
+
+A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. So is combining it with `--dry-run`, which returns before anything is compiled or tested. All of those exit **2**, the same as any other bad invocation. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
+
+Pair it with a threshold to get a scriptable answer:
+
+```sh
+gomutants --run-mutant-id "$ID" --threshold-efficacy 100 ./...   # exit 0 = killed, 10 = still alive
+```
+
+Three behaviors worth knowing:
+
+- **The incremental cache is bypassed for that mutant.** A cache hit would replay the previous verdict rather than run anything, which is exactly the wrong answer when you have just edited a test. The fresh verdict is still written back to the cache.
+- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is one mutant test run instead of N, which is the part that grows with the package. A bad `id` is the exception: it is resolved against the discovered set before those phases start, so a typo or a stale anchor fails immediately instead of after a full `go test -cover`.
+- **A missing verdict exits 1, not 0.** `KILLED` and `LIVED` are the only two statuses that answer the question. If the named mutant comes back `NOT COVERED`, `NOT VIABLE`, `TIMED OUT`, `EQUIVALENT` or `INFRA ERROR`, the thresholds above would see an empty denominator, skip the gate and exit 0 — so a single-mutant run instead fails with the status it got. Ordinary whole-package runs keep the skip-the-gate behavior.
 
 ## Self-efficacy (gomutants on itself)
 

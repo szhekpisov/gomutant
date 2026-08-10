@@ -266,6 +266,7 @@ func run(ctx context.Context, args []string) error {
 		excludeFiles      string
 		excludeCalls      string
 		changedSince      string
+		runMutantID       string
 		cachePath         string
 		annotations       string
 		strykerOutput     string
@@ -353,6 +354,10 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	})
 	fs.StringVar(&changedSince, "changed-since", "", "only test mutants on lines changed vs git ref (e.g. main, HEAD~1)")
+	// The back-quoted `id` is the value placeholder flag's UnquoteUsage
+	// prints in --help; see the --test-flags comment above for why its
+	// position within the string matters.
+	fs.StringVar(&runMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
 	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source and tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
 	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
 	fs.StringVar(&strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
@@ -415,6 +420,7 @@ func run(ctx context.Context, args []string) error {
 		ExcludeFiles:       excludeFiles,
 		ExcludeCalls:       excludeCalls,
 		ChangedSince:       changedSince,
+		RunMutantID:        runMutantID,
 		Cache:              cachePath,
 		DryRun:             dryRun,
 		Verbose:            verbose,
@@ -431,6 +437,16 @@ func run(ctx context.Context, args []string) error {
 	// rather than silently pick one.
 	if cfg.Integration && cfg.CoverPkg != "" {
 		return usageErrorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
+	}
+
+	// --run-mutant-id exists to answer "did the test I just wrote kill this
+	// mutant?" from an exit code, and --dry-run returns before anything is
+	// compiled or tested. The pair would print the mutant and exit 0 — which
+	// a script reads as a kill. Checked after ApplyFlags because dry-run is
+	// also a config-file key: a committed `dry-run: true` is invisible to the
+	// caller and cannot be turned back off from the command line.
+	if cfg.RunMutantID != "" && cfg.DryRun {
+		return usageErrorf("--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report")
 	}
 
 	// Checked after ApplyFlags so a value from .gomutants.yml is screened
@@ -529,6 +545,29 @@ func run(ctx context.Context, args []string) error {
 		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(pkgs), excludedFiles)
 	}
 	term.PhaseDone(resolveMsg)
+
+	// Resolve --run-mutant-id here, not at step 5. Discovery is pure AST
+	// work over the packages just resolved, so an unknown or ambiguous id
+	// costs nothing to diagnose; leaving it at step 5 would charge a full
+	// `go test -cover` plus a baseline run before reporting a typo or a
+	// stale id — on the one flag whose purpose is to avoid paying for the
+	// whole package. The result is carried to step 5 rather than re-parsed.
+	fset := token.NewFileSet()
+	var (
+		discovered *discover.Result
+		mutants    []mutator.Mutant
+	)
+	if cfg.RunMutantID != "" {
+		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
+		// Runs before every other filter so that "no mutant matches this
+		// id" is diagnosed against the full discovered set rather than
+		// against whatever --changed-since happened to leave behind. Both
+		// drop mutants, so the order doesn't change the intersection.
+		mutants, err = discover.FilterByStableID(discovered.Mutants, cfg.RunMutantID)
+		if err != nil {
+			return usageError(err)
+		}
+	}
 
 	// Integration mode widens coverage collection, the baseline run, and the
 	// per-test map to the reverse-dependency closure R of the target packages
@@ -641,9 +680,12 @@ func run(ctx context.Context, args []string) error {
 
 	// 5. Discover mutants.
 	term.Phase("Discovering mutants...")
-	fset := token.NewFileSet()
-	discovered := discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
-	mutants := discovered.Mutants
+	// discovered is already set when --run-mutant-id resolved it above,
+	// along with the single mutant it narrowed to.
+	if discovered == nil {
+		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
+		mutants = discovered.Mutants
+	}
 	if cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, projectDir)
 		if err != nil {
@@ -674,6 +716,13 @@ func run(ctx context.Context, args []string) error {
 			fmt.Fprintf(stderr, "suppressed %s at %s:%d (%s)\n",
 				s.Mutant.Type, s.Mutant.RelFile, s.Mutant.Line, reason)
 		}
+	}
+	// FilterByStableID resolved the id, but a later filter can still drop
+	// what it found. Without this the run would test nothing, print
+	// "0 found" and exit 0 — indistinguishable, to a script reading the
+	// exit code, from the mutant having been killed.
+	if cfg.RunMutantID != "" && len(mutants) == 0 {
+		return usageError(runMutantDroppedError(cfg.RunMutantID, cfg.ChangedSince, suppressed))
 	}
 
 	pendingCount := 0
@@ -766,7 +815,17 @@ func run(ctx context.Context, args []string) error {
 			return files
 		}
 
-		if hits := loadedCache.Lookup(mutants, hasher, testFilesFor); hits > 0 {
+		// --run-mutant-id skips the lookup, not the resolver above: the
+		// point of naming one mutant is to measure it again after editing
+		// a test, and a cache hit would replay the previous verdict
+		// instead of running anything. testFilesFor is still needed by
+		// checkpoint's loadedCache.Update, so the fresh verdict lands in
+		// the cache file as usual.
+		hits := 0
+		if cfg.RunMutantID == "" {
+			hits = loadedCache.Lookup(mutants, hasher, testFilesFor)
+		}
+		if hits > 0 {
 			pendingCount -= hits
 			// When equivalence detection is off this run, a cached EQUIVALENT
 			// must not surface — report the survivor honestly as LIVED. The
@@ -918,6 +977,19 @@ func run(ctx context.Context, args []string) error {
 	// mutants fall out the same way, but unlike EQUIVALENT they represent a
 	// *missing* measurement, so the run warns before evaluating the gates.
 	warnInfraErrors(stderr, r)
+	// --run-mutant-id exists to answer one question — "did the test I just
+	// wrote kill this mutant?" — from an exit code. Every status other than
+	// KILLED and LIVED leaves that unanswered, and the gates below would
+	// still exit 0: those statuses drop out of the efficacy denominator,
+	// and a zero denominator skips the gate entirely. Report the non-answer
+	// rather than let a script read it as a kill. mutants holds exactly the
+	// one FilterByStableID returned; anything that empties it has already
+	// returned above.
+	if cfg.RunMutantID != "" {
+		if s := mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
+			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", cfg.RunMutantID, s)
+		}
+	}
 	tested := r.MutantsKilled + r.MutantsLived
 	mcoverDenom := tested + r.MutantsNotCovered
 	mcover := 0.0
@@ -946,6 +1018,23 @@ func run(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+// runMutantDroppedError explains which filter dropped the mutant that
+// --run-mutant-id had already resolved. A suppression carries its own
+// reason, written either at the site or by --exclude-calls; when nothing
+// was suppressed, --changed-since is what narrowed the run.
+func runMutantDroppedError(id, changedSince string, suppressed []discover.Suppression) error {
+	if len(suppressed) > 0 {
+		reason := suppressed[0].Reason
+		if reason == "" {
+			reason = "no reason"
+		}
+		return fmt.Errorf("the mutant matching --run-mutant-id %q is suppressed at %s:%d (%s)",
+			id, suppressed[0].Mutant.RelFile, suppressed[0].Mutant.Line, reason)
+	}
+	return fmt.Errorf("the mutant matching --run-mutant-id %q is not on any line changed since %q",
+		id, changedSince)
 }
 
 // warnInfraErrors notes on stderr that part of the run never produced a

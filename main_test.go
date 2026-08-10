@@ -18,6 +18,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/config"
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/report"
 	"github.com/szhekpisov/gomutants/internal/runner"
 )
@@ -2106,5 +2107,310 @@ func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
 	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "exclude-calls-defaults") {
 		t.Errorf("error should name the flag, got: %v", err)
+	}
+}
+
+func TestRunUnknownMutantIDIsUsageError(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	// Exit 2, not 1: naming a mutant that doesn't exist is a bad
+	// invocation, in the same class as an unknown flag.
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("error should explain the id matched nothing, got: %v", err)
+	}
+}
+
+func TestRunAmbiguousMutantIDIsUsageError(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// setupTinyProject's Add has one `+`, so widen the mutator set to get
+	// several mutants under one file prefix.
+	err := run(context.Background(), []string{
+		"--run-mutant-id", "add.go:",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error should report the prefix as ambiguous, got: %v", err)
+	}
+}
+
+// TestRunMutantIDResolvesBeforeCoverage pins the *placement* of the id
+// resolution: it happens on the discovered set right after packages are
+// resolved, so a typo costs nothing. Both slow phases are stubbed to fail;
+// if resolution moved back below them, one of those markers would surface
+// instead of the usage error.
+func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origCov := runCoverageFunc
+	defer func() { runCoverageFunc = origCov }()
+	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
+		return "", errors.New("coverage ran: marker_cov")
+	}
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
+		return 0, errors.New("baseline ran: marker_base")
+	}
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("an unknown id must be diagnosed before the coverage and baseline runs, got: %v", err)
+	}
+}
+
+// TestRunMutantIDRejectsDryRun: --dry-run returns before anything is
+// compiled or tested, so the pair would exit 0 for a mutant that was never
+// measured — which a script reads as a kill.
+func TestRunMutantIDRejectsDryRun(t *testing.T) {
+	err := run(context.Background(), []string{
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"--dry-run",
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := "--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRunMutantIDRejectsDryRunFromYAML pins the guard's placement after
+// ApplyFlags: dry-run is a config-file key with no CLI way to turn it back
+// off, so a committed `dry-run: true` is exactly the case the caller cannot
+// see. Hoisting the check above the merge would pass this project through.
+func TestRunMutantIDRejectsDryRunFromYAML(t *testing.T) {
+	dir := setupTinyProject(t)
+	cfgPath := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(cfgPath, []byte("dry-run: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{
+		"--config", cfgPath,
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := "--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunMutantIDNarrowsToOneMutant(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// First a full run, to learn a real id from the report rather than
+	// hard-coding one the anchoring scheme might later change.
+	full := filepath.Join(dir, "full.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache=off", "-o", full, "testmod",
+	}); err != nil {
+		t.Fatalf("full run: %v", err)
+	}
+	r := loadReport(t, full)
+	if len(r.Files) == 0 || len(r.Files[0].Mutations) == 0 {
+		t.Fatalf("full run produced no mutations: %+v", r.Files)
+	}
+	id := r.Files[0].Mutations[0].ID
+
+	one := filepath.Join(dir, "one.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache=off",
+		"--run-mutant-id", id, "-o", one, "testmod",
+	}); err != nil {
+		t.Fatalf("single-mutant run: %v", err)
+	}
+
+	got := loadReport(t, one)
+	total := 0
+	for _, f := range got.Files {
+		total += len(f.Mutations)
+	}
+	if total != 1 {
+		t.Fatalf("single-mutant run reported %d mutations, want 1", total)
+	}
+	if got.Files[0].Mutations[0].ID != id {
+		t.Errorf("reported id=%q, want %q", got.Files[0].Mutations[0].ID, id)
+	}
+	if got.MutantsTotal != 1 {
+		t.Errorf("MutantsTotal=%d, want 1", got.MutantsTotal)
+	}
+}
+
+func TestRunMutantIDBypassesCache(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	cachePath := filepath.Join(dir, "cache.json")
+	full := filepath.Join(dir, "full.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache", cachePath, "-o", full, "testmod",
+	}); err != nil {
+		t.Fatalf("warming run: %v", err)
+	}
+	id := loadReport(t, full).Files[0].Mutations[0].ID
+
+	// Same source, warm cache: an ordinary re-run would replay the stored
+	// verdict. --run-mutant-id must measure it again instead, or the
+	// write-a-test/did-it-die loop would report stale results.
+	one := filepath.Join(dir, "one.json")
+	if err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE", "-w", "1", "--cache", cachePath,
+		"--run-mutant-id", id, "-o", one, "testmod",
+	}); err != nil {
+		t.Fatalf("single-mutant run: %v", err)
+	}
+
+	got := loadReport(t, one)
+	if got.MutantsCached != 0 {
+		t.Errorf("MutantsCached=%d, want 0 — --run-mutant-id must skip the cache lookup", got.MutantsCached)
+	}
+	if got.MutantsTotal != 1 {
+		t.Fatalf("MutantsTotal=%d, want 1", got.MutantsTotal)
+	}
+	if got.MutantsKilled+got.MutantsLived != 1 {
+		t.Errorf("the mutant should have a fresh verdict, got killed=%d lived=%d",
+			got.MutantsKilled, got.MutantsLived)
+	}
+}
+
+// writeModuleWithFiles creates a module rooted at a temp dir from the
+// given file map, with go.mod written for the caller.
+func writeModuleWithFiles(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	files["go.mod"] = "module testmod\n\ngo 1.26\n"
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func TestRunMutantIDSuppressedIsUsageError(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n" +
+			"\treturn a + b // gomutants:disable ARITHMETIC_BASE reason=\"checked elsewhere\"\n}\n",
+		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	})
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// The id resolves — the directive filter runs after FilterByStableID —
+	// so without the guard this run would test nothing and exit 0.
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (checked elsewhere)`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunMutantIDWithoutVerdictIsError(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		// Sub has no test, so its mutant comes back NOT COVERED: a status
+		// that leaves the efficacy denominator empty and would otherwise
+		// exit 0 through the skipped gate.
+		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n" +
+			"func Sub(a, b int) int {\n\treturn a - b\n}\n",
+		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	})
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Sub:ARITHMETIC_BASE#1",
+		"--threshold-efficacy", "100",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	// Exit 1, not 2: the invocation was fine, the measurement was not.
+	requireExitCode(t, err, exitCodeRuntimeError)
+	want := `--run-mutant-id "add.go:Sub:ARITHMETIC_BASE#1" produced no verdict: the mutant is NOT COVERED`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestRunMutantDroppedError(t *testing.T) {
+	suppression := func(reason string) []discover.Suppression {
+		return []discover.Suppression{{
+			Mutant: mutator.Mutant{RelFile: "pkg/a.go", Line: 12},
+			Reason: reason,
+		}}
+	}
+	tests := []struct {
+		name         string
+		changedSince string
+		suppressed   []discover.Suppression
+		want         string
+	}{
+		{
+			name:       "suppressed with reason",
+			suppressed: suppression("commutative"),
+			want:       `the mutant matching --run-mutant-id "a#1" is suppressed at pkg/a.go:12 (commutative)`,
+		},
+		{
+			name:       "suppressed without reason",
+			suppressed: suppression(""),
+			want:       `the mutant matching --run-mutant-id "a#1" is suppressed at pkg/a.go:12 (no reason)`,
+		},
+		{
+			name:         "outside the diff",
+			changedSince: "origin/main",
+			want:         `the mutant matching --run-mutant-id "a#1" is not on any line changed since "origin/main"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := runMutantDroppedError("a#1", tt.changedSince, tt.suppressed)
+			if got.Error() != tt.want {
+				t.Errorf("error = %q, want %q", got.Error(), tt.want)
+			}
+		})
 	}
 }

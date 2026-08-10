@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -372,6 +373,88 @@ func F(a, b, c bool) bool {
 	}
 }
 
+// mutantsWithIDs builds a mutant slice carrying only the StableIDs, which
+// is all FilterByStableID looks at.
+func mutantsWithIDs(ids ...string) []mutator.Mutant {
+	ms := make([]mutator.Mutant, len(ids))
+	for i, id := range ids {
+		ms[i] = mutator.Mutant{StableID: id}
+	}
+	return ms
+}
+
+func TestFilterByStableIDExactMatch(t *testing.T) {
+	ms := mutantsWithIDs(
+		"a.go:F:ARITHMETIC_BASE#1",
+		"a.go:F:ARITHMETIC_BASE#2",
+		"b.go:G:BRANCH_IF#1",
+	)
+
+	got, err := FilterByStableID(ms, "a.go:F:ARITHMETIC_BASE#2")
+	if err != nil {
+		t.Fatalf("FilterByStableID: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(got)=%d, want 1", len(got))
+	}
+	if got[0].StableID != "a.go:F:ARITHMETIC_BASE#2" {
+		t.Errorf("got %q, want the exactly-matching mutant", got[0].StableID)
+	}
+}
+
+func TestFilterByStableIDUniquePrefix(t *testing.T) {
+	ms := mutantsWithIDs(
+		"a.go:F:ARITHMETIC_BASE#1",
+		"b.go:G:BRANCH_IF#1",
+	)
+
+	got, err := FilterByStableID(ms, "b.go:G")
+	if err != nil {
+		t.Fatalf("FilterByStableID: %v", err)
+	}
+	if len(got) != 1 || got[0].StableID != "b.go:G:BRANCH_IF#1" {
+		t.Fatalf("got %+v, want the single b.go mutant", got)
+	}
+}
+
+func TestFilterByStableIDExactBeatsPrefix(t *testing.T) {
+	// "#1" is a literal prefix of "#10" and "#11". Without exact-match
+	// precedence the most ordinary request there is — a function's first
+	// mutant of some type — would be rejected as ambiguous.
+	ms := mutantsWithIDs(
+		"a.go:F:ARITHMETIC_BASE#1",
+		"a.go:F:ARITHMETIC_BASE#10",
+		"a.go:F:ARITHMETIC_BASE#11",
+	)
+
+	got, err := FilterByStableID(ms, "a.go:F:ARITHMETIC_BASE#1")
+	if err != nil {
+		t.Fatalf("FilterByStableID: %v", err)
+	}
+	if len(got) != 1 || got[0].StableID != "a.go:F:ARITHMETIC_BASE#1" {
+		t.Fatalf("got %+v, want exactly #1", got)
+	}
+}
+
+func TestFilterByStableIDUnknown(t *testing.T) {
+	ms := mutantsWithIDs("a.go:F:ARITHMETIC_BASE#1", "b.go:G:BRANCH_IF#1")
+
+	got, err := FilterByStableID(ms, "nope")
+	if err == nil {
+		t.Fatalf("expected an error, got %+v", got)
+	}
+	if got != nil {
+		t.Errorf("expected no mutants alongside the error, got %+v", got)
+	}
+	// The message has to say what was searched and how big the haystack
+	// was, so a typo is distinguishable from a scoping mistake.
+	for _, want := range []string{"nope", "2 discovered", "--only"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+}
+
 func TestAnchorName(t *testing.T) {
 	// The first occurrence is bare; only a repeat pays the suffix.
 	if got := anchorName("init", 1); got != "init" {
@@ -529,5 +612,114 @@ func TestDiscoverStableIDsAreIndependentOfThePackageArgument(t *testing.T) {
 	}
 	if wide[0].RelFile != "a/a.go" {
 		t.Errorf("wide RelFile=%q, want %q", wide[0].RelFile, "a/a.go")
+	}
+}
+
+func TestFilterByStableIDAmbiguous(t *testing.T) {
+	ms := mutantsWithIDs(
+		"a.go:F:ARITHMETIC_BASE#1",
+		"a.go:F:ARITHMETIC_BASE#2",
+		"b.go:G:BRANCH_IF#1",
+	)
+
+	got, err := FilterByStableID(ms, "a.go:F")
+	if err == nil {
+		t.Fatalf("expected an ambiguity error, got %+v", got)
+	}
+	if got != nil {
+		t.Errorf("expected no mutants alongside the error, got %+v", got)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "ambiguous") || !strings.Contains(msg, "2 mutants") {
+		t.Errorf("error %q should name the ambiguity and the count", msg)
+	}
+	// Both candidates must be listed so the user can paste one back.
+	for _, want := range []string{"a.go:F:ARITHMETIC_BASE#1", "a.go:F:ARITHMETIC_BASE#2"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q missing candidate %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "b.go") {
+		t.Errorf("error %q listed a non-matching mutant", msg)
+	}
+}
+
+func TestFilterByStableIDAmbiguousTruncatesCandidates(t *testing.T) {
+	// Seven matches: five listed, the rest summarized.
+	ids := make([]string, 0, 7)
+	for i := 1; i <= 7; i++ {
+		ids = append(ids, fmt.Sprintf("a.go:F:ARITHMETIC_BASE#%d", i))
+	}
+	_, err := FilterByStableID(mutantsWithIDs(ids...), "a.go:")
+	if err == nil {
+		t.Fatal("expected an ambiguity error")
+	}
+	msg := err.Error()
+	// On its own line, not trailing the fifth candidate.
+	if !strings.Contains(msg, "\n  ... and 2 more") {
+		t.Errorf("error %q should summarize the remaining candidates on their own line", msg)
+	}
+	if strings.Contains(msg, "ARITHMETIC_BASE#6") {
+		t.Errorf("error %q listed a candidate past the cap", msg)
+	}
+	if !strings.Contains(msg, "ARITHMETIC_BASE#5") {
+		t.Errorf("error %q should list up to and including the 5th candidate", msg)
+	}
+}
+
+func TestFilterByStableIDEmptyInput(t *testing.T) {
+	got, err := FilterByStableID(nil, "a.go:F:ARITHMETIC_BASE#1")
+	if err == nil {
+		t.Fatalf("expected an error on an empty mutant list, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "0 discovered") {
+		t.Errorf("error %q should report an empty haystack", err)
+	}
+}
+
+func TestFormatCandidates(t *testing.T) {
+	// Exact equality, not a Contains check: the layout is the contract.
+	// One indented id per line, no leading newline before the first and
+	// no trailing newline after the last.
+	got := formatCandidates(mutantsWithIDs("a.go:F:T#1", "a.go:F:T#2", "a.go:F:T#3"))
+	want := "  a.go:F:T#1\n  a.go:F:T#2\n  a.go:F:T#3"
+	if got != want {
+		t.Errorf("formatCandidates =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestFormatCandidatesTruncatesExactly(t *testing.T) {
+	ids := make([]string, 0, 7)
+	for i := 1; i <= 7; i++ {
+		ids = append(ids, fmt.Sprintf("a.go:F:T#%d", i))
+	}
+
+	// The cap replaces the sixth entry with the summary and stops there —
+	// nothing from the tail may leak out past it.
+	got := formatCandidates(mutantsWithIDs(ids...))
+	want := "  a.go:F:T#1\n  a.go:F:T#2\n  a.go:F:T#3\n  a.go:F:T#4\n  a.go:F:T#5\n  ... and 2 more"
+	if got != want {
+		t.Errorf("formatCandidates =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestFormatCandidatesSingle(t *testing.T) {
+	// One candidate: no separator anywhere.
+	got := formatCandidates(mutantsWithIDs("a.go:F:T#1"))
+	if got != "  a.go:F:T#1" {
+		t.Errorf("formatCandidates = %q, want a single indented line", got)
+	}
+}
+
+func TestFormatCandidatesExactlyAtCap(t *testing.T) {
+	// Exactly maxAmbiguousListed candidates: all listed, no summary line.
+	ids := make([]string, 0, maxAmbiguousListed)
+	for i := 1; i <= maxAmbiguousListed; i++ {
+		ids = append(ids, fmt.Sprintf("a.go:F:T#%d", i))
+	}
+	got := formatCandidates(mutantsWithIDs(ids...))
+	want := "  a.go:F:T#1\n  a.go:F:T#2\n  a.go:F:T#3\n  a.go:F:T#4\n  a.go:F:T#5"
+	if got != want {
+		t.Errorf("formatCandidates =\n%q\nwant\n%q", got, want)
 	}
 }

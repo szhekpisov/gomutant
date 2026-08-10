@@ -47,6 +47,10 @@ output: mutation-report.json
 # the CLI overrides. Requires a git repository.
 # changed-since: ""
 
+# There is deliberately no run-mutant-id key: --run-mutant-id is a
+# CLI-only flag. Pinning one id in a committed config would make every
+# later run test a single mutant, with no CLI value that turns it back off.
+
 # Incremental-analysis cache path. The default (".gomutants-cache.json")
 # enables caching at that path; set to "off" to disable. Per-mutant
 # outcomes are keyed by content hashes of the production file and the

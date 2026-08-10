@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
@@ -160,4 +161,66 @@ func stableIDFile(absPath, moduleRoot string) string {
 		return filepath.ToSlash(absPath)
 	}
 	return filepath.ToSlash(rel)
+}
+
+// maxAmbiguousListed caps how many candidate IDs an ambiguity error
+// spells out. Enough to pick from, short enough to stay readable when a
+// one-character prefix matches a whole package.
+const maxAmbiguousListed = 5
+
+// FilterByStableID narrows mutants to the single one identified by id,
+// which is the `id` field of a JSON report entry.
+//
+// An exact StableID match wins outright; only when there is none is id
+// treated as a prefix, and then it must match exactly one mutant. The
+// precedence is load-bearing rather than a convenience: "#1" is a literal
+// prefix of "#10", so prefix-only matching would report the most ordinary
+// case — a function's first mutant of some type — as ambiguous.
+//
+// Both failure modes are errors because both mean the run cannot do what
+// was asked, but they carry different messages: an unknown id is usually
+// a scoping mistake, while an ambiguous one just needs more characters.
+func FilterByStableID(mutants []mutator.Mutant, id string) ([]mutator.Mutant, error) {
+	for _, m := range mutants {
+		if m.StableID == id {
+			return []mutator.Mutant{m}, nil
+		}
+	}
+
+	var matches []mutator.Mutant
+	for _, m := range mutants {
+		if strings.HasPrefix(m.StableID, id) {
+			matches = append(matches, m)
+		}
+	}
+
+	switch len(matches) {
+	case 1:
+		return matches, nil
+	case 0:
+		return nil, fmt.Errorf(
+			"no mutant matches --run-mutant-id %q among the %d discovered; check the package argument, --only/--disable, and that the id came from a report for this revision",
+			id, len(mutants))
+	default:
+		return nil, fmt.Errorf(
+			"--run-mutant-id %q is ambiguous, matching %d mutants; use a longer prefix or the full id:\n%s",
+			id, len(matches), formatCandidates(matches))
+	}
+}
+
+// formatCandidates renders an ambiguity error's candidate list, one
+// indented id per line, truncated to maxAmbiguousListed.
+func formatCandidates(matches []mutator.Mutant) string {
+	var b strings.Builder
+	for i, m := range matches {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		if i == maxAmbiguousListed {
+			fmt.Fprintf(&b, "  ... and %d more", len(matches)-maxAmbiguousListed)
+			break
+		}
+		fmt.Fprintf(&b, "  %s", m.StableID)
+	}
+	return b.String()
 }
