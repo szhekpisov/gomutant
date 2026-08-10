@@ -59,7 +59,15 @@ type FileReport struct {
 }
 
 // MutationReport is a single mutation entry.
+//
+// ID is gomutants-specific (additive, ignored by gremlins consumers): a
+// cross-run handle of the form "rel_file:anchor:TYPE#n" — see
+// mutator.Mutant.StableID. It is stable against line shifts and edits to
+// other functions, so reports from successive runs can be diffed entry by
+// entry. It changes when the mutant's own function is renamed, or when a
+// same-type mutation point is added or removed earlier in that function.
 type MutationReport struct {
+	ID          string `json:"id"`
 	Type        string `json:"type"`
 	Status      string `json:"status"`
 	Line        int    `json:"line"`
@@ -114,6 +122,7 @@ func Generate(mutants []mutator.Mutant, goModule string, elapsed time.Duration, 
 		}
 
 		mr := MutationReport{
+			ID:          m.StableID,
 			Type:        string(m.Type),
 			Status:      m.Status.String(),
 			Line:        m.Line,

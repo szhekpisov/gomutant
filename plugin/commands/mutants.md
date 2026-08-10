@@ -57,6 +57,7 @@ Read `/tmp/gomutants-report.json`. Schema:
       "file_name": "...",
       "mutations": [
         {
+          "id": "pkg/file.go:FuncName:TYPE#1",
           "type": "...",
           "status": "LIVED|KILLED|NOT COVERED|NOT VIABLE|TIMED OUT|INFRA ERROR",
           "line": N,
@@ -70,6 +71,8 @@ Read `/tmp/gomutants-report.json`. Schema:
 }
 ```
 
+`id` is a stable per-mutant handle, formatted `file:function:TYPE#n`, where the file part is relative to the module root. It is anchored to the enclosing function rather than to a line, and does not depend on which packages the run was scoped to, so it stays the same across runs even when the file is reformatted, edited elsewhere, or covered by a different package argument — carry it into your output so the user can match a suggestion to the same mutant on a later run.
+
 Filter to `status == "LIVED"`. Note the `NOT COVERED` count per file separately as a secondary signal — those mutants no test even exercises. Count `INFRA ERROR` entries separately as an incomplete environmental outcome; they are intentionally excluded from test proposals and the incremental cache.
 
 ## Step 4 — propose tests
@@ -82,6 +85,7 @@ For up to ~10 surviving mutants (prioritise files with the most survivors):
 
    ```
    ### <file>:<line>  —  <type>   (status: LIVED)
+   `<id>`
    `<original>`  →  `<replacement>`
 
    **Why it survived:** <one sentence — what existing tests fail to assert>

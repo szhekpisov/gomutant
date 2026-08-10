@@ -790,6 +790,36 @@ Compatible with the gremlins JSON format:
 }
 ```
 
+Each entry under `files[].mutations[]` looks like this:
+
+```json
+{
+  "id": "internal/runner/pool.go:(*Pool).dispatch:CONDITIONALS_BOUNDARY#2",
+  "type": "CONDITIONALS_BOUNDARY",
+  "status": "LIVED",
+  "line": 142,
+  "column": 9,
+  "original": "<",
+  "replacement": "<="
+}
+```
+
+`id` is a stable handle for one mutant, formatted `file:function:TYPE#n`. The file segment is the path relative to the module root. Unlike the enclosing entry's `file_name`, which stays gremlins-compatible by dropping the import-path prefix shared by the packages in the run, it does not depend on which packages you asked for — so the same mutant carries the same `id` under `gomutants ./...` and under `gomutants ./internal/runner/`. The function segment is the enclosing declaration — `(*T).Method` for methods, empty for package-level declarations, and the enclosing function (not the literal) for mutants inside a closure. `n` counts mutants sharing those three fields, in source order.
+
+Because the ID is anchored to a function rather than a line, it survives edits elsewhere in the file: adding imports, reformatting, or changing a neighbouring function all leave it untouched, so two runs' reports can be diffed entry by entry to see which mutants are *still* alive. Adding a *differently* named neighbour is one such edit; adding one that renders to the same name is the exception, covered below. IDs are unique within a report. The Stryker and HTML reports use the same string as their mutant `id`.
+
+An ID does change when:
+
+- the enclosing function is renamed, or its receiver type changes;
+- a same-type mutation point is added or removed earlier in that same function;
+- the file is renamed or moved;
+- a same-type mutation point is added or removed earlier in the same file, for the package-level declarations that share the empty function segment. Mutants inside functions are unaffected;
+- a declaration rendering to the same name as the enclosing one is added or removed earlier in the file — in practice, another `func init()`. See below.
+
+Two declarations in one file that render to the same name — most often a second `func init()` — are told apart by an occurrence suffix: `init`, then `init~2`. They do not share a counter, so an edit inside the first leaves the second's IDs alone.
+
+The suffix counts occurrences in source order, so inserting a third `func init()` *above* the other two shifts them to `init~2` and `init~3` and hands the new declaration the bare `init` anchor. Unlike a rename, this does not retire the old IDs: they still resolve, but to mutants in a different declaration, so a report diff across that edit reads them as the same mutant changing status. Compare by line as well when a file gains or loses an `init`. Nothing else collides — two same-named functions are a compile error, and a method's anchor carries its receiver type.
+
 `mutants_suppressed` is omitted when zero; it counts mutants dropped by `// gomutants:disable*` directives or by [`--exclude-calls`](#call-site-exclusion), and is excluded from every other count. `mutants_suppressed_by_calls` (also omitted when zero) breaks out the `--exclude-calls` share of that total rather than adding to it.
 
 `mutants_equivalent` is omitted when zero; it counts surviving mutants proven equivalent by `--detect-equivalent`. They stay in `mutants_total` but count as neither killed nor lived, so they drop out of the `test_efficacy` denominator.

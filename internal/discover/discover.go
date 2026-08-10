@@ -119,6 +119,10 @@ type Result struct {
 func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string) *Result {
 	var allCandidates []mutator.MutantCandidate
 	files := make(map[string]*ParsedFile)
+	// Function spans per file, for resolving each candidate's stable-ID
+	// anchor. Kept local rather than on ParsedFile so the parse cache's
+	// contract stays unchanged.
+	spansByFile := make(map[string][]funcSpan)
 
 	for _, pkg := range pkgs {
 		for _, filename := range pkg.GoFiles {
@@ -131,6 +135,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 				continue
 			}
 			files[absPath] = &ParsedFile{Src: src, File: file}
+			spansByFile[absPath] = funcSpans(fset, file)
 			for _, m := range mutators {
 				candidates := m.Discover(fset, file, src)
 				allCandidates = append(allCandidates, candidates...)
@@ -138,7 +143,8 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		}
 	}
 
-	// Sort by file, line, column, type for deterministic output.
+	// Sort into candidateLess order: deterministic output, and the total
+	// order the stable-ID ordinals below are counted in.
 	sort.Slice(allCandidates, func(i, j int) bool {
 		return candidateLess(allCandidates[i], allCandidates[j])
 	})
@@ -156,8 +162,10 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 	// then RelFile for "github.com/foo/bar/pkg/diffyml/cli/cli.go" is "cli/cli.go".
 	commonPrefix := longestCommonPrefix(pkgs)
 
-	// Convert candidates to mutants.
+	// Convert candidates to mutants. The loop runs in candidateLess order,
+	// so the per-group ordinals feeding stable IDs are deterministic.
 	mutants := make([]mutator.Mutant, len(allCandidates))
+	ordinals := make(map[ordinalKey]int)
 	for i, c := range allCandidates {
 		absPath := c.Pos.Filename
 		pkg := filePkg[absPath]
@@ -168,8 +176,16 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		// Coverage profile path: ImportPath/filename.
 		coverageFile := pkg + "/" + filepath.Base(absPath)
 
+		key := ordinalKey{
+			file:   stableIDFile(absPath, moduleRoot),
+			anchor: anchorFor(spansByFile[absPath], c.Pos.Offset),
+			typ:    c.Type,
+		}
+		ordinals[key]++
+
 		mutants[i] = mutator.Mutant{
 			ID:           i + 1,
+			StableID:     stableID(key, ordinals[key]),
 			Type:         c.Type,
 			File:         absPath,
 			RelFile:      relPath,
@@ -210,8 +226,20 @@ func parseFile(fset *token.FileSet, path string) ([]byte, *ast.File, error) {
 	return src, file, nil
 }
 
-// candidateLess orders candidates by (file, line, column, type) so
-// Discover produces deterministic output regardless of the AST-walk order.
+// candidateLess orders candidates by (file, line, column, type, end offset,
+// replacement) so Discover produces deterministic output regardless of the
+// AST-walk order.
+//
+// The last two fields make the order total, which the stable-ID ordinals
+// depend on. Position and type alone do not separate every candidate: in a
+// nested boolean expression like `a && b && c`, EXPRESSION_REMOVE emits one
+// candidate for the outer left operand (`a && b`) and one for the inner
+// (`a`), both starting at `a`. Left tied, sort.Slice — which is not stable —
+// could order them either way, and the two would swap the `#1` and `#2`
+// suffixes of an otherwise identical ID, so the same string would name a
+// different mutation from run to run. End offset separates them by span,
+// innermost first; replacement is a final backstop for same-type candidates
+// covering the identical span.
 //
 // Each field is compared with a < / > pair (no `!=` guard). The pattern
 // keeps every `<` mutation observable: a guarded `if a != b { return a < b }`
@@ -236,7 +264,19 @@ func candidateLess(a, b mutator.MutantCandidate) bool {
 	if a.Pos.Column > b.Pos.Column {
 		return false
 	}
-	return a.Type < b.Type
+	if a.Type < b.Type {
+		return true
+	}
+	if a.Type > b.Type {
+		return false
+	}
+	if a.EndOffset < b.EndOffset {
+		return true
+	}
+	if a.EndOffset > b.EndOffset {
+		return false
+	}
+	return a.Replacement < b.Replacement
 }
 
 // computeRelFile produces a gremlins-compatible module-relative path.

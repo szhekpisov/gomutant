@@ -386,3 +386,59 @@ func TestReportMutantsSuppressedByCallsSerialization(t *testing.T) {
 		t.Errorf("mutants_suppressed_by_calls should be omitted when 0, got: %s", data)
 	}
 }
+
+func TestGenerateCarriesStableID(t *testing.T) {
+	mutants := []mutator.Mutant{
+		{
+			ID: 1, StableID: "a.go:Add:ARITHMETIC_BASE#1", Type: mutator.ArithmeticBase,
+			RelFile: "a.go", Line: 10, Col: 5, Status: mutator.StatusLived,
+		},
+		{
+			ID: 2, StableID: "a.go:Add:ARITHMETIC_BASE#2", Type: mutator.ArithmeticBase,
+			RelFile: "a.go", Line: 12, Col: 5, Status: mutator.StatusKilled,
+		},
+	}
+
+	r := Generate(mutants, "mod", time.Second, 0)
+	if len(r.Files) != 1 || len(r.Files[0].Mutations) != 2 {
+		t.Fatalf("expected 1 file with 2 mutations, got files=%v", r.Files)
+	}
+	// The stable ID must ride along per entry, not be derived from the
+	// sequential ID or shared across the file.
+	for i, want := range []string{"a.go:Add:ARITHMETIC_BASE#1", "a.go:Add:ARITHMETIC_BASE#2"} {
+		if got := r.Files[0].Mutations[i].ID; got != want {
+			t.Errorf("Mutations[%d].ID=%q, want %q", i, got, want)
+		}
+	}
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"id":"a.go:Add:ARITHMETIC_BASE#1"`) {
+		t.Errorf("expected the id field under the `id` JSON key, got: %s", data)
+	}
+
+	var loaded Report
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if loaded.Files[0].Mutations[1].ID != "a.go:Add:ARITHMETIC_BASE#2" {
+		t.Errorf("after round-trip: ID=%q", loaded.Files[0].Mutations[1].ID)
+	}
+}
+
+func TestGenerateEmitsIDEvenWhenEmpty(t *testing.T) {
+	// `id` carries no omitempty: a consumer indexing on it should see the
+	// key on every entry rather than have it vanish.
+	mutants := []mutator.Mutant{
+		{ID: 1, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 1, Col: 1, Status: mutator.StatusKilled},
+	}
+	data, err := json.Marshal(Generate(mutants, "mod", time.Second, 0))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"id":""`) {
+		t.Errorf("expected an empty id key to be present, got: %s", data)
+	}
+}
