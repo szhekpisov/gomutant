@@ -2151,6 +2151,79 @@ func TestRunAmbiguousMutantIDIsUsageError(t *testing.T) {
 	}
 }
 
+// TestRunMutantIDResolvesBeforeCoverage pins the *placement* of the id
+// resolution: it happens on the discovered set right after packages are
+// resolved, so a typo costs nothing. Both slow phases are stubbed to fail;
+// if resolution moved back below them, one of those markers would surface
+// instead of the usage error.
+func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origCov := runCoverageFunc
+	defer func() { runCoverageFunc = origCov }()
+	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
+		return "", errors.New("coverage ran: marker_cov")
+	}
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
+		return 0, errors.New("baseline ran: marker_base")
+	}
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("an unknown id must be diagnosed before the coverage and baseline runs, got: %v", err)
+	}
+}
+
+// TestRunMutantIDRejectsDryRun: --dry-run returns before anything is
+// compiled or tested, so the pair would exit 0 for a mutant that was never
+// measured — which a script reads as a kill.
+func TestRunMutantIDRejectsDryRun(t *testing.T) {
+	err := run(context.Background(), []string{
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"--dry-run",
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := "--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRunMutantIDRejectsDryRunFromYAML pins the guard's placement after
+// ApplyFlags: dry-run is a config-file key with no CLI way to turn it back
+// off, so a committed `dry-run: true` is exactly the case the caller cannot
+// see. Hoisting the check above the merge would pass this project through.
+func TestRunMutantIDRejectsDryRunFromYAML(t *testing.T) {
+	dir := setupTinyProject(t)
+	cfgPath := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(cfgPath, []byte("dry-run: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{
+		"--config", cfgPath,
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := "--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestRunMutantIDNarrowsToOneMutant(t *testing.T) {
 	dir := setupTinyProject(t)
 	orig, _ := os.Getwd()

@@ -842,7 +842,7 @@ jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
 gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
 ```
 
-A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. All of those exit **2**, the same as any other bad invocation. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
+A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. So is combining it with `--dry-run`, which returns before anything is compiled or tested. All of those exit **2**, the same as any other bad invocation. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
 
 Pair it with a threshold to get a scriptable answer:
 
@@ -853,7 +853,7 @@ gomutants --run-mutant-id "$ID" --threshold-efficacy 100 ./...   # exit 0 = kill
 Three behaviors worth knowing:
 
 - **The incremental cache is bypassed for that mutant.** A cache hit would replay the previous verdict rather than run anything, which is exactly the wrong answer when you have just edited a test. The fresh verdict is still written back to the cache.
-- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is one mutant test run instead of N, which is the part that grows with the package.
+- **Setup is not skipped.** Coverage collection, the baseline measurement and the per-test coverage map all still run — the saving is one mutant test run instead of N, which is the part that grows with the package. A bad `id` is the exception: it is resolved against the discovered set before those phases start, so a typo or a stale anchor fails immediately instead of after a full `go test -cover`.
 - **A missing verdict exits 1, not 0.** `KILLED` and `LIVED` are the only two statuses that answer the question. If the named mutant comes back `NOT COVERED`, `NOT VIABLE`, `TIMED OUT`, `EQUIVALENT` or `INFRA ERROR`, the thresholds above would see an empty denominator, skip the gate and exit 0 — so a single-mutant run instead fails with the status it got. Ordinary whole-package runs keep the skip-the-gate behavior.
 
 ## Self-efficacy (gomutants on itself)

@@ -439,6 +439,16 @@ func run(ctx context.Context, args []string) error {
 		return usageErrorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
 	}
 
+	// --run-mutant-id exists to answer "did the test I just wrote kill this
+	// mutant?" from an exit code, and --dry-run returns before anything is
+	// compiled or tested. The pair would print the mutant and exit 0 — which
+	// a script reads as a kill. Checked after ApplyFlags because dry-run is
+	// also a config-file key: a committed `dry-run: true` is invisible to the
+	// caller and cannot be turned back off from the command line.
+	if cfg.RunMutantID != "" && cfg.DryRun {
+		return usageErrorf("--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report")
+	}
+
 	// Checked after ApplyFlags so a value from .gomutants.yml is screened
 	// too, not just the CLI one.
 	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
@@ -535,6 +545,29 @@ func run(ctx context.Context, args []string) error {
 		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(pkgs), excludedFiles)
 	}
 	term.PhaseDone(resolveMsg)
+
+	// Resolve --run-mutant-id here, not at step 5. Discovery is pure AST
+	// work over the packages just resolved, so an unknown or ambiguous id
+	// costs nothing to diagnose; leaving it at step 5 would charge a full
+	// `go test -cover` plus a baseline run before reporting a typo or a
+	// stale id — on the one flag whose purpose is to avoid paying for the
+	// whole package. The result is carried to step 5 rather than re-parsed.
+	fset := token.NewFileSet()
+	var (
+		discovered *discover.Result
+		mutants    []mutator.Mutant
+	)
+	if cfg.RunMutantID != "" {
+		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
+		// Runs before every other filter so that "no mutant matches this
+		// id" is diagnosed against the full discovered set rather than
+		// against whatever --changed-since happened to leave behind. Both
+		// drop mutants, so the order doesn't change the intersection.
+		mutants, err = discover.FilterByStableID(discovered.Mutants, cfg.RunMutantID)
+		if err != nil {
+			return usageError(err)
+		}
+	}
 
 	// Integration mode widens coverage collection, the baseline run, and the
 	// per-test map to the reverse-dependency closure R of the target packages
@@ -647,18 +680,11 @@ func run(ctx context.Context, args []string) error {
 
 	// 5. Discover mutants.
 	term.Phase("Discovering mutants...")
-	fset := token.NewFileSet()
-	discovered := discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
-	mutants := discovered.Mutants
-	// --run-mutant-id runs before every other filter so that "no mutant
-	// matches this id" is diagnosed against the full discovered set rather
-	// than against whatever --changed-since happened to leave behind.
-	// Both drop mutants, so the order doesn't change the intersection.
-	if cfg.RunMutantID != "" {
-		mutants, err = discover.FilterByStableID(mutants, cfg.RunMutantID)
-		if err != nil {
-			return usageError(err)
-		}
+	// discovered is already set when --run-mutant-id resolved it above,
+	// along with the single mutant it narrowed to.
+	if discovered == nil {
+		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
+		mutants = discovered.Mutants
 	}
 	if cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, projectDir)
