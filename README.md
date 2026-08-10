@@ -8,27 +8,67 @@
 
 # gomutants
 
-**Mutation testing for Go, fast enough to run on every edit.**
+**The best mutation testing tool for the Go development loop.**
 
-Coverage tells you a line ran. gomutants tells you whether a test would have caught it breaking — the gap that opens widest when tests are written at machine speed.
+**Find the gap. Fix the test. Verify the mutant. Repeat in seconds.**
 
-- **Warm reruns in 2.7–19s** on real projects whose cold runs take 6–46 minutes. The content-addressed cache short-circuits every mutant whose source bytes and covering tests are unchanged, so the loop stays tight enough to run after each edit. [benchmarks](#benchmark-snapshot)
-- **Scoped to your diff.** `--changed-since <ref>` mutates only changed lines, routes each mutant to only the tests that cover it, gates on a threshold, and annotates surviving mutants on the PR.
-- **Survivors come back as test proposals**, not a report to triage — the Claude Code plugin turns each one into a concrete `*_test.go` case without editing your repository.
-- **28 mutators including block-level and return-value operators**, surfacing the weak-assertion gaps that token-only mutation misses.
-- **Built to survive its own parallelism** — adaptive timeouts, an OOM safety net, and bounded per-worker concurrency that keeps parallel mutants from oversubscribing CPU. [how it works](#how-it-works)
+Coverage tells you a line ran. gomutants tells you whether a test would catch it breaking, then gives you the controls to close that gap while you are still developing: changed-code scope, exact covering-test routing, stable single-mutant reruns, source overlays, and a checkpointed content-addressed cache.
+
+gomutants earns that position through the complete path from a code change to a verified test fix. The advantage is the workflow, not any one checkbox: other tools have more mutators or win particular cold benchmarks, but they do not combine the same development-loop controls in one tool. [See the comparison.](#how-it-compares)
+
+## The Go development loop
+
+```bash
+# 1. Find test gaps introduced by this branch.
+gomutants --changed-since main -o mutants.json ./...
+
+# 2. Add or strengthen the test for a surviving mutant.
+
+# 3. Verify that exact mutant instead of rerunning the package.
+gomutants --run-mutant-id \
+  'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' \
+  --threshold-efficacy 100 ./...
+
+# 4. Rerun the changed scope. Unaffected verdicts come from the cache.
+gomutants --changed-since main ./...
+```
+
+The targeted command bypasses the old cached verdict, runs the tests that cover that mutant, and writes the fresh result back to the cache. Exit `0` means the test killed it; exit `10` means it still lived. Mutations are applied with `go test -overlay`, so the source tree is never rewritten.
+
+## Why gomutants leads this loop
+
+- **Work on the change, not the repository.** `--changed-since <ref>` uses the merge base and includes uncommitted edits, keeping local and pull-request runs focused on the code being developed.
+- **Run only the relevant tests.** Per-test coverage routing maps each mutant to the tests that cover its line; `--integration` extends that routing across importing packages when the real assertion lives downstream.
+- **Verify one fix directly.** Stable mutant IDs and unique prefixes turn “did this test kill it?” into one targeted run rather than another full mutation pass.
+- **Keep completed work.** The default content-addressed cache reuses a verdict only while the mutated source and its relevant tests remain byte-identical. Mid-run checkpoints also let interrupted runs resume instead of starting over.
+- **Make the workflow repeatable.** An auto-loaded [`.gomutants.yml`](#configuration-file) keeps operators, exclusions, thresholds, routing, timeouts, and cache behavior with the project; CLI flags can override it for one run.
+- **Keep the working tree clean.** Byte-level overlays preserve Go syntax, including generics, without copying or editing source files.
+- **Get an actionable result.** Terminal diffs, JSON, Stryker, self-contained HTML, GitHub annotations, and the Claude Code plugin put each survivor where a developer or coding agent can act on it.
+
+### Measured feedback time
+
+On the published Apple M1 Pro benchmark, unchanged out-of-the-box reruns complete **120–150× faster** on the larger targets because cached mutants do not execute again:
+
+| Target | Cold run | Warm rerun | Speedup |
+|---|---:|---:|---:|
+| spf13/cobra | 410 s | **2.7 s** | **~150×** |
+| prometheus/model/labels | 342 s | **2.8 s** | **~120×** |
+| prometheus tsdb-4 | 2768 s (~46 min) | **19 s** | **~145×** |
+
+These are unchanged-tree reruns, not a claim that all edits are free: changing source or covering tests invalidates the affected cached verdicts. Cold-engine ordering also depends on the target; gremlins is faster on the smallest measured external project, while gomutants leads the measured medium single-package targets. See the [benchmark snapshot](#benchmark-snapshot) and [`docs/performance.md`](docs/performance.md) for methodology and reproduction commands.
 
 ## Table of Contents
 
-- [Why gomutants?](#why-gomutants)
+- [The Go development loop](#the-go-development-loop)
+- [Why gomutants leads this loop](#why-gomutants-leads-this-loop)
 - [Installation](#installation)
   - [Go Install](#go-install)
   - [GitHub Action](#github-action)
   - [Direct binary download](#direct-binary-download)
   - [From Source](#from-source)
   - [Verifying Releases](#verifying-releases)
-- [Quick Start](#quick-start)
-- [Where gomutants isn't the fit?](#where-gomutants-isnt-the-fit)
+- [More ways to run](#more-ways-to-run)
+- [Where gomutants is—and isn't—the fit](#where-gomutants-isand-isntthe-fit)
 - [How It Compares](#how-it-compares)
   - [Mutator-set equivalence](#mutator-set-equivalence)
   - [Benchmark snapshot](#benchmark-snapshot)
@@ -50,18 +90,6 @@ Coverage tells you a line ran. gomutants tells you whether a test would have cau
 - [Security & Code Quality](#security--code-quality)
 - [Contributing](#contributing)
 - [License](#license)
-
-## Why gomutants?
-
-* **A passing suite is not a working suite.** Passing tests only show that code and tests agree with each other. A surviving mutant shows a plausible behavioral defect the suite cannot detect — a test that would stay green while the code broke. That gap is widest in test suites written at machine speed, where line coverage climbs faster than assertion strength.
-
-* **The rerun is the number that matters.** Mutation testing gets used when it fits inside the edit/test loop, not when it runs overnight. Warm reruns land at 2.7s (cobra), 2.8s (prometheus labels), and 19s (prometheus tsdb-4) against cold runs of 6.8, 5.7, and 46 minutes — 120–150× faster, because the content-addressed cache re-executes only the mutants whose source bytes or covering tests actually changed. On cold full-module runs gomutants is ~20% faster wall-clock and ~1.7× faster per tested mutant than the nearest Go mutation tester. See [`docs/performance.md`](docs/performance.md) for methodology and external-target benchmarks.
-
-* **Every PR, not every quarter.** `--changed-since <ref>` mutates only lines added or modified since a git ref; per-test coverage routing runs each mutant against only the tests whose coverage touches the mutated line; thresholds gate the change; GitHub annotations place survivors directly on the diff; and JSON, Stryker, and self-contained HTML reports preserve the result.
-
-* **Survivors are findings, not homework.** The `/gomutants:mutants` slash command runs gomutants on changed code and proposes the specific test cases that would kill each surviving mutant, leaving the repository untouched. 28 mutators including block-level operators (`BRANCH_IF`, `BRANCH_ELSE`, `BRANCH_CASE`, `EXPRESSION_REMOVE`, `STATEMENT_REMOVE`, `LOOP_CONDITION`, `RANGE_BREAK`) and return-value operators (`RETURN_ERROR_NIL`, `RETURN_ZERO`, `RETURN_TRUE`, `RETURN_FALSE`) surface the weak-assertion gaps that token-level mutation misses.
-
-* **Built not to lie to you.** Compile-failing mutants surface as `NOT_VIABLE` instead of inflating the score, `--detect-equivalent` drops provably unkillable mutants out of the denominator, adaptive per-mutant timeouts kill infinite-loop mutants in seconds rather than minutes, and byte-level `go test -overlay` patches preserve generics and never modify your source tree.
 
 ## Installation
 
@@ -164,7 +192,7 @@ gh attestation verify gomutants_<VERSION>_linux_amd64.tar.gz \
 
 </details>
 
-## Quick Start
+## More ways to run
 
 ```bash
 # Run on the whole module.
@@ -180,31 +208,30 @@ gomutants unleash ./...
 gomutants --threshold-efficacy 80 ./...
 ```
 
-## Where gomutants isn't the fit?
+## Where gomutants is—and isn't—the fit
 
-One-off manual runs or thin test suites (<70% line coverage) — the one-time setup cost (coverage collection, baseline measurement, per-test coverage map build) only pays off when many mutants share it.
+gomutants is strongest on active codebases with meaningful test suites, where developers repeatedly find, fix, and verify gaps. For a one-off scan, a very small package, or a thin test suite (roughly below 70% line coverage), its up-front coverage collection, baseline measurement, and per-test map may cost more than the later cache and routing can save.
 
 ## How It Compares
 
-| Feature | gomutants | [gremlins](https://github.com/go-gremlins/gremlins) | [go-mutesting](https://github.com/zimmski/go-mutesting) |
-|---|---|---|---|
-| Mutators (default set) | 28 | 5 | 6 |
-| Block-level mutators | yes | no | no |
-| Generics support | yes (byte-patching) | partial[^1] | no |
-| `--changed-since <ref>` | first-class | no | no |
-| Per-test coverage routing | yes | no | no |
-| Incremental cache | yes (on by default) | no | no |
-| `NOT_VIABLE` classification | yes | no[^2] | partial |
-| Equivalent-mutant detection (TCE) | yes (opt-in) | no | no |
-| OOM-safe subprocess control | 2 GiB RSS cap, process group | no | no |
-| gremlins-compatible JSON | yes | (native) | no |
-| Stryker dashboard format | yes | no | no |
-| Self-contained HTML report | yes | no | no |
-| Per-mutant timeout | yes (adaptive) | yes (fixed) | yes (fixed) |
-| Active maintenance | yes | yes | minimal |
+**The position:** gomutants is the Go mutation tester built for the complete development loop. It does not have the largest operator catalog (Mutago does), the richest standalone LLM payload (Mutago), or native sharding and OCI report transport (Gooze). It does combine change scoping, exact test-impact selection, a stable fresh single-mutant rerun, mutant-level caching, checkpoint/resume, adaptive deadlines, overlays, conservative outcomes, and CI-ready reports in one workflow.
 
-[^1]: gremlins uses AST rewriting; some generic constructs round-trip incorrectly.
-[^2]: Compile-failing mutants are silently dropped, so they don't appear in the report at all — they neither contribute to the kill count nor surface as a separate category.
+| Development-loop capability | gomutants | [Mutago 2.8.1](https://github.com/quality-gates/mutago) | [Gremlins 0.6.0](https://gremlins.dev/latest/) | [Gooze 1.0.1](https://github.com/gooze-dev/gooze) |
+|---|---|---|---|---|
+| Changed-line scope | merge base + working tree | merge base | git ref | no native support found |
+| Stable single-mutant rerun | yes, forced fresh | yes | no | no |
+| Persistent incremental results | mutant/test-aware | no | no | file-level |
+| Mid-run checkpoint/resume | yes | no | no | no |
+| Test-impact selection | covering tests, default | covering tests, opt-in | package or full suite | companion test file |
+| Source isolation | `go test -overlay` | `go test -overlay` | temporary worktree | temporary project copy |
+| Timeout policy | adaptive from selected tests | clean-suite coefficient | package coefficient | fixed seconds |
+| Equivalent-mutant detection | compiler TCE, opt-in | no | no | no |
+| Main report surfaces | JSON, Stryker, HTML, GitHub | JSON, agentic JSON, HTML, GitHub/GitLab | JSON, terminal diff | TUI, YAML, OCI |
+| Native sharding | no | no | no | yes |
+
+The feature matrix was reviewed on 10 August 2026 against the linked releases and documentation. “No” means no documented native capability was found, not that the workflow cannot be reproduced with external scripting.
+
+This comparison is deliberately about development-loop capabilities, not an absolute score. Competitors can be the better choice when their distinct strength is the priority: Mutago for operator breadth or agent-oriented JSON, Gremlins for a simpler cold run, Gooze for distributed execution, and Ooze for custom domain-specific mutation operators.
 
 ### Mutator-set equivalence
 
