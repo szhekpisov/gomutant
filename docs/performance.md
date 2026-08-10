@@ -1,8 +1,9 @@
 # Performance
 
-_Last measured: 2026-05-12 on a 10-core Apple M1 Pro under macOS 26.3.1.
-Toolchain numbers shift with each Go release; treat as a snapshot, not a
-spec._
+_Last measured: 2026-08-10 for the in-repo three-tool comparison and
+2026-05-12 for the broader real-world study, on a 10-core Apple M1 Pro.
+Toolchain numbers shift with each Go release; treat these as snapshots, not
+specifications._
 
 Mutation testing on real Go packages. This page documents the methodology
 and the numbers it produced on six targets — a tiny in-repo fixture
@@ -16,7 +17,45 @@ LOC) — so you can reproduce them on your own hardware. The in-repo
 harness at `benchmarks/` covers a couple of additional in-repo targets
 (`./internal/mutator`).
 
-## Headlines
+## 2026-08-10 three-tool refresh
+
+The current in-repo harness adds Mutago and refreshes Gremlins against the
+v0.6.0-rc1 gomutants checkout. It copies the target source into an isolated
+`go 1.25.7` module, uses 10 workers, disables gomutants's persistent cache,
+warms each command, and reports three-run Hyperfine means. Mutago runs with
+its opt-in coverage and per-test routing enabled.
+
+| Scenario | gomutants | Gremlins 0.6.0 | Mutago 2.8.1 | Reported mutants (g / G / M) |
+|---|---:|---:|---:|---:|
+| `testdata/simple`, default catalogs¹ | 11.01 ± 0.06 s | **4.27 ± 0.15 s** | 11.33 ± 1.90 s | 68 / 20 / 63 |
+| `testdata/simple`, matched four operators | 4.25 ± 0.06 s | **3.95 ± 0.03 s** | 4.06 ± 0.04 s | 18 / 19 / 18 |
+| `internal/mutator`, matched four operators | **14.22 ± 0.13 s** | 23.16 ± 0.25 s | 22.22 ± 7.94 s² | 84 / 89 / 71 |
+
+¹ Default catalogs deliberately do different work; this row measures the wait
+from each product configuration, not equal engine throughput.
+
+² Mutago's first measured medium run was 31.38 s and its next two were about
+17.5 s, producing the large standard deviation. Three samples establish the
+direction here, not a precise long-run estimate.
+
+The matched set is arithmetic replacement, conditional boundary, conditional
+negation, and unary-negative inversion—the transformations shared exactly by
+all three tools. Mutant positions and viability filters still differ, so the
+medium row should be read with both wall time and tested-mutant throughput:
+gomutants used 173 ms per KILLED/LIVED mutant, Gremlins 260 ms, and Mutago
+313 ms. Total wall time made gomutants 1.63× faster than Gremlins and 1.56×
+faster than Mutago on that target. On the tiny matched target the ordering was
+effectively tied: all three completed within 8%.
+
+Pinned Gremlins v0.6.0 panics when executing these targets under Go 1.26.x,
+while the current gomutants module itself requires Go 1.26.1. The isolated Go
+1.25.7 fixture is therefore necessary to put all three tools on one working
+toolchain. Gooze v1.0.1 remains excluded because the audited tag does not
+compile. See the [generated result](../benchmarks/results.md) and
+[harness documentation](../benchmarks/README.md) for outcome tables, raw-data
+locations, exact flags, and reproduction instructions.
+
+## Headlines from the May 2026 real-world study
 
 If you only read one section:
 

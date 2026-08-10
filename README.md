@@ -244,6 +244,26 @@ gomutants is a strict superset of [ooze](https://github.com/gtramontina/ooze) v0
 
 ### Benchmark snapshot
 
+Current three-tool run on Apple M1 Pro 10-core: gomutants v0.6.0-rc1,
+Gremlins v0.6.0, and Mutago v2.8.1; 3-run Hyperfine means, 10 workers,
+cache off, and `GOTOOLCHAIN=go1.25.7`. The matched rows use the four operator
+semantics implemented identically by all three tools.
+
+| Scenario | gomutants | Gremlins | Mutago | Mutants reported (g / G / M) |
+|---|---:|---:|---:|---:|
+| Tiny fixture, default catalogs¹ | 11.01 s | **4.27 s** | 11.33 s | 68 / 20 / 63 |
+| Tiny fixture, matched operators | 4.25 s | **3.95 s** | 4.06 s | 18 / 19 / 18 |
+| `internal/mutator`, matched operators | **14.22 s** | 23.16 s | 22.22 s | 84 / 89 / 71 |
+
+¹ Default catalogs do different amounts of work and are not an engine-speed
+comparison. On the medium matched target, gomutants was 1.63× faster than
+Gremlins and 1.56× faster than Mutago in total wall time; per tested mutant it
+used 173 ms, versus 260 ms and 313 ms respectively. See the
+[full dated results](benchmarks/results.md) for standard deviations, outcome
+counts, pinned versions, Go 1.26 compatibility, and reproduction details.
+
+**Broader Gremlins study (May 2026):**
+
 Four real-world Go projects on Apple M1 Pro 10-core, gomutants v0.2.2 vs gremlins v0.6.0, matched 5-operator set (gremlins' defaults), `workers=10`, `--cache=off`, `GOTOOLCHAIN=go1.25.7` (gremlins is broken on Go 1.26.x). Engine and gremlins rows are 3-run medians; cold-OOB rows on the larger targets are single-run.
 
 **Engine wall-clock (cold cache, like-for-like operators):**
@@ -271,7 +291,9 @@ Four real-world Go projects on Apple M1 Pro 10-core, gomutants v0.2.2 vs gremlin
 - **Engine ordering depends on package size.** Roughly tied on uuid (~120 mutants), 1.5–1.8× faster on medium single-package targets where gomutants's pre-built test binary amortizes across many mutants, tied again on the 4-package multi-target where one-shot setup balances against gremlins's per-subpackage setup paid 4×.
 - **Adaptive per-mutant timeouts win on contended runs.** Gremlins ran 26% of uuid mutants into its `--timeout-coefficient=20` ceiling under worker contention; gomutants ran 2.5%. Same pattern on tsdb-4 (196 vs 45 timeouts).
 
-See [`docs/performance.md`](docs/performance.md) for full per-target tables, NOT_COVERED interpretation differences, Go 1.26 compatibility notes, and reproduction commands. The in-repo [`benchmarks/results.md`](benchmarks/results.md) covers `./testdata/simple/` and other in-repo targets.
+See [`docs/performance.md`](docs/performance.md) for full per-target tables,
+NOT_COVERED interpretation differences, Go compatibility notes, and
+reproduction commands.
 
 ## Features
 
