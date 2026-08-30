@@ -33,18 +33,24 @@ func TestRegistryCatalogCoversRegisteredMutators(t *testing.T) {
 			t.Errorf("catalog contains duplicate type %q", entry.Type)
 		}
 		seen[entry.Type] = true
+	}
+}
 
-		for field, value := range map[string]string{
-			"description": entry.Description,
-			"example":     entry.Example,
-		} {
-			if value == "" || strings.TrimSpace(value) != value {
-				t.Errorf("%s has invalid %s %q", entry.Type, field, value)
-			}
-			if strings.ContainsAny(value, "\t\r\n") {
-				t.Errorf("%s %s contains a catalog delimiter: %q", entry.Type, field, value)
-			}
-		}
+func TestRegistryCatalogHasValidMetadata(t *testing.T) {
+	for _, entry := range mutator.NewRegistry().Catalog() {
+		assertValidCatalogText(t, entry.Type, "description", entry.Description)
+		assertValidCatalogText(t, entry.Type, "example", entry.Example)
+	}
+}
+
+func assertValidCatalogText(t *testing.T, mutationType mutator.MutationType, field, value string) {
+	t.Helper()
+
+	if value == "" || strings.TrimSpace(value) != value {
+		t.Errorf("%s has invalid %s %q", mutationType, field, value)
+	}
+	if strings.ContainsAny(value, "\t\r\n") {
+		t.Errorf("%s %s contains a catalog delimiter: %q", mutationType, field, value)
 	}
 }
 
