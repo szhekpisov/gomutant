@@ -566,6 +566,20 @@ Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.exam
 
 ### Mutators
 
+`gomutants --list-mutators` prints the authoritative catalog for the installed
+binary, one mutator per line with a description and representative example. It
+does not require a Go module or configuration file, so it can be used anywhere
+to check names before adding them to `--only`, `--disable`, or an inline
+directive:
+
+```console
+$ gomutants --list-mutators | grep RETURN
+RETURN_ERROR_NIL            Swallow a propagated error            return nil, err -> return nil, nil
+RETURN_FALSE                Force a boolean return false          return x > 0 -> return false
+RETURN_TRUE                 Force a boolean return true           return x > 0 -> return true
+RETURN_ZERO                 Return the zero value instead         return count -> return 0
+```
+
 **Token-level:**
 
 | Type | Description | Example |
@@ -665,6 +679,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--dry-run` | | false | List mutants without testing |
 | `--verbose` | `-v` | false | Stream each mutant as tested |
 | `--quiet` | `-q` | false | Suppress header, phase lines, and per-mutant progress; only the final summary lands on stdout (warnings still go to stderr). Mutually exclusive with `--verbose`. |
+| `--list-mutators` | | false | Print every registered mutator type with its description and a representative example, then exit. Requires no module, package argument, or configuration file. |
 | `--version` | | | Print version and exit |
 
 </details>
@@ -687,7 +702,8 @@ gomutants -v ./...
 # Quiet for CI: only the final summary on stdout (exit code still gates).
 gomutants -q --threshold-efficacy 80 ./...
 
-# Limit to specific mutators (or exclude some).
+# Inspect, select, or exclude mutators.
+gomutants --list-mutators
 gomutants --only ARITHMETIC_BASE,CONDITIONALS_NEGATION ./...
 gomutants --disable BRANCH_IF,BRANCH_ELSE ./...
 

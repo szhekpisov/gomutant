@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/szhekpisov/gomutants/internal/cache"
@@ -114,6 +115,19 @@ func vcsSetting(key string) string {
 func formatVersion() string {
 	return fmt.Sprintf("gomutants v%s (commit: %s, built: %s)\n",
 		effectiveVersion(), effectiveCommit(), effectiveBuildDate())
+}
+
+// writeMutatorCatalog renders one greppable line per registered mutator. The
+// registry supplies alphabetical entries; tabwriter only aligns the three
+// fields for terminal readers.
+func writeMutatorCatalog(w io.Writer, entries []mutator.CatalogEntry) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	for _, entry := range entries {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", entry.Type, entry.Description, entry.Example); err != nil {
+			return err
+		}
+	}
+	return tw.Flush()
 }
 
 // cacheToolVersion is the identifier stamped into the cache's
@@ -278,6 +292,7 @@ func run(ctx context.Context, args []string) error {
 		quiet             bool
 		integration       bool
 		showVersion       bool
+		listMutators      bool
 	)
 
 	fs.IntVar(&workers, "workers", 0, "parallel workers (default: NumCPU)")
@@ -371,6 +386,7 @@ func run(ctx context.Context, args []string) error {
 	fs.BoolVar(&quiet, "q", false, "quiet (shorthand)")
 	fs.BoolVar(&integration, "integration", false, "cross-package mode: route each mutant to covering tests in any package that imports it (widens coverage + the per-test build to the reverse-dependency closure). Manages -coverpkg itself; passing --coverpkg too is an error")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&listMutators, "list-mutators", false, "print every mutator type with its description and example, then exit")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -396,6 +412,9 @@ func run(ctx context.Context, args []string) error {
 	if showVersion {
 		fmt.Fprint(stdout, formatVersion())
 		return nil
+	}
+	if listMutators {
+		return writeMutatorCatalog(stdout, mutator.NewRegistry().Catalog())
 	}
 
 	cfg, err := config.Load(configPath)
@@ -522,11 +541,16 @@ func run(ctx context.Context, args []string) error {
 	// instead of a silent filter miss. EnabledMutators already ignores
 	// unknown names; warning is purely additive.
 	reg := mutator.NewRegistry()
-	for _, n := range reg.UnknownNames(cfg.Only) {
+	unknownOnly := reg.UnknownNames(cfg.Only)
+	unknownDisable := reg.UnknownNames(cfg.Disable)
+	for _, n := range unknownOnly {
 		fmt.Fprintf(stderr, "gomutants: unknown mutator %q in --only (ignored)\n", n)
 	}
-	for _, n := range reg.UnknownNames(cfg.Disable) {
+	for _, n := range unknownDisable {
 		fmt.Fprintf(stderr, "gomutants: unknown mutator %q in --disable (ignored)\n", n)
+	}
+	if len(unknownOnly)+len(unknownDisable) > 0 {
+		fmt.Fprintln(stderr, `gomutants: run "gomutants --list-mutators" to see valid mutator names`)
 	}
 	enabledMutators := reg.EnabledMutators(cfg.Only, cfg.Disable)
 
