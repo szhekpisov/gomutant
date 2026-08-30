@@ -90,6 +90,89 @@ func TestRunUnleash(t *testing.T) {
 	}
 }
 
+func TestRunListMutators(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "broken.yml"), []byte("only: [\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	}()
+
+	var out string
+	stderrText, err := captureStderr(t, func() error {
+		var runErr error
+		out, runErr = captureOutput(t, func() error {
+			return run(context.Background(), []string{
+				"--config", "broken.yml",
+				"--list-mutators",
+				"not-a-package",
+			})
+		})
+		return runErr
+	})
+	if err != nil {
+		t.Fatalf("run --list-mutators: %v", err)
+	}
+	if stderrText != "" {
+		t.Errorf("--list-mutators wrote stderr: %q", stderrText)
+	}
+
+	catalog := mutator.NewRegistry().Catalog()
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if got, want := len(lines), len(catalog); got != want {
+		t.Fatalf("got %d catalog lines, want %d:\n%s", got, want, out)
+	}
+	for i, entry := range catalog {
+		line := lines[i]
+		if !strings.HasPrefix(line, string(entry.Type)+" ") {
+			t.Errorf("line %d = %q, want type %q first", i, line, entry.Type)
+			continue
+		}
+		descriptionAt := strings.Index(line, entry.Description)
+		exampleAt := strings.Index(line, entry.Example)
+		if descriptionAt < 0 || exampleAt < descriptionAt+len(entry.Description) {
+			t.Errorf("line %d = %q, want description %q followed by example %q",
+				i, line, entry.Description, entry.Example)
+		}
+	}
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Name() != "broken.yml" {
+		t.Errorf("--list-mutators created project artifacts: %v", files)
+	}
+}
+
+func TestRunListMutatorsWithUnleashPrefix(t *testing.T) {
+	plain, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--list-mutators"})
+	})
+	if err != nil {
+		t.Fatalf("run --list-mutators: %v", err)
+	}
+	prefixed, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"unleash", "--list-mutators"})
+	})
+	if err != nil {
+		t.Fatalf("run unleash --list-mutators: %v", err)
+	}
+	if prefixed != plain {
+		t.Errorf("unleash catalog differs\nplain:\n%s\nprefixed:\n%s", plain, prefixed)
+	}
+}
+
 func TestRunInvalidFlag(t *testing.T) {
 	_, err := captureStderr(t, func() error {
 		return run(context.Background(), []string{"--invalid-flag"})
@@ -125,6 +208,9 @@ func TestRunHelpExitsSuccessfully(t *testing.T) {
 	}
 	if !strings.Contains(output, "Usage of gomutants:") {
 		t.Errorf("help output missing usage header: %q", output)
+	}
+	if !strings.Contains(output, "-list-mutators") {
+		t.Errorf("help output missing --list-mutators: %q", output)
 	}
 }
 
@@ -355,6 +441,10 @@ func TestRunWarnsOnUnknownMutatorName(t *testing.T) {
 	}
 	if !strings.Contains(stderrText, `unknown mutator "BOGUS_MUTATOR" in --disable`) {
 		t.Errorf("expected --disable typo warning, got: %q", stderrText)
+	}
+	const hint = `gomutants: run "gomutants --list-mutators" to see valid mutator names`
+	if got := strings.Count(stderrText, hint); got != 1 {
+		t.Errorf("expected one catalog hint, got %d in: %q", got, stderrText)
 	}
 }
 
