@@ -13,8 +13,8 @@
 // TestFilesForFn callback (typically backed by the per-test coverage map
 // + TestIndex). This handles cross-package -coverpkg correctly: tests in
 // package B that exercise code in package A invalidate A's mutants when
-// edited — and so do B's own production sources, which is where an
-// end-to-end test keeps most of what it asserts.
+// edited — and so do B's own helpers and production sources, which is
+// where an end-to-end test keeps most of what it asserts.
 package cache
 
 import (
@@ -58,7 +58,10 @@ import (
 //	    file in the same package replayed a stale verdict — a KILLED mutant
 //	    whose kill depended on a constant next door stayed KILLED after that
 //	    constant changed, without executing anything. v6 entries carry no
-//	    pkg_hash and must not be replayed.
+//	    pkg_hash and must not be replayed. The coverage key gained an
+//	    //go:embed dimension in the same version: a v7 profile recorded
+//	    before it simply mismatches and is recomputed, which is why this
+//	    framing change rides on v7 rather than a bump of its own.
 const SchemaVersion = 7
 
 // I/O syscalls used by Save are exposed as package-level function
@@ -362,6 +365,49 @@ func goFilesIn(pkgDirs []string, skipTests bool) ([]string, error) {
 	return files, nil
 }
 
+// embedFrames returns one length-prefixed hash frame per //go:embed input
+// of the given package directories, in an order that depends only on the
+// set of directories and not on how the caller ordered or repeated them.
+// A directory the caller never described via SetEmbedFiles contributes no
+// frames — the right answer for the packages with no embed directives, and
+// the pre-embed behavior for any directory outside the resolved set.
+//
+// Frames are the shared piece of pkg_hash and the coverage key: embedded
+// data decides both a mutant's verdict (a test asserting on a parsed
+// schema.json) and which lines the coverage profile marks covered (a test
+// iterating an embedded table calls into code that an empty table never
+// reaches), so both dimensions have to carry it.
+//
+// Inputs are framed by their dir-relative slash path rather than their
+// basename: they can sit in subdirectories, where two files may share a
+// basename (data/a/x.json, data/b/x.json) that a basename-only framing
+// would alias together. Directories are sorted rather than emitted in
+// call order so the same package set hashes identically however it was
+// enumerated; within a directory the rel paths are sorted and deduped.
+//
+// A read error is propagated — callers treat it as a cache miss, never as
+// a match.
+func (h *Hasher) embedFrames(pkgDirs []string) ([]string, error) {
+	dirs := slices.Clone(pkgDirs)
+	slices.Sort(dirs)
+	dirs = slices.Compact(dirs)
+
+	var frames []string
+	for _, dir := range dirs {
+		rels := slices.Clone(h.embeds[dir])
+		slices.Sort(rels)
+		rels = slices.Compact(rels)
+		for _, rel := range rels {
+			fileHex, err := h.File(filepath.Join(dir, filepath.FromSlash(rel)))
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, fmt.Sprintf("%d:%s|%s|", len(rel), rel, fileHex))
+		}
+	}
+	return frames, nil
+}
+
 // HashPkgFiles returns a stable hex-encoded sha256 over every non-test .go
 // file directly inside dir, followed by every file the package's production
 // //go:embed directives pull in. It is the per-mutant key's dependency
@@ -378,10 +424,8 @@ func goFilesIn(pkgDirs []string, skipTests bool) ([]string, error) {
 //
 // Framing matches HashTestFiles — sorted, deduped, length-prefixed — so no
 // STATEMENT_REMOVE or boundary-alias mutation against the writes can go
-// unobserved. Embed inputs are framed by their dir-relative slash path
-// rather than their basename: they can sit in subdirectories, where two
-// files may share a basename (data/a/x.json, data/b/x.json) that a
-// basename-only framing would alias together.
+// unobserved. The embed half is framed by embedFrames, which the coverage
+// key shares.
 //
 // Results are memoized per directory for the lifetime of the Hasher, so a
 // package is listed and hashed once per run rather than once per mutant.
@@ -407,15 +451,12 @@ func (h *Hasher) HashPkgFiles(dir string) (string, error) {
 		base := filepath.Base(p)
 		fmt.Fprintf(hh, "%d:%s|%s|", len(base), base, fileHex)
 	}
-	embeds := slices.Clone(h.embeds[dir])
-	slices.Sort(embeds)
-	embeds = slices.Compact(embeds)
-	for _, rel := range embeds {
-		fileHex, err := h.File(filepath.Join(dir, filepath.FromSlash(rel)))
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(hh, "%d:%s|%s|", len(rel), rel, fileHex)
+	frames, err := h.embedFrames([]string{dir})
+	if err != nil {
+		return "", err
+	}
+	for _, f := range frames {
+		fmt.Fprint(hh, f)
 	}
 	v := hex.EncodeToString(hh.Sum(nil))
 	h.dirs[dir] = v
@@ -468,7 +509,30 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 		fmt.Fprintf(hh, "%d:%s|%s|", len(base), base, fileHex)
 	}
 
-	// 2. Hash go.mod (required) and go.sum (optional).
+	// 2. Fold in the //go:embed inputs of those same directories. A test
+	// that iterates an embedded table decides which lines the profile
+	// marks covered exactly as its .go source does — add a case that
+	// reaches a previously untouched branch and every .go file is still
+	// byte-identical, so without this the stale profile would be replayed
+	// and the mutants on those lines would stay NOT_COVERED, untested.
+	// Frames carry an "embed:" prefix so an embedded x.go can't alias the
+	// production x.go framed above.
+	//
+	// Only directories the caller described via SetEmbedFiles contribute;
+	// with a coverage scope wider than the resolved target packages (the
+	// --integration closure, a broader -coverpkg) the extra directories'
+	// embed inputs stay outside the key, as do //go:embed directives in
+	// _test.go files, which go list reports separately and discover does
+	// not collect.
+	frames, err := h.embedFrames(pkgDirs)
+	if err != nil {
+		return "", fmt.Errorf("hashing embedded files: %w", err)
+	}
+	for _, f := range frames {
+		fmt.Fprintf(hh, "embed:%s", f)
+	}
+
+	// 3. Hash go.mod (required) and go.sum (optional).
 	modHex, err := h.File(filepath.Join(projectDir, "go.mod"))
 	if err != nil {
 		return "", fmt.Errorf("hashing go.mod: %w", err)
@@ -483,7 +547,7 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 	}
 	fmt.Fprintf(hh, "gosum:%d:%s|", len(sumHex), sumHex)
 
-	// 3. Mix in the configuration / toolchain dimensions with the same
+	// 4. Mix in the configuration / toolchain dimensions with the same
 	// length-prefixed framing so adjacent values can't alias.
 	fmt.Fprintf(hh, "coverpkg:%d:%s|", len(coverPkg), coverPkg)
 	fmt.Fprintf(hh, "tags:%d:%s|", len(tags), tags)
@@ -588,9 +652,10 @@ func Save(c *Cache, path string) error {
 // wires this through TestIndex.CoveringFiles: every _test.go in the
 // mutant's package directory, plus the files declaring whichever tests
 // the per-test coverage map attributes to the mutant (those can live in
-// another package under -coverpkg). The package-wide half is what keeps
-// an edit to a test helper — which declares no test entry point, so no
-// coverage-derived name names it — from replaying a stale verdict.
+// another package under -coverpkg, and that package is then hashed whole).
+// The package-wide halves are what keep an edit to a test helper — which
+// declares no test entry point, so no coverage-derived name names it —
+// from replaying a stale verdict.
 type TestFilesForFn func(m mutator.Mutant) []string
 
 // Lookup applies cache hits to the mutants slice in place. For each
@@ -627,9 +692,16 @@ type TestFilesForFn func(m mutator.Mutant) []string
 // Scope, stated plainly. Between them the three dimensions cover: the
 // mutated file, every other non-test .go file in its package, that
 // package's //go:embed inputs, every _test.go file in its package, and —
-// for a covering test the coverage map places in another package, which is
-// what --integration produces — that package's test *and* production
-// sources.
+// for a covering test the coverage map places in another package, which
+// takes an instrumentation scope wider than the package under test
+// (--integration, or an explicit --coverpkg) — that package's test *and*
+// production sources.
+//
+// That last half is conditional on the wider scope for a reason: the
+// coverage map's test names carry no package, so without one a foreign
+// declaring directory is a name collision rather than a dependency, and
+// expanding on it would fold unrelated packages' sources into tests_hash.
+// See TestIndex.CoveringFiles.
 //
 // What is left: an edit in a package the mutant's package *imports*. That
 // mutant still replays a stale verdict. Closing it needs the forward import
