@@ -187,11 +187,50 @@ func TestIncrementalCacheInvalidatesPerturbedTestFile(t *testing.T) {
 // folds `raw + 0` and `raw - 0` to identical code, so a TCE pass would
 // classify this mutant EQUIVALENT rather than LIVED.
 func TestIncrementalCacheInvalidatesOnSiblingFileEdit(t *testing.T) {
+	staleVerdictProbe{
+		fixture:    "testdata/crossfile",
+		dependency: "b.go's sibling constant",
+		// Edit ONLY b.go. a.go and a_test.go keep their exact bytes, so
+		// both prod_hash and tests_hash still match the cached entry.
+		edit: func(t *testing.T, dir string) {
+			bPath := filepath.Join(dir, "b.go")
+			body, err := os.ReadFile(bPath)
+			if err != nil {
+				t.Fatalf("read b.go: %v", err)
+			}
+			edited := strings.Replace(string(body), "const Offset = 5", "const Offset = 0", 1)
+			if edited == string(body) {
+				t.Fatal("b.go did not contain `const Offset = 5` — fixture drifted")
+			}
+			if err := os.WriteFile(bPath, []byte(edited), 0o644); err != nil {
+				t.Fatalf("write b.go: %v", err)
+			}
+		},
+	}.run(t)
+}
+
+// staleVerdictProbe drives one cache-invalidation regression: copy fixture,
+// run gomutants cold, apply an edit that must change the probe mutant's
+// verdict, run warm, and assert the cache did not replay the stale KILLED.
+//
+// Both tests that use it hinge on the same probe — the sole ARITHMETIC_BASE
+// mutant in the fixture's a.go, KILLED while the dependency holds 5 and
+// LIVED once it holds 0 — and differ only in which dependency the edit
+// touches, so the run itself is written once here. dependency names that
+// dependency for the failure messages.
+type staleVerdictProbe struct {
+	fixture    string
+	dependency string
+	edit       func(t *testing.T, dir string)
+}
+
+func (p staleVerdictProbe) run(t *testing.T) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	dir := setupTestdataCopy(t, "testdata/crossfile")
+	dir := setupTestdataCopy(t, p.fixture)
 	cachePath := filepath.Join(dir, ".gomutants-cache.json")
 	reportPath := filepath.Join(dir, "report.json")
 	args := []string{"-w", "4", "-cache", cachePath, "-o", reportPath, "./..."}
@@ -202,32 +241,19 @@ func TestIncrementalCacheInvalidatesOnSiblingFileEdit(t *testing.T) {
 	// one. a.go is byte-identical across both runs, so the ID is stable.
 	probe := findArithmeticMutation(t, cold, "a.go")
 	if probe.Status != mutator.StatusKilled.String() {
-		t.Fatalf("cold run: %s status=%s, want KILLED — fixture is not exercising the sibling dependency",
-			probe.ID, probe.Status)
+		t.Fatalf("cold run: %s status=%s, want KILLED — fixture is not exercising %s",
+			probe.ID, probe.Status, p.dependency)
 	}
 
-	// Edit ONLY b.go. a.go and a_test.go keep their exact bytes, so both
-	// prod_hash and tests_hash still match the cached entry.
-	bPath := filepath.Join(dir, "b.go")
-	body, err := os.ReadFile(bPath)
-	if err != nil {
-		t.Fatalf("read b.go: %v", err)
-	}
-	edited := strings.Replace(string(body), "const Offset = 5", "const Offset = 0", 1)
-	if edited == string(body) {
-		t.Fatal("b.go did not contain `const Offset = 5` — fixture drifted")
-	}
-	if err := os.WriteFile(bPath, []byte(edited), 0o644); err != nil {
-		t.Fatalf("write b.go: %v", err)
-	}
+	p.edit(t, dir)
 
 	warm := runInDir(t, dir, args)
 
 	got := findMutationByID(t, warm, probe.ID)
 	if got.Status == mutator.StatusKilled.String() {
-		t.Errorf("warm run: %s replayed as KILLED after b.go changed (cached=%d); "+
+		t.Errorf("warm run: %s replayed as KILLED after %s changed (cached=%d); "+
 			"the mutant now survives and must be recomputed to LIVED",
-			probe.ID, warm.MutantsCached)
+			probe.ID, p.dependency, warm.MutantsCached)
 	}
 	if got.Status != mutator.StatusLived.String() {
 		t.Errorf("warm run: %s status=%s, want LIVED", probe.ID, got.Status)
@@ -444,38 +470,17 @@ func loadCacheFile(t *testing.T, path string) *cachepkg.Cache {
 // package byte-identical, so prod_hash, the .go half of pkg_hash and
 // tests_hash all still match. Only the embed dimension can see this.
 func TestIncrementalCacheInvalidatesOnEmbeddedFileEdit(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	dir := setupTestdataCopy(t, "testdata/embedcache")
-	cachePath := filepath.Join(dir, ".gomutants-cache.json")
-	reportPath := filepath.Join(dir, "report.json")
-	args := []string{"-w", "4", "-cache", cachePath, "-o", reportPath, "./..."}
-
-	cold := runInDir(t, dir, args)
-
-	probe := findArithmeticMutation(t, cold, "a.go")
-	if probe.Status != mutator.StatusKilled.String() {
-		t.Fatalf("cold run: %s status=%s, want KILLED — fixture is not exercising the embedded constant",
-			probe.ID, probe.Status)
-	}
-
-	// Edit ONLY the embedded data file.
-	offsetPath := filepath.Join(dir, "offset.txt")
-	if err := os.WriteFile(offsetPath, []byte("0\n"), 0o644); err != nil {
-		t.Fatalf("write offset.txt: %v", err)
-	}
-
-	warm := runInDir(t, dir, args)
-
-	got := findMutationByID(t, warm, probe.ID)
-	if got.Status == mutator.StatusKilled.String() {
-		t.Errorf("warm run: %s replayed as KILLED after offset.txt changed (cached=%d); "+
-			"the mutant now survives and must be recomputed to LIVED",
-			probe.ID, warm.MutantsCached)
-	}
-	if got.Status != mutator.StatusLived.String() {
-		t.Errorf("warm run: %s status=%s, want LIVED", probe.ID, got.Status)
-	}
+	staleVerdictProbe{
+		fixture:    "testdata/embedcache",
+		dependency: "offset.txt's embedded constant",
+		// Edit ONLY the embedded data file: every .go file in the package
+		// keeps its exact bytes, so prod_hash, the .go half of pkg_hash and
+		// tests_hash all still match.
+		edit: func(t *testing.T, dir string) {
+			offsetPath := filepath.Join(dir, "offset.txt")
+			if err := os.WriteFile(offsetPath, []byte("0\n"), 0o644); err != nil {
+				t.Fatalf("write offset.txt: %v", err)
+			}
+		},
+	}.run(t)
 }
