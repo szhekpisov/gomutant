@@ -40,7 +40,7 @@ The targeted command bypasses the old cached verdict, runs the tests that cover 
 - **Work on the change, not the repository.** `--changed-since <ref>` uses the merge base and includes uncommitted edits to tracked files, keeping local and pull-request runs focused on the code being developed. A brand-new file is invisible to git diff until it is staged, so `git add` it before trusting the count.
 - **Run only the relevant tests.** Per-test coverage routing maps each mutant to the tests that cover its line; `--integration` extends that routing across importing packages when the real assertion lives downstream.
 - **Verify one fix directly.** Stable mutant IDs and unique prefixes turn “did this test kill it?” into one targeted run rather than another full mutation pass.
-- **Keep completed work.** The default content-addressed cache reuses a verdict only while the mutated source and its relevant tests remain byte-identical. Mid-run checkpoints also let interrupted runs resume instead of starting over.
+- **Keep completed work.** The default content-addressed cache reuses a verdict only while the mutated file, the rest of its package, and the tests that could exercise it all remain byte-identical. Mid-run checkpoints also let interrupted runs resume instead of starting over.
 - **Make the workflow repeatable.** An auto-loaded [`.gomutants.yml`](#configuration-file) keeps operators, exclusions, thresholds, routing, timeouts, and cache behavior with the project; CLI flags can override it for one run.
 - **Keep the working tree clean.** Byte-level overlays preserve Go syntax, including generics, without copying or editing source files.
 - **Get an actionable result.** Terminal diffs, JSON, Stryker, self-contained HTML, GitHub annotations, and the Claude Code plugin put each survivor where a developer or coding agent can act on it.
@@ -55,7 +55,7 @@ On the published Apple M1 Pro benchmark, unchanged out-of-the-box reruns complet
 | prometheus/model/labels | 342 s | **2.8 s** | **~120×** |
 | prometheus tsdb-4 | 2768 s (~46 min) | **19 s** | **~145×** |
 
-These are unchanged-tree reruns, not a claim that all edits are free: changing source or covering tests invalidates the affected cached verdicts. The cold-OOB column runs the full mutator set and is a single run on these targets, so it is not comparable to the matched-operator, 3-run-median engine timings below. Cold-engine ordering also depends on the target; gremlins is faster on the smallest measured external project, while gomutants leads the measured medium single-package targets. See the [benchmark snapshot](#benchmark-snapshot) and [`docs/performance.md`](docs/performance.md) for methodology and reproduction commands.
+These are unchanged-tree reruns, not a claim that all edits are free: editing a package's source or its tests invalidates that package's cached verdicts. The cold-OOB column runs the full mutator set and is a single run on these targets, so it is not comparable to the matched-operator, 3-run-median engine timings below. Cold-engine ordering also depends on the target; gremlins is faster on the smallest measured external project, while gomutants leads the measured medium single-package targets. See the [benchmark snapshot](#benchmark-snapshot) and [`docs/performance.md`](docs/performance.md) for methodology and reproduction commands.
 
 ## Table of Contents
 
@@ -299,7 +299,7 @@ reproduction commands.
 
 - **`--changed-since <ref>`** — scope mutation testing to lines changed vs a git ref. Fast enough to gate every PR.
 - **Per-test coverage routing** — each mutant runs only the tests whose coverage touches the mutated line, not the whole suite.
-- **Incremental cache** — content-addressed; warm reruns skip mutants whose source bytes and tests are byte-identical to the previous run (120–150× speedup on warm reruns).
+- **Incremental cache** — content-addressed; warm reruns skip mutants whose package sources and covering tests are byte-identical to the previous run (120–150× speedup on warm reruns).
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
 - **Adaptive per-mutant timeouts** — deadlines sized from recorded per-test durations × margin, so fast tests don't wait out a multi-minute global ceiling.
 - **Byte-level patching via `go test -overlay`** — generics and all Go syntax survive intact; source tree never modified.
@@ -667,7 +667,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
 | `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
 | `--run-mutant-id` | | | Run only the mutant with this stable `id` (the `id` field of a report entry); a unique prefix is accepted. Skips the incremental cache for that mutant. See [Re-running a single mutant](#re-running-a-single-mutant) |
-| `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
+| `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source package and covering tests are byte-identical to the cached run — invalidation is package-scoped, so editing one file re-runs its package. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
 | `--integration` | | false | Route each mutant to covering tests in *any* package that imports it, not just its own. Widens coverage and the per-test build to the reverse-dependency closure of the target packages and manages `-coverpkg` itself (passing `--coverpkg` too is an error). Lets a mutant be killed by a cross-package/E2E test. See [Cross-Package Mode](#cross-package-mode). |
@@ -839,7 +839,7 @@ Performance optimizations layered on top:
 - **`GOMAXPROCS=NumCPU/workers` per child.** Without this, `--workers=10` on a 10-core box would have each child also assume 10 cores, oversubscribing 100×. With it, each child compiles + tests within its share.
 - **Sort pending mutants by `(Pkg, File, Offset)` before dispatch.** The first mutant in a package pays the cold compile; subsequent ones reuse the build cache for deps and stdlib. This sort alone was a 17% wall-clock reduction.
 - **`-vet=off` on the inner `go test`.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
-- **Incremental cache.** Mutants whose source byte range and the surrounding tests are byte-identical to a prior run are skipped and their previous classifications reused. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried. CI runs that touch one file pay for that file only.
+- **Incremental cache.** A verdict is reused only while three things are byte-identical to the prior run: the mutated file, every other non-test file in its package, and every test file that could exercise it (its package's test files, plus the cross-package tests the coverage map routes to it). Both dimensions are package-scoped on purpose — a mutant compiles as part of its whole package and is killed by tests that share their package's helpers, so file-level invalidation would replay stale verdicts. A CI run that touches one file therefore pays for that file's package, not the repository. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried.
 
 ### JSON report
 

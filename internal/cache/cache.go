@@ -307,9 +307,13 @@ func (h *Hasher) HashTestFiles(absPaths []string) (string, error) {
 //
 // skipTests drops _test.go files. HashCoverageInputs wants them (a test file
 // decides which lines the profile marks covered); HashPkgFiles does not,
-// because test content is already gated separately via tests_hash and
-// folding it in here would invalidate a package's NOT_VIABLE entries — whose
-// reuse is explicitly test-independent — on every test edit.
+// because folding them in here would invalidate a package's NOT_VIABLE
+// entries — whose reuse is explicitly test-independent — on every test edit.
+// Test content is instead carried by tests_hash, and carried at package
+// granularity: TestIndex.CoveringFiles always includes every _test.go in the
+// mutant's own directory, not just the files declaring its covering tests,
+// so a package-level test helper that declares no test entry point (and that
+// therefore no coverage-derived name can resolve to) still gates reuse.
 func goFilesIn(pkgDirs []string, skipTests bool) ([]string, error) {
 	seen := make(map[string]bool, len(pkgDirs))
 	var files []string
@@ -538,9 +542,12 @@ func Save(c *Cache, path string) error {
 
 // TestFilesForFn resolves a mutant to the set of absolute test-file
 // paths whose contents gate cache reuse for that mutant. The integrator
-// typically wires this through the per-test coverage map + TestIndex,
-// falling back to "all _test.go in the mutant's package directory" when
-// coverage information is unavailable.
+// wires this through TestIndex.CoveringFiles: every _test.go in the
+// mutant's package directory, plus the files declaring whichever tests
+// the per-test coverage map attributes to the mutant (those can live in
+// another package under -coverpkg). The package-wide half is what keeps
+// an edit to a test helper — which declares no test entry point, so no
+// coverage-derived name names it — from replaying a stale verdict.
 type TestFilesForFn func(m mutator.Mutant) []string
 
 // Lookup applies cache hits to the mutants slice in place. For each
@@ -685,11 +692,13 @@ func parseStatus(s string) mutator.MutantStatus {
 	return mutator.StatusPending
 }
 
-// Update merges this run's results into c and drops entries for files
-// whose prod_hash no longer matches the current file content. Entries
+// Update merges this run's results into c and drops entries whose
+// prod_hash or pkg_hash no longer matches the current source. Entries
 // for files outside this run's mutant set (e.g. excluded by
 // --changed-since) are preserved when their file still exists with
-// matching content.
+// matching content *and* their package still hashes the same — a
+// carried-over entry is reused by the next run's Lookup, so it has to
+// clear the same two gates Lookup applies.
 //
 // projectDir lets us resolve a stored RelFile back to an absolute path
 // for re-hashing prior entries.

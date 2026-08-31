@@ -373,7 +373,7 @@ func run(ctx context.Context, args []string) error {
 	// prints in --help; see the --test-flags comment above for why its
 	// position within the string matters.
 	fs.StringVar(&runMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
-	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source and tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
+	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source package and covering tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
 	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
 	fs.StringVar(&strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
 	fs.StringVar(&htmlOutput, "html-output", "", "also write a self-contained interactive HTML mutation report at this path (Stryker mutation-testing-elements viewer, no network deps)")
@@ -809,34 +809,19 @@ func run(ctx context.Context, args []string) error {
 		// mutated target via -coverpkg — resolves to the right test files.
 		testIndex := cache.BuildTestIndex(rDirs)
 
-		// Resolver: prefer the per-test coverage map's covering set,
-		// mapped through the index to defining files. When the map is
-		// nil, has no entry for this mutant, or none of the covering
-		// names resolve to a known file, fall back to every _test.go
-		// in the mutant's package directory — sound but coarser.
+		// Resolver: every _test.go in the mutant's own package, plus the
+		// files declaring the tests the coverage map attributes to this
+		// mutant (which -coverpkg can place in another package). The
+		// local half is unconditional rather than a fallback because a
+		// package-level test helper declares no test entry point, so no
+		// coverage-derived name resolves to it — see CoveringFiles. A nil
+		// coverage map just means there are no names to add.
 		testFilesFor = func(m mutator.Mutant) []string {
-			pkgDir := filepath.Dir(m.File)
-			if testMap == nil {
-				return testIndex.AllInDir(pkgDir)
+			var names []string
+			if testMap != nil {
+				names = testMap.TestsFor(m.CoverageFile, m.Line)
 			}
-			names := testMap.TestsFor(m.CoverageFile, m.Line)
-			if len(names) == 0 {
-				return testIndex.AllInDir(pkgDir)
-			}
-			seen := make(map[string]bool, len(names))
-			var files []string
-			for _, n := range names {
-				for _, f := range testIndex.FilesFor(n) {
-					if !seen[f] {
-						seen[f] = true
-						files = append(files, f)
-					}
-				}
-			}
-			if len(files) == 0 {
-				return testIndex.AllInDir(pkgDir)
-			}
-			return files
+			return testIndex.CoveringFiles(filepath.Dir(m.File), names)
 		}
 
 		// --run-mutant-id skips the lookup, not the resolver above: the

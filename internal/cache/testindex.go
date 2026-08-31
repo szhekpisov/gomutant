@@ -18,7 +18,8 @@ import (
 // via -coverpkg) means the per-test coverage map can return test names
 // whose defining files live outside the mutant's own package directory.
 // FilesFor surfaces those, so tests_hash includes every covering test
-// file regardless of which package declared it.
+// file regardless of which package declared it. CoveringFiles combines
+// both lookups into the set callers actually hash.
 type TestIndex struct {
 	byName map[string][]string // testName → abs paths of declaring _test.go files
 	byDir  map[string][]string // pkgDir → abs paths of every _test.go in dir
@@ -128,12 +129,56 @@ func (ti *TestIndex) FilesFor(testName string) []string {
 	return ti.byName[testName]
 }
 
-// AllInDir returns every _test.go file in pkgDir (absolute paths). Used
-// as the conservative fallback when the per-test coverage map is
-// unavailable or has no entry for a mutant.
+// AllInDir returns every _test.go file in pkgDir (absolute paths). It is
+// the local half of every covering set — see CoveringFiles — and the whole
+// of it when the per-test coverage map is unavailable.
 func (ti *TestIndex) AllInDir(pkgDir string) []string {
 	if ti == nil {
 		return nil
 	}
 	return ti.byDir[pkgDir]
+}
+
+// CoveringFiles returns the _test.go files whose content gates cache reuse
+// for a mutant in pkgDir that the per-test coverage map attributes to
+// testNames. Pass a nil/empty testNames when no coverage map is available.
+//
+// The result is always a superset of AllInDir(pkgDir): every test file in
+// the mutant's own package is in the set, not just the files declaring the
+// covering tests. A package-level test helper — a table builder, a custom
+// assertion, a fake — lives in a _test.go file that need not declare any
+// test entry point at all, so BuildTestIndex records no name for it and no
+// coverage-derived name can ever resolve to it. Loosen an assertion inside
+// such a helper and a KILLED mutant starts surviving while its own file,
+// its package's non-test files, and the covering test's file are all
+// byte-identical. Test files are deliberately outside pkg_hash (folding
+// them in would invalidate test-independent NOT_VIABLE entries on every
+// test edit), so tests_hash is the only dimension that can carry them, and
+// it can only carry them at package granularity.
+//
+// testNames then adds the cross-package half: with -coverpkg (--integration)
+// the covering tests can be declared outside pkgDir entirely, and those
+// files gate the mutant too. Names the index doesn't know contribute
+// nothing — they resolve to no file, and the local set already stands.
+func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string) []string {
+	if ti == nil {
+		return nil
+	}
+	var files []string
+	seen := make(map[string]bool)
+	add := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			files = append(files, f)
+		}
+	}
+	for _, f := range ti.AllInDir(pkgDir) {
+		add(f)
+	}
+	for _, n := range testNames {
+		for _, f := range ti.FilesFor(n) {
+			add(f)
+		}
+	}
+	return files
 }
