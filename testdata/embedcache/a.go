@@ -1,6 +1,8 @@
 package embedcache
 
 import (
+	// Blank import: //go:embed on a string variable requires the embed
+	// package to be imported, but nothing here references it by name.
 	_ "embed"
 	"strconv"
 	"strings"
