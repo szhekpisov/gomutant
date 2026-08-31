@@ -173,24 +173,42 @@ func (ti *TestIndex) AllInDir(pkgDir string) []string {
 // files gate the mutant too. Names the index doesn't know contribute
 // nothing — they resolve to no file, and the local set already stands.
 //
-// For a covering test declared in a *foreign* directory, that directory's
-// production sources are added as well. Under --integration the dependency
-// arrow points the other way from the usual one: mutants live in target
-// package T, the covering tests live in importer R, and pkg_hash only ever
-// hashes T. R's non-test sources — the fixture builders and helper types an
-// end-to-end test is mostly made of — would otherwise sit in no dimension
-// of the key at all, so editing R's fixture to expect a looser value would
-// replay T's mutant as KILLED after it started surviving. pkgDir itself is
-// excluded from this: pkg_hash already covers the mutant's own package, and
-// re-adding it here would make an unrelated production edit invalidate the
-// tests dimension too.
+// crossPkg says whether a foreign declaring directory can be a genuine
+// cross-package coverage relationship: the caller sets it when this run
+// instruments beyond the package under test (--integration, or an explicit
+// --coverpkg), which is what it takes for a test outside pkgDir to record
+// coverage on the mutant at all. When it is set, a foreign directory
+// contributes its whole package the way pkgDir does: every _test.go in it
+// (the same helper-only argument as above, which applies verbatim to R's
+// assertion helpers) and every non-test .go file. Under --integration the dependency arrow points
+// the other way from the usual one: mutants live in target package T, the
+// covering tests live in importer R, and pkg_hash only ever hashes T. R's
+// helpers and fixture builders — most of what an end-to-end test is made
+// of — would otherwise sit in no dimension of the key at all, so loosening
+// R's fixture would replay T's mutant as KILLED after it started surviving.
+// pkgDir itself is excluded from this: pkg_hash already covers the mutant's
+// own package, and re-adding it here would make an unrelated production
+// edit invalidate the tests dimension too.
+//
+// Without crossPkg the expansion is skipped and only the declaring file
+// itself is added, because a foreign hit is then a name collision rather
+// than a dependency. TestMap.TestsFor deliberately projects package context
+// out of the covering names, so FilesFor("TestNew") resolves to every
+// indexed package declaring a TestNew — and TestAdd, TestParse or TestString
+// live in several packages of most repositories, this one included.
+// Expanding on a collision would fold unrelated packages' production sources
+// into tests_hash and make an edit anywhere in them invalidate this mutant:
+// package-scoped invalidation degraded to repository-scoped by a name two
+// packages happened to share. The declaring file itself is still added — it
+// is one file, and it keeps the conservative direction on the off chance
+// that the name really is the covering test.
 //
 // A nil receiver yields nil, but there is no `ti == nil` guard here: both
 // lookups this delegates to are already nil-safe and return nil, so the
 // loops below iterate zero times and files stays nil. An explicit guard
 // would be an unobservable branch — the same reason BuildTestIndex elides
 // its redundant `|| f == nil`.
-func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string) []string {
+func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string, crossPkg bool) []string {
 	var files []string
 	seen := make(map[string]bool)
 	add := func(f string) {
@@ -205,10 +223,16 @@ func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string) []string {
 	for _, n := range testNames {
 		for _, f := range ti.FilesFor(n) {
 			add(f)
+			if !crossPkg {
+				continue
+			}
 			// Dereferencing ti here needs no nil guard: reaching this
 			// point means FilesFor returned a file, which a nil index
 			// never does.
 			if dir := filepath.Dir(f); dir != pkgDir {
+				for _, tf := range ti.AllInDir(dir) {
+					add(tf)
+				}
 				for _, src := range ti.srcDir[dir] {
 					add(src)
 				}

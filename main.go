@@ -825,12 +825,23 @@ func run(ctx context.Context, args []string) error {
 		// package-level test helper declares no test entry point, so no
 		// coverage-derived name resolves to it — see CoveringFiles. A nil
 		// coverage map just means there are no names to add.
+		//
+		// crossPkg tells CoveringFiles whether a covering test resolving to
+		// a foreign directory can be a real cross-package dependency or is
+		// just two packages declaring the same test name. It takes an
+		// instrumentation scope wider than the package under test —
+		// --integration, or an explicit --coverpkg — for a test outside the
+		// mutant's package to record coverage on it at all; without one,
+		// TestsFor's package-agnostic names are the only way a foreign
+		// directory can turn up, and expanding on them would fold unrelated
+		// packages' sources into tests_hash.
+		crossPkg := cfg.Integration || cfg.CoverPkg != ""
 		testFilesFor = func(m mutator.Mutant) []string {
 			var names []string
 			if testMap != nil {
 				names = testMap.TestsFor(m.CoverageFile, m.Line)
 			}
-			return testIndex.CoveringFiles(filepath.Dir(m.File), names)
+			return testIndex.CoveringFiles(filepath.Dir(m.File), names, crossPkg)
 		}
 
 		// --run-mutant-id skips the lookup, not the resolver above: the
