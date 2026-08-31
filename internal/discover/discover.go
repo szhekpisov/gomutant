@@ -31,6 +31,13 @@ type Package struct {
 	Imports      []string // production imports.
 	TestImports  []string // imports of in-package (_test.go) test files.
 	XTestImports []string // imports of external (foo_test) test files.
+	// EmbedFiles lists the files the package's production //go:embed
+	// directives pull in, as Dir-relative slash paths (go list resolves the
+	// patterns for us, so `all:`, globs and directory trees need no
+	// reimplementation here). The incremental cache hashes them alongside
+	// the package's .go files: embedded data decides test outcomes exactly
+	// as source does.
+	EmbedFiles []string
 }
 
 // goListJSON mirrors the fields we need from `go list -json`.
@@ -42,6 +49,7 @@ type goListJSON struct {
 	Imports      []string `json:"Imports"`
 	TestImports  []string `json:"TestImports"`
 	XTestImports []string `json:"XTestImports"`
+	EmbedFiles   []string `json:"EmbedFiles"`
 	Error        *struct {
 		Err string `json:"Err"`
 	} `json:"Error"`
@@ -90,6 +98,7 @@ func decodeGoListJSON(r io.Reader) ([]Package, error) {
 			Imports:      p.Imports,
 			TestImports:  p.TestImports,
 			XTestImports: p.XTestImports,
+			EmbedFiles:   p.EmbedFiles,
 		})
 	}
 	return pkgs, nil

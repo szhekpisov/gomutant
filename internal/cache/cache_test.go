@@ -269,17 +269,30 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 6 must load under the current
-// constant. (Pins SchemaVersion == 6; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 7 must load under the current
+// constant. (Pins SchemaVersion == 7; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 6 {
+	if SchemaVersion != 7 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":6,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":7,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-6 cache must load under SchemaVersion=6, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-7 cache must load under SchemaVersion=7, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_V6CacheRejected pins the v7 bump's reason. A v6 cache carries no
+// pkg_hash on any entry, so replaying it would reuse verdicts keyed on the
+// mutated file alone — exactly the sibling-file staleness v7 exists to
+// close. The metadata gate must discard it wholesale.
+func TestLoad_V6CacheRejected(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":6,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
+	if len(c.Entries) != 0 {
+		t.Fatalf("a v6 cache must be discarded under SchemaVersion=7, got %d entries", len(c.Entries))
 	}
 }
 
@@ -516,29 +529,37 @@ type lookupCase struct {
 	name           string
 	priorStatus    mutator.MutantStatus
 	prodHashMatch  bool
+	pkgHashMatch   bool
 	testsHashMatch bool
 	wantHit        bool
 }
 
 func TestLookup_HitMissMatrix(t *testing.T) {
 	cases := []lookupCase{
-		{"killed both match", mutator.StatusKilled, true, true, true},
-		{"killed prod mismatch", mutator.StatusKilled, false, true, false},
-		{"killed tests mismatch", mutator.StatusKilled, true, false, false},
-		{"lived both match", mutator.StatusLived, true, true, true},
-		{"lived tests mismatch", mutator.StatusLived, true, false, false},
+		{"killed all match", mutator.StatusKilled, true, true, true, true},
+		{"killed prod mismatch", mutator.StatusKilled, false, true, true, false},
+		{"killed pkg mismatch", mutator.StatusKilled, true, false, true, false},
+		{"killed tests mismatch", mutator.StatusKilled, true, true, false, false},
+		{"lived all match", mutator.StatusLived, true, true, true, true},
+		{"lived pkg mismatch", mutator.StatusLived, true, false, true, false},
+		{"lived tests mismatch", mutator.StatusLived, true, true, false, false},
 		// TIMED_OUT now requires tests_hash match — adding a faster
 		// killer test could legitimately turn a prior timeout into KILLED.
-		{"timed_out both match", mutator.StatusTimedOut, true, true, true},
-		{"timed_out tests mismatch", mutator.StatusTimedOut, true, false, false},
-		{"timed_out prod mismatch", mutator.StatusTimedOut, false, true, false},
-		// NOT_VIABLE is purely a function of mutated source (compile failure),
-		// so reuse is gated only on prod_hash.
-		{"not_viable prod match", mutator.StatusNotViable, true, false, true},
-		{"not_viable prod mismatch", mutator.StatusNotViable, false, false, false},
-		{"infra_error never reused", mutator.StatusInfraError, true, true, false},
-		{"not_covered never reused", mutator.StatusNotCovered, true, true, false},
-		{"pending never reused", mutator.StatusPending, true, true, false},
+		{"timed_out all match", mutator.StatusTimedOut, true, true, true, true},
+		{"timed_out tests mismatch", mutator.StatusTimedOut, true, true, false, false},
+		{"timed_out prod mismatch", mutator.StatusTimedOut, false, true, true, false},
+		{"timed_out pkg mismatch", mutator.StatusTimedOut, true, false, true, false},
+		// NOT_VIABLE is independent of *test* content (it never ran a
+		// test), so tests_hash does not gate it — but it is not
+		// independent of the rest of the package: a sibling file
+		// supplying a missing symbol makes a previously uncompilable
+		// mutant compile, so pkg_hash still gates it.
+		{"not_viable prod+pkg match", mutator.StatusNotViable, true, true, false, true},
+		{"not_viable prod mismatch", mutator.StatusNotViable, false, true, false, false},
+		{"not_viable pkg mismatch", mutator.StatusNotViable, true, false, false, false},
+		{"infra_error never reused", mutator.StatusInfraError, true, true, true, false},
+		{"not_covered never reused", mutator.StatusNotCovered, true, true, true, false},
+		{"pending never reused", mutator.StatusPending, true, true, true, false},
 	}
 
 	for _, tc := range cases {
@@ -564,10 +585,15 @@ func runLookupCase(t *testing.T, tc lookupCase) {
 	if err != nil {
 		t.Fatalf("testsHash: %v", err)
 	}
+	pkgHash := mustPkgHash(t, dir)
 	storedProd := prodHash
+	storedPkg := pkgHash
 	storedTests := testsHash
 	if !tc.prodHashMatch {
 		storedProd = "stale-prod"
+	}
+	if !tc.pkgHashMatch {
+		storedPkg = "stale-pkg"
 	}
 	if !tc.testsHashMatch {
 		storedTests = "stale-tests"
@@ -581,7 +607,7 @@ func runLookupCase(t *testing.T, tc lookupCase) {
 			RelFile: "x.go", Line: 1, Col: 1,
 			Type: "ARITHMETIC_BASE", StartOffset: 0,
 			Original: "+", Replacement: "-",
-			ProdHash: storedProd, TestsHash: storedTests,
+			ProdHash: storedProd, PkgHash: storedPkg, TestsHash: storedTests,
 			Status: tc.priorStatus.String(), DurationMs: 7,
 		}},
 	}
@@ -711,36 +737,51 @@ func TestLookup_CorruptedStatusFallsThrough(t *testing.T) {
 
 func TestUpdate_KeepsUnchangedCarriesNewDropsStale(t *testing.T) {
 	root := t.TempDir()
-	// Two prod files. file_a.go stays the same; file_b.go is rewritten.
-	mustWrite(t, filepath.Join(root, "file_a.go"), "package x\n")
-	mustWrite(t, filepath.Join(root, "file_b.go"), "package x\n// v1\n")
+	// Two prod files in SEPARATE packages. pkga/file_a.go stays the same;
+	// pkgb/file_b.go is rewritten. The packages must be separate for this
+	// test to isolate per-file carry-over: pkg_hash makes every entry in a
+	// package share that package's fingerprint, so co-locating the two
+	// would (correctly) drop file_a's entry too — the behavior
+	// TestUpdate_DropsSiblingEntriesOnPackageChange covers.
+	dirA := filepath.Join(root, "pkga")
+	dirB := filepath.Join(root, "pkgb")
+	if err := os.MkdirAll(dirA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dirB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dirA, "file_a.go"), "package a\n")
+	mustWrite(t, filepath.Join(dirB, "file_b.go"), "package b\n// v1\n")
 
-	hA, _ := HashFile(filepath.Join(root, "file_a.go"))
-	hB, _ := HashFile(filepath.Join(root, "file_b.go"))
+	hA, _ := HashFile(filepath.Join(dirA, "file_a.go"))
+	hB, _ := HashFile(filepath.Join(dirB, "file_b.go"))
+	pkgA := mustPkgHash(t, dirA)
+	pkgB := mustPkgHash(t, dirB)
 
 	c := &Cache{
 		SchemaVersion: SchemaVersion, GoModule: testModule, ToolVersion: testVersion,
 		Entries: []Entry{
-			{ // prior entry for file_a — file unchanged, should be carried over.
-				RelFile: "file_a.go", Line: 1, Col: 1,
+			{ // prior entry for file_a — package unchanged, should be carried over.
+				RelFile: filepath.Join("pkga", "file_a.go"), Line: 1, Col: 1,
 				Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
-				ProdHash: hA, Status: "KILLED",
+				ProdHash: hA, PkgHash: pkgA, Status: "KILLED",
 			},
 			{ // prior entry for file_b — about to be rewritten, should drop.
-				RelFile: "file_b.go", Line: 1, Col: 1,
+				RelFile: filepath.Join("pkgb", "file_b.go"), Line: 1, Col: 1,
 				Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
-				ProdHash: hB, Status: "KILLED",
+				ProdHash: hB, PkgHash: pkgB, Status: "KILLED",
 			},
 		},
 	}
 
 	// Rewrite file_b so its prior hash no longer matches.
-	mustWrite(t, filepath.Join(root, "file_b.go"), "package x\n// v2\n")
+	mustWrite(t, filepath.Join(dirB, "file_b.go"), "package b\n// v2\n")
 
 	// This run only tested a NEW mutant in file_b (different line/col).
 	mutants := []mutator.Mutant{{
 		ID: 1, Type: mutator.ArithmeticBase,
-		File: filepath.Join(root, "file_b.go"), RelFile: "file_b.go",
+		File: filepath.Join(dirB, "file_b.go"), RelFile: filepath.Join("pkgb", "file_b.go"),
 		Line: 5, Col: 3, Original: "*", Replacement: "/",
 		Status: mutator.StatusLived, Duration: 11 * time.Millisecond,
 	}}
@@ -751,26 +792,62 @@ func TestUpdate_KeepsUnchangedCarriesNewDropsStale(t *testing.T) {
 		t.Fatalf("expected 2 entries (file_a kept + file_b new), got %d: %+v", len(c.Entries), c.Entries)
 	}
 
+	relA := filepath.Join("pkga", "file_a.go")
+	relB := filepath.Join("pkgb", "file_b.go")
 	var sawA, sawNewB bool
 	for _, e := range c.Entries {
-		if e.RelFile == "file_a.go" && e.Status == mutator.StatusKilled.String() {
+		if e.RelFile == relA && e.Status == mutator.StatusKilled.String() {
 			sawA = true
 		}
-		if e.RelFile == "file_b.go" && e.Line == 5 && e.Status == mutator.StatusLived.String() {
+		if e.RelFile == relB && e.Line == 5 && e.Status == mutator.StatusLived.String() {
 			sawNewB = true
 			if e.DurationMs != 11 {
 				t.Errorf("DurationMs=%d, want 11", e.DurationMs)
 			}
 		}
-		if e.RelFile == "file_b.go" && e.Line == 1 {
+		if e.RelFile == relB && e.Line == 1 {
 			t.Errorf("stale file_b entry not dropped: %+v", e)
 		}
 	}
 	if !sawA {
-		t.Error("file_a entry was dropped — should be kept (hash unchanged)")
+		t.Error("file_a entry was dropped — should be kept (package unchanged)")
 	}
 	if !sawNewB {
 		t.Error("new file_b entry not added")
+	}
+}
+
+// TestUpdate_DropsSiblingEntriesOnPackageChange is the carry-over half of
+// the v7 cache-soundness fix. Update's carry-over loop re-checks pkg_hash,
+// not just prod_hash: an entry for a byte-identical file whose *package*
+// moved on could never be reused by Lookup, so keeping it only grows the
+// cache file with weight no run can spend.
+func TestUpdate_DropsSiblingEntriesOnPackageChange(t *testing.T) {
+	root := t.TempDir()
+	aPath := filepath.Join(root, "a.go")
+	bPath := filepath.Join(root, "b.go")
+	mustWrite(t, aPath, "package x\n")
+	mustWrite(t, bPath, "package x\n// v1\n")
+
+	hA, _ := HashFile(aPath)
+
+	c := &Cache{
+		SchemaVersion: SchemaVersion, GoModule: testModule, ToolVersion: testVersion,
+		Entries: []Entry{{
+			RelFile: "a.go", Line: 1, Col: 1,
+			Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
+			ProdHash: hA, PkgHash: mustPkgHash(t, root), Status: "KILLED",
+		}},
+	}
+
+	// Edit only the sibling. a.go itself is untouched, so prod_hash still
+	// matches — pkg_hash is the only thing that can catch this.
+	mustWrite(t, bPath, "package x\n// v2\n")
+
+	c.Update(nil, NewHasher(nil), root, pkgDirTestFilesFor)
+
+	if len(c.Entries) != 0 {
+		t.Errorf("entry for a.go survived a sibling edit: %+v", c.Entries)
 	}
 }
 
@@ -910,6 +987,19 @@ func mustWrite(t *testing.T, p, body string) {
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", p, err)
 	}
+}
+
+// mustPkgHash returns the package-dependency hash of dir, failing the
+// test on error. Callers must compute it *after* every write that shapes
+// the directory: HashPkgFiles fingerprints the directory listing, so a
+// file added later changes the result.
+func mustPkgHash(t *testing.T, dir string) string {
+	t.Helper()
+	h, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles(%s): %v", dir, err)
+	}
+	return h
 }
 
 // pkgDirTestFilesFor is the conservative resolver used by unit tests:

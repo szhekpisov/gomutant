@@ -2504,3 +2504,23 @@ func TestRunMutantDroppedError(t *testing.T) {
 		})
 	}
 }
+
+// TestEmbedFilesByDir asserts the shape cache.Hasher.SetEmbedFiles expects:
+// keyed by package directory, valued by go list's dir-relative paths, and
+// with embed-less packages left out entirely (an absent directory and one
+// mapped to an empty list hash identically, so the sparse map is the
+// smaller thing to carry).
+func TestEmbedFilesByDir(t *testing.T) {
+	got := embedFilesByDir([]discover.Package{
+		{Dir: "/m/a", ImportPath: "m/a", EmbedFiles: []string{"data/schema.json", "tmpl/x.tmpl"}},
+		{Dir: "/m/b", ImportPath: "m/b"},
+		{Dir: "/m/c", ImportPath: "m/c", EmbedFiles: []string{}},
+	})
+
+	if len(got) != 1 {
+		t.Fatalf("embedFilesByDir = %v, want only the embedding package", got)
+	}
+	if !slices.Equal(got["/m/a"], []string{"data/schema.json", "tmpl/x.tmpl"}) {
+		t.Errorf("got[\"/m/a\"] = %v, want both embed inputs", got["/m/a"])
+	}
+}

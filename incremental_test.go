@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	cachepkg "github.com/szhekpisov/gomutants/internal/cache"
+	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/report"
 )
 
@@ -161,6 +163,142 @@ func TestIncrementalCacheInvalidatesPerturbedTestFile(t *testing.T) {
 	}
 }
 
+// TestIncrementalCacheInvalidatesOnSiblingFileEdit is the cache-soundness
+// probe. A mutant's verdict depends on every source file its package
+// compiles against, not just the file it lives in — but the per-mutant key
+// hashes only the mutated file plus the covering tests. This test edits a
+// *sibling* production file in the same package, leaving the mutated file
+// and every test file byte-identical, and asserts the verdict is recomputed
+// rather than replayed.
+//
+// testdata/crossfile is built so the verdict genuinely flips:
+//
+//	a.go:      func Adjust(raw int) int { return raw + Offset }
+//	b.go:      const Offset = 5
+//	a_test.go: Adjust(0) must equal Offset
+//
+// With Offset=5 the ARITHMETIC_BASE mutant (+ → -) yields -5 ≠ 5 and is
+// KILLED. Set Offset=0 and the unmutated code still passes (0+0 == 0), but
+// the mutant now yields 0 == 0 and LIVES. A cache that replays the stale
+// KILLED reports a killed mutant that was never executed and is in fact
+// alive — silent false confidence, the dangerous direction to be wrong in.
+//
+// Equivalence detection stays off (the default): with Offset=0 the compiler
+// folds `raw + 0` and `raw - 0` to identical code, so a TCE pass would
+// classify this mutant EQUIVALENT rather than LIVED.
+func TestIncrementalCacheInvalidatesOnSiblingFileEdit(t *testing.T) {
+	staleVerdictProbe{
+		fixture:    "testdata/crossfile",
+		dependency: "b.go's sibling constant",
+		// Edit ONLY b.go. a.go and a_test.go keep their exact bytes, so
+		// both prod_hash and tests_hash still match the cached entry.
+		edit: func(t *testing.T, dir string) {
+			bPath := filepath.Join(dir, "b.go")
+			body, err := os.ReadFile(bPath)
+			if err != nil {
+				t.Fatalf("read b.go: %v", err)
+			}
+			edited := strings.Replace(string(body), "const Offset = 5", "const Offset = 0", 1)
+			if edited == string(body) {
+				t.Fatal("b.go did not contain `const Offset = 5` — fixture drifted")
+			}
+			if err := os.WriteFile(bPath, []byte(edited), 0o644); err != nil {
+				t.Fatalf("write b.go: %v", err)
+			}
+		},
+	}.run(t)
+}
+
+// staleVerdictProbe drives one cache-invalidation regression: copy fixture,
+// run gomutants cold, apply an edit that must change the probe mutant's
+// verdict, run warm, and assert the cache did not replay the stale KILLED.
+//
+// Both tests that use it hinge on the same probe — the sole ARITHMETIC_BASE
+// mutant in the fixture's a.go, KILLED while the dependency holds 5 and
+// LIVED once it holds 0 — and differ only in which dependency the edit
+// touches, so the run itself is written once here. dependency names that
+// dependency for the failure messages.
+type staleVerdictProbe struct {
+	fixture    string
+	dependency string
+	edit       func(t *testing.T, dir string)
+}
+
+func (p staleVerdictProbe) run(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	dir := setupTestdataCopy(t, p.fixture)
+	cachePath := filepath.Join(dir, ".gomutants-cache.json")
+	reportPath := filepath.Join(dir, "report.json")
+	args := []string{"-w", "4", "-cache", cachePath, "-o", reportPath, "./..."}
+
+	cold := runInDir(t, dir, args)
+
+	// Locate the probe mutant by StableID so the warm run can find the same
+	// one. a.go is byte-identical across both runs, so the ID is stable.
+	probe := findArithmeticMutation(t, cold, "a.go")
+	if probe.Status != mutator.StatusKilled.String() {
+		t.Fatalf("cold run: %s status=%s, want KILLED — fixture is not exercising %s",
+			probe.ID, probe.Status, p.dependency)
+	}
+
+	p.edit(t, dir)
+
+	warm := runInDir(t, dir, args)
+
+	got := findMutationByID(t, warm, probe.ID)
+	if got.Status == mutator.StatusKilled.String() {
+		t.Errorf("warm run: %s replayed as KILLED after %s changed (cached=%d); "+
+			"the mutant now survives and must be recomputed to LIVED",
+			probe.ID, p.dependency, warm.MutantsCached)
+	}
+	if got.Status != mutator.StatusLived.String() {
+		t.Errorf("warm run: %s status=%s, want LIVED", probe.ID, got.Status)
+	}
+}
+
+// findArithmeticMutation returns the sole ARITHMETIC_BASE mutation reported
+// for relFile, failing the test if there is not exactly one. The uniqueness
+// check is deliberate: the caller uses this mutant as a fixed probe across
+// two runs, so an ambiguous match means the fixture grew a second
+// arithmetic operator and the test is no longer measuring what it claims.
+func findArithmeticMutation(t *testing.T, r *report.Report, relFile string) report.MutationReport {
+	t.Helper()
+	var found []report.MutationReport
+	for _, f := range r.Files {
+		if filepath.Base(f.FileName) != relFile {
+			continue
+		}
+		for _, m := range f.Mutations {
+			if m.Type == string(mutator.ArithmeticBase) {
+				found = append(found, m)
+			}
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("found %d ARITHMETIC_BASE mutations in %s, want exactly 1: %+v", len(found), relFile, found)
+	}
+	return found[0]
+}
+
+// findMutationByID looks up a mutation by its StableID across every file in
+// the report.
+func findMutationByID(t *testing.T, r *report.Report, id string) report.MutationReport {
+	t.Helper()
+	for _, f := range r.Files {
+		for _, m := range f.Mutations {
+			if m.ID == id {
+				return m
+			}
+		}
+	}
+	t.Fatalf("mutation %s not found in report", id)
+	return report.MutationReport{}
+}
+
 // TestIncrementalCacheResumesAfterMidRunKill simulates a hard kill during
 // a long run: a mid-run checkpoint persists the outcomes completed so
 // far, the process "dies" before the end-of-run final flush, and a fresh
@@ -312,4 +450,37 @@ func loadCacheFile(t *testing.T, path string) *cachepkg.Cache {
 		t.Fatalf("parse cache: %v", err)
 	}
 	return &c
+}
+
+// TestIncrementalCacheInvalidatesOnEmbeddedFileEdit is the //go:embed
+// counterpart of TestIncrementalCacheInvalidatesOnSiblingFileEdit, and
+// covers the wiring the unit tests cannot: that `go list`'s EmbedFiles
+// actually reaches the Hasher for the directories mutants live in.
+//
+// testdata/embedcache holds the calibration constant in offset.txt rather
+// than a Go declaration:
+//
+//	offset.txt: 5
+//	a.go:       func Adjust(raw int) int { return raw + Offset() }
+//	a_test.go:  Adjust(0) must equal Offset()
+//
+// With 5 the ARITHMETIC_BASE mutant (+ → -) yields -5 ≠ 5 and is KILLED.
+// Put 0 in offset.txt and the unmutated code still passes (0+0 == 0) while
+// the mutant now yields 0 == 0 and LIVES — with every .go file in the
+// package byte-identical, so prod_hash, the .go half of pkg_hash and
+// tests_hash all still match. Only the embed dimension can see this.
+func TestIncrementalCacheInvalidatesOnEmbeddedFileEdit(t *testing.T) {
+	staleVerdictProbe{
+		fixture:    "testdata/embedcache",
+		dependency: "offset.txt's embedded constant",
+		// Edit ONLY the embedded data file: every .go file in the package
+		// keeps its exact bytes, so prod_hash, the .go half of pkg_hash and
+		// tests_hash all still match.
+		edit: func(t *testing.T, dir string) {
+			offsetPath := filepath.Join(dir, "offset.txt")
+			if err := os.WriteFile(offsetPath, []byte("0\n"), 0o644); err != nil {
+				t.Fatalf("write offset.txt: %v", err)
+			}
+		},
+	}.run(t)
 }
