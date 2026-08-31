@@ -1272,3 +1272,239 @@ func TestUpdate_PkgHashMismatchContinuesCarryOver(t *testing.T) {
 // Compile-time sanity for unused helpers.
 var _ = withFailingOp
 var _ = fmt.Sprintf
+
+// --- pkg_hash: //go:embed inputs ---------------------------------------------
+
+// embedDir builds a package directory holding one .go file plus the named
+// embed inputs (relative slash paths → contents) and returns its path.
+func embedDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a.go"), "package x\n")
+	for rel, body := range files {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		mustWrite(t, p, body)
+	}
+	return dir
+}
+
+// embedHash hashes dir with the given embed inputs declared, on a fresh
+// Hasher so the per-directory memo never carries across cases.
+func embedHash(t *testing.T, dir string, embeds []string) string {
+	t.Helper()
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{dir: embeds})
+	v, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles(%s): %v", dir, err)
+	}
+	return v
+}
+
+// TestHashPkgFiles_EmbeddedContentChangesHash is the regression: a mutant
+// killed by a test asserting on embedded data survives once that data
+// changes, with every .go file byte-identical. Without the embed dimension
+// pkg_hash cannot see it and the cache replays the stale KILLED.
+func TestHashPkgFiles_EmbeddedContentChangesHash(t *testing.T) {
+	dir := embedDir(t, map[string]string{"data/schema.json": `{"max":5}`})
+
+	before := embedHash(t, dir, []string{"data/schema.json"})
+	mustWrite(t, filepath.Join(dir, "data", "schema.json"), `{"max":9}`)
+	after := embedHash(t, dir, []string{"data/schema.json"})
+
+	if before == after {
+		t.Error("pkg_hash unchanged after the embedded file's content changed")
+	}
+}
+
+// TestHashPkgFiles_EmbedsAreOptional pins the other side: a package that
+// declares no embed inputs must hash exactly as it did before the dimension
+// existed, so warm caches for the overwhelming majority of packages survive.
+// It also covers a directory absent from the map, which is how
+// embedFilesByDir represents "embeds nothing".
+func TestHashPkgFiles_EmbedsAreOptional(t *testing.T) {
+	dir := embedDir(t, map[string]string{"data/schema.json": `{"max":5}`})
+
+	plain, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaredEmpty := embedHash(t, dir, nil)
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{"/some/other/pkg": {"x.json"}})
+	otherDir, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if plain != declaredEmpty || plain != otherDir {
+		t.Errorf("hashes diverged with no embeds in play: plain=%s empty=%s otherDir=%s",
+			plain, declaredEmpty, otherDir)
+	}
+
+	// And the embedded file really is invisible without the declaration —
+	// otherwise the test above would pass for the wrong reason.
+	mustWrite(t, filepath.Join(dir, "data", "schema.json"), `{"max":9}`)
+	edited, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited != plain {
+		t.Error("an undeclared file under the package dir changed pkg_hash")
+	}
+}
+
+// TestHashPkgFiles_EmbedFramingUsesRelativePath covers the choice of
+// dir-relative path over basename for the embed framing. Two packages that
+// embed byte-identical content under the same basename in different
+// subdirectories must not collide: `data/a/x.json` and `data/b/x.json` are
+// different inputs, and a basename-only framing would write the same bytes
+// for both.
+func TestHashPkgFiles_EmbedFramingUsesRelativePath(t *testing.T) {
+	inA := embedDir(t, map[string]string{"data/a/x.json": "same"})
+	inB := embedDir(t, map[string]string{"data/b/x.json": "same"})
+
+	if embedHash(t, inA, []string{"data/a/x.json"}) == embedHash(t, inB, []string{"data/b/x.json"}) {
+		t.Error("same basename in different subdirectories hashed identically — " +
+			"the embed framing is not path-aware")
+	}
+}
+
+// TestHashPkgFiles_EmbedListIsOrderIndependent pins the sort + dedup: go
+// list's ordering is not part of the contract we want to hash, and a
+// pattern set can name the same file twice (`data/*.json data/schema.json`).
+func TestHashPkgFiles_EmbedListIsOrderIndependent(t *testing.T) {
+	dir := embedDir(t, map[string]string{
+		"data/a.json": "1",
+		"data/b.json": "2",
+	})
+
+	sorted := embedHash(t, dir, []string{"data/a.json", "data/b.json"})
+	reversed := embedHash(t, dir, []string{"data/b.json", "data/a.json"})
+	duped := embedHash(t, dir, []string{"data/b.json", "data/a.json", "data/b.json"})
+
+	if sorted != reversed {
+		t.Errorf("input order changed the hash: %s vs %s", sorted, reversed)
+	}
+	if sorted != duped {
+		t.Errorf("a repeated entry changed the hash: %s vs %s", sorted, duped)
+	}
+}
+
+// TestHashPkgFiles_MissingEmbedFileIsAnError locks the error return in the
+// embed loop. A declared input we cannot read leaves us unable to say
+// whether the package changed, and Lookup must see that as a miss rather
+// than hash the package as if the file were not there.
+func TestHashPkgFiles_MissingEmbedFileIsAnError(t *testing.T) {
+	dir := embedDir(t, nil)
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{dir: {"data/vanished.json"}})
+	if _, err := h.HashPkgFiles(dir); err == nil {
+		t.Error("HashPkgFiles succeeded with an unreadable embed input")
+	}
+}
+
+// --- Update's carry-over: gone vs. merely unreadable --------------------------
+
+// carryOver runs Update with no results of its own, so every prior entry
+// takes the carry-over path, and reports whether the entry survived.
+func carryOver(t *testing.T, c *Cache, h *Hasher, projectDir string) bool {
+	t.Helper()
+	c.Update(nil, h, projectDir, pkgDirTestFilesFor)
+	return len(c.Entries) == 1
+}
+
+// priorEntry returns a carry-over candidate for relFile stamped with the
+// given hashes.
+func priorEntry(relFile, prodHash, pkgHash string) *Cache {
+	return &Cache{Entries: []Entry{{
+		RelFile: relFile, Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
+		Original: "+", Replacement: "-",
+		ProdHash: prodHash, PkgHash: pkgHash,
+		Status: mutator.StatusKilled.String(),
+	}}}
+}
+
+// TestUpdate_DropsPriorEntryWhenSourceDeleted covers the fs.ErrNotExist
+// branch on the prod side. A deleted file can never hash back to the stored
+// value, so keeping the entry would grow the cache file without bound.
+// Without the branch the entry falls into "unreadable → keep" and survives.
+func TestUpdate_DropsPriorEntryWhenSourceDeleted(t *testing.T) {
+	root := t.TempDir()
+	c := priorEntry("gone.go", "abc123", "def456")
+
+	if carryOver(t, c, NewHasher(nil), root) {
+		t.Error("entry for a deleted file was carried over")
+	}
+}
+
+// TestUpdate_DropsPriorEntryWhenPackageDirDeleted covers the same branch on
+// the pkg side, which needs the mutated file to still hash: its bytes come
+// from the in-memory source map while its directory does not exist.
+//
+// The stored PkgHash is deliberately empty — the value a failed hash used to
+// be compared against. Before the rewrite this entry was *kept*, which is
+// the same laundering TestLookup_PkgHashErrorIsAMiss locks out on the
+// Lookup side.
+func TestUpdate_DropsPriorEntryWhenPackageDirDeleted(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "no-such-dir", "x.go")
+	h := srcCacheHasher(abs, "package x\n")
+	prodHash, err := h.File(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry(filepath.Join("no-such-dir", "x.go"), prodHash, "")
+
+	if carryOver(t, c, h, root) {
+		t.Error("entry whose package directory is gone was carried over")
+	}
+}
+
+// TestUpdate_KeepsPriorEntryWhenSourceUnreadable covers the "cannot verify"
+// branch on the prod side. Update runs on every checkpoint, so treating a
+// transient read failure as staleness would discard a package's warm cache
+// over one blip. Keeping is safe because Lookup re-verifies both hashes and
+// treats its own errors as a miss.
+//
+// The unreadable file is a *directory* named like one, which yields EISDIR
+// — an error that is not fs.ErrNotExist, and needs no permission games that
+// a root-running CI would defeat.
+func TestUpdate_KeepsPriorEntryWhenSourceUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "weird.go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry("weird.go", "abc123", "def456")
+
+	if !carryOver(t, c, NewHasher(nil), root) {
+		t.Error("entry was dropped over an unreadable (not missing) source file")
+	}
+}
+
+// TestUpdate_KeepsPriorEntryWhenPackageDirUnreadable covers the same branch
+// on the pkg side: the mutated file reads out of the source map, while its
+// "directory" is a regular file, so ReadDir fails with ENOTDIR rather than
+// fs.ErrNotExist.
+func TestUpdate_KeepsPriorEntryWhenPackageDirUnreadable(t *testing.T) {
+	root := t.TempDir()
+	notADir := filepath.Join(root, "pkg")
+	mustWrite(t, notADir, "not a directory\n")
+
+	abs := filepath.Join(notADir, "x.go")
+	h := srcCacheHasher(abs, "package x\n")
+	prodHash, err := h.File(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry(filepath.Join("pkg", "x.go"), prodHash, "def456")
+
+	if !carryOver(t, c, h, root) {
+		t.Error("entry was dropped over an unreadable (not missing) package directory")
+	}
+}

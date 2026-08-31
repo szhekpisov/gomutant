@@ -259,3 +259,76 @@ func TestCoveringFiles_UnknownDirIsEmpty(t *testing.T) {
 		t.Errorf("nil index CoveringFiles = %v, want nil", got)
 	}
 }
+
+// TestCoveringFiles_IncludesForeignPackageSources is the --integration
+// regression. Mutants live in target package T while the covering test
+// lives in importer R, and pkg_hash only ever hashes T — so R's non-test
+// sources, which is most of what an end-to-end test is made of, sat in no
+// dimension of the key. Loosen R's fixture and T's mutant replays KILLED
+// after it started surviving.
+//
+// The stray notes.txt pins the .go filter: R's non-source files are not
+// package inputs and must stay out of the hash.
+func TestCoveringFiles_IncludesForeignPackageSources(t *testing.T) {
+	target := t.TempDir()
+	importer := t.TempDir()
+	mustWrite(t, filepath.Join(target, "unit_test.go"), `package x
+
+import "testing"
+
+func TestUnit(t *testing.T) {}
+`)
+	mustWrite(t, filepath.Join(importer, "e2e_test.go"), `package y
+
+import "testing"
+
+func TestEndToEnd(t *testing.T) {}
+`)
+	mustWrite(t, filepath.Join(importer, "fixtures.go"), `package y
+
+const Want = 42
+`)
+	mustWrite(t, filepath.Join(importer, "notes.txt"), "not a package input\n")
+
+	ti := BuildTestIndex([]string{target, importer})
+
+	got := ti.CoveringFiles(target, []string{"TestEndToEnd"})
+	var names []string
+	for _, f := range got {
+		names = append(names, filepath.Base(f))
+	}
+	sort.Strings(names)
+
+	want := []string{"e2e_test.go", "fixtures.go", "unit_test.go"}
+	if len(names) != len(want) {
+		t.Fatalf("CoveringFiles = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("CoveringFiles = %v, want %v", names, want)
+		}
+	}
+}
+
+// TestCoveringFiles_ExcludesOwnPackageSources pins the `dir != pkgDir`
+// guard. The mutant's own production files are pkg_hash's job; re-adding
+// them here would make an unrelated production edit invalidate the tests
+// dimension as well, for no extra soundness.
+func TestCoveringFiles_ExcludesOwnPackageSources(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a_test.go"), `package x
+
+import "testing"
+
+func TestAlpha(t *testing.T) {}
+`)
+	mustWrite(t, filepath.Join(dir, "prod.go"), "package x\n\nfunc Foo() {}\n")
+
+	ti := BuildTestIndex([]string{dir})
+
+	got := ti.CoveringFiles(dir, []string{"TestAlpha"})
+	if len(got) != 1 || filepath.Base(got[0]) != "a_test.go" {
+		t.Errorf("CoveringFiles = %v, want only a_test.go — the mutant's own "+
+			"production files belong to pkg_hash", got)
+	}
+}

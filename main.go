@@ -564,6 +564,15 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, excluder, projectDir)
+	if hasher != nil {
+		// Feed the cache's pkg_hash the //go:embed inputs go list resolved
+		// for these packages. Mutants only ever live in the packages
+		// resolved here, so every directory HashPkgFiles is asked about as
+		// a *mutant's* package is covered. Set here, before any Lookup or
+		// Update, so every pkg_hash this run computes carries the
+		// dimension.
+		hasher.SetEmbedFiles(embedFilesByDir(pkgs))
+	}
 	resolveMsg := fmt.Sprintf("done (%d packages)", len(pkgs))
 	if excludedFiles > 0 {
 		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(pkgs), excludedFiles)
@@ -1248,6 +1257,25 @@ func dirsOfPackages(pkgs []discover.Package) []string {
 		}
 	}
 	return dirs
+}
+
+// embedFilesByDir maps each package's directory to the dir-relative paths
+// its production //go:embed directives resolved to, for cache.Hasher's
+// pkg_hash. Packages that embed nothing are left out of the map entirely —
+// an absent directory and one mapped to an empty list hash identically, and
+// the sparse map is the smaller thing to carry.
+//
+// Two packages never share a directory, so a plain assignment is enough;
+// the map is keyed by directory rather than import path because that is
+// what HashPkgFiles is called with.
+func embedFilesByDir(pkgs []discover.Package) map[string][]string {
+	embeds := make(map[string][]string)
+	for _, p := range pkgs {
+		if len(p.EmbedFiles) > 0 {
+			embeds[p.Dir] = p.EmbedFiles
+		}
+	}
+	return embeds
 }
 
 // integrationScope computes the reverse-dependency closure of the target

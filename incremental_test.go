@@ -425,3 +425,57 @@ func loadCacheFile(t *testing.T, path string) *cachepkg.Cache {
 	}
 	return &c
 }
+
+// TestIncrementalCacheInvalidatesOnEmbeddedFileEdit is the //go:embed
+// counterpart of TestIncrementalCacheInvalidatesOnSiblingFileEdit, and
+// covers the wiring the unit tests cannot: that `go list`'s EmbedFiles
+// actually reaches the Hasher for the directories mutants live in.
+//
+// testdata/embedcache holds the calibration constant in offset.txt rather
+// than a Go declaration:
+//
+//	offset.txt: 5
+//	a.go:       func Adjust(raw int) int { return raw + Offset() }
+//	a_test.go:  Adjust(0) must equal Offset()
+//
+// With 5 the ARITHMETIC_BASE mutant (+ → -) yields -5 ≠ 5 and is KILLED.
+// Put 0 in offset.txt and the unmutated code still passes (0+0 == 0) while
+// the mutant now yields 0 == 0 and LIVES — with every .go file in the
+// package byte-identical, so prod_hash, the .go half of pkg_hash and
+// tests_hash all still match. Only the embed dimension can see this.
+func TestIncrementalCacheInvalidatesOnEmbeddedFileEdit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	dir := setupTestdataCopy(t, "testdata/embedcache")
+	cachePath := filepath.Join(dir, ".gomutants-cache.json")
+	reportPath := filepath.Join(dir, "report.json")
+	args := []string{"-w", "4", "-cache", cachePath, "-o", reportPath, "./..."}
+
+	cold := runInDir(t, dir, args)
+
+	probe := findArithmeticMutation(t, cold, "a.go")
+	if probe.Status != mutator.StatusKilled.String() {
+		t.Fatalf("cold run: %s status=%s, want KILLED — fixture is not exercising the embedded constant",
+			probe.ID, probe.Status)
+	}
+
+	// Edit ONLY the embedded data file.
+	offsetPath := filepath.Join(dir, "offset.txt")
+	if err := os.WriteFile(offsetPath, []byte("0\n"), 0o644); err != nil {
+		t.Fatalf("write offset.txt: %v", err)
+	}
+
+	warm := runInDir(t, dir, args)
+
+	got := findMutationByID(t, warm, probe.ID)
+	if got.Status == mutator.StatusKilled.String() {
+		t.Errorf("warm run: %s replayed as KILLED after offset.txt changed (cached=%d); "+
+			"the mutant now survives and must be recomputed to LIVED",
+			probe.ID, warm.MutantsCached)
+	}
+	if got.Status != mutator.StatusLived.String() {
+		t.Errorf("warm run: %s status=%s, want LIVED", probe.ID, got.Status)
+	}
+}

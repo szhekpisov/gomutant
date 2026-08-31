@@ -23,6 +23,7 @@ import (
 type TestIndex struct {
 	byName map[string][]string // testName → abs paths of declaring _test.go files
 	byDir  map[string][]string // pkgDir → abs paths of every _test.go in dir
+	srcDir map[string][]string // pkgDir → abs paths of every non-test .go in dir
 }
 
 // BuildTestIndex parses each _test.go file in pkgDirs and indexes
@@ -42,6 +43,7 @@ func BuildTestIndex(pkgDirs []string) *TestIndex {
 	ti := &TestIndex{
 		byName: make(map[string][]string),
 		byDir:  make(map[string][]string),
+		srcDir: make(map[string][]string),
 	}
 	seen := make(map[string]bool)
 	for _, dir := range pkgDirs {
@@ -57,16 +59,24 @@ func BuildTestIndex(pkgDirs []string) *TestIndex {
 		// guard — so no separate branch is needed.
 		entries, _ := os.ReadDir(abs)
 
-		var dirFiles []string
+		var dirFiles, srcFiles []string
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
 			}
 			name := e.Name()
+			absPath := filepath.Join(abs, name)
 			if !strings.HasSuffix(name, "_test.go") {
+				// Non-test sources are recorded too: when this directory
+				// is a *foreign* package declaring a covering test, its
+				// production files decide that test's outcome and so gate
+				// the mutant — see CoveringFiles. The .go filter keeps the
+				// same set HashPkgFiles would compute for the directory.
+				if strings.HasSuffix(name, ".go") {
+					srcFiles = append(srcFiles, absPath)
+				}
 				continue
 			}
-			absPath := filepath.Join(abs, name)
 			dirFiles = append(dirFiles, absPath)
 
 			fset := token.NewFileSet()
@@ -97,6 +107,7 @@ func BuildTestIndex(pkgDirs []string) *TestIndex {
 		// stored an empty slice with the same observable AllInDir
 		// result) so it's been folded into an unconditional write.
 		ti.byDir[abs] = dirFiles
+		ti.srcDir[abs] = srcFiles
 	}
 	return ti
 }
@@ -139,9 +150,10 @@ func (ti *TestIndex) AllInDir(pkgDir string) []string {
 	return ti.byDir[pkgDir]
 }
 
-// CoveringFiles returns the _test.go files whose content gates cache reuse
-// for a mutant in pkgDir that the per-test coverage map attributes to
-// testNames. Pass a nil/empty testNames when no coverage map is available.
+// CoveringFiles returns the files outside prod_hash and pkg_hash whose
+// content gates cache reuse for a mutant in pkgDir that the per-test
+// coverage map attributes to testNames. Pass a nil/empty testNames when no
+// coverage map is available.
 //
 // The result is always a superset of AllInDir(pkgDir): every test file in
 // the mutant's own package is in the set, not just the files declaring the
@@ -160,6 +172,18 @@ func (ti *TestIndex) AllInDir(pkgDir string) []string {
 // the covering tests can be declared outside pkgDir entirely, and those
 // files gate the mutant too. Names the index doesn't know contribute
 // nothing — they resolve to no file, and the local set already stands.
+//
+// For a covering test declared in a *foreign* directory, that directory's
+// production sources are added as well. Under --integration the dependency
+// arrow points the other way from the usual one: mutants live in target
+// package T, the covering tests live in importer R, and pkg_hash only ever
+// hashes T. R's non-test sources — the fixture builders and helper types an
+// end-to-end test is mostly made of — would otherwise sit in no dimension
+// of the key at all, so editing R's fixture to expect a looser value would
+// replay T's mutant as KILLED after it started surviving. pkgDir itself is
+// excluded from this: pkg_hash already covers the mutant's own package, and
+// re-adding it here would make an unrelated production edit invalidate the
+// tests dimension too.
 //
 // A nil receiver yields nil, but there is no `ti == nil` guard here: both
 // lookups this delegates to are already nil-safe and return nil, so the
@@ -181,6 +205,14 @@ func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string) []string {
 	for _, n := range testNames {
 		for _, f := range ti.FilesFor(n) {
 			add(f)
+			// Dereferencing ti here needs no nil guard: reaching this
+			// point means FilesFor returned a file, which a nil index
+			// never does.
+			if dir := filepath.Dir(f); dir != pkgDir {
+				for _, src := range ti.srcDir[dir] {
+					add(src)
+				}
+			}
 		}
 	}
 	return files

@@ -322,7 +322,7 @@ func TestResolvePackagesForwardsTags(t *testing.T) {
 }
 
 func TestDecodeGoListJSONValid(t *testing.T) {
-	input := `{"Dir":"/a","ImportPath":"mod/a","GoFiles":["a.go"],"TestGoFiles":["a_test.go"]}
+	input := `{"Dir":"/a","ImportPath":"mod/a","GoFiles":["a.go"],"TestGoFiles":["a_test.go"],"EmbedFiles":["data/schema.json"]}
 {"Dir":"/b","ImportPath":"mod/b","GoFiles":["b.go"]}
 `
 	pkgs, err := decodeGoListJSON(strings.NewReader(input))
@@ -334,6 +334,15 @@ func TestDecodeGoListJSONValid(t *testing.T) {
 	}
 	if pkgs[0].ImportPath != "mod/a" {
 		t.Errorf("pkgs[0].ImportPath=%q", pkgs[0].ImportPath)
+	}
+	// EmbedFiles feeds the incremental cache's pkg_hash, so a dropped
+	// assignment here would silently stop invalidating mutants on an
+	// embedded-data edit.
+	if len(pkgs[0].EmbedFiles) != 1 || pkgs[0].EmbedFiles[0] != "data/schema.json" {
+		t.Errorf("pkgs[0].EmbedFiles=%v, want [data/schema.json]", pkgs[0].EmbedFiles)
+	}
+	if pkgs[1].EmbedFiles != nil {
+		t.Errorf("pkgs[1].EmbedFiles=%v, want nil for a package that embeds nothing", pkgs[1].EmbedFiles)
 	}
 }
 
