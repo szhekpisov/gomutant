@@ -9,6 +9,7 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1444,24 +1445,31 @@ func TestHashCoverageInputs_EmbedsAreOptional(t *testing.T) {
 	// And the embedded file really is invisible without the declaration —
 	// otherwise the test above would pass for the wrong reason.
 	mustWrite(t, filepath.Join(dir, "data", "cases.json"), `[1,2]`)
-	if edited := coverHash(t, []string{dir}, dir, nil); edited != plain {
+	if coverHash(t, []string{dir}, dir, nil) != plain {
 		t.Error("an undeclared file under a package dir changed the coverage key")
 	}
 }
 
-// TestHashCoverageInputs_EmbedOrderIndependent pins embedFrames' directory
-// sort. Unlike pkg_hash this method takes a whole scope, and its callers
-// build that list in whatever order go list or the integration closure
-// produced — an order that must not reach the key, or the same repository
-// would hash differently from one run to the next.
-func TestHashCoverageInputs_EmbedOrderIndependent(t *testing.T) {
+// TestHashCoverageInputs_EmbedsAcrossDirectories covers embedFrames on a
+// multi-directory scope, which is the shape pkg_hash never sees: every
+// directory's inputs have to land, and neither the caller's ordering nor a
+// repeated entry may change the result. Callers build that list in whatever
+// order go list or the integration closure produced, so an order-sensitive
+// key would hash the same repository differently from one run to the next.
+func TestHashCoverageInputs_EmbedsAcrossDirectories(t *testing.T) {
 	root := coverEmbedDir(t, map[string]string{"data/a.json": "1"})
 	other := embedDir(t, map[string]string{"data/b.json": "2"})
 	embeds := map[string][]string{root: {"data/a.json"}, other: {"data/b.json"}}
 
 	forward := coverHash(t, []string{root, other}, root, embeds)
 	reversed := coverHash(t, []string{other, root}, root, embeds)
-	duped := coverHash(t, []string{other, root, other}, root, embeds)
+	// Both directories are repeated, so whichever sorts first, one repeat
+	// lands mid-list rather than at the end. A repeat in the last position
+	// hides most of the ways the skip can be wrong: stopping at the repeat
+	// and skipping past it are the same thing there, and so are "this
+	// equals its predecessor" and "always equal". Mid-list, each of those
+	// drops a directory's frames or emits them twice.
+	duped := coverHash(t, []string{root, other, root, other}, root, embeds)
 
 	if forward != reversed {
 		t.Errorf("pkgDirs order changed the key: %s vs %s", forward, reversed)
@@ -1469,19 +1477,43 @@ func TestHashCoverageInputs_EmbedOrderIndependent(t *testing.T) {
 	if forward != duped {
 		t.Errorf("a repeated pkgDir changed the key: %s vs %s", forward, duped)
 	}
+
+	// Each directory's inputs must actually reach the key, asserted by
+	// dropping one declaration at a time. The three comparisons above
+	// cannot see this on their own: a skip that swallowed every directory
+	// after the first would swallow the same one in all three, leaving them
+	// equal to each other and the bug invisible. Which directory sorts
+	// first depends on the temp-dir names, so both drops are checked.
+	onlyRoot := coverHash(t, []string{root, other}, root, map[string][]string{root: {"data/a.json"}})
+	onlyOther := coverHash(t, []string{root, other}, root, map[string][]string{other: {"data/b.json"}})
+	if forward == onlyRoot {
+		t.Error("dropping the second directory's embed declaration left the key unchanged")
+	}
+	if forward == onlyOther {
+		t.Error("dropping the first directory's embed declaration left the key unchanged")
+	}
 }
 
 // TestHashCoverageInputs_MissingEmbedFileIsAnError locks the error return.
 // A declared input we cannot read leaves us unable to say whether the
 // coverage inputs changed, and the caller must re-run coverage rather than
 // key a profile as if the file were not there.
+//
+// The cause is asserted through errors.Is, not just for a non-nil error:
+// the wrap has to keep the underlying fs.ErrNotExist reachable, or Update's
+// "gone vs. merely unreadable" classification — which is exactly that
+// errors.Is check — cannot tell the two apart.
 func TestHashCoverageInputs_MissingEmbedFileIsAnError(t *testing.T) {
 	dir := coverEmbedDir(t, nil)
 
 	h := NewHasher(nil)
 	h.SetEmbedFiles(map[string][]string{dir: {"data/vanished.json"}})
-	if _, err := h.HashCoverageInputs([]string{dir}, dir, "", "", "", "go1.26", "env"); err == nil {
-		t.Error("HashCoverageInputs succeeded with an unreadable embed input")
+	_, err := h.HashCoverageInputs([]string{dir}, dir, "", "", "", "go1.26", "env")
+	if err == nil {
+		t.Fatal("HashCoverageInputs succeeded with an unreadable embed input")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want one unwrapping to fs.ErrNotExist", err)
 	}
 }
 

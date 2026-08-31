@@ -383,17 +383,27 @@ func goFilesIn(pkgDirs []string, skipTests bool) ([]string, error) {
 // basename (data/a/x.json, data/b/x.json) that a basename-only framing
 // would alias together. Directories are sorted rather than emitted in
 // call order so the same package set hashes identically however it was
-// enumerated; within a directory the rel paths are sorted and deduped.
+// enumerated, and a directory named twice contributes its frames once;
+// within a directory the rel paths are sorted and deduped too.
 //
 // A read error is propagated — callers treat it as a cache miss, never as
 // a match.
 func (h *Hasher) embedFrames(pkgDirs []string) ([]string, error) {
 	dirs := slices.Clone(pkgDirs)
 	slices.Sort(dirs)
-	dirs = slices.Compact(dirs)
 
 	var frames []string
-	for _, dir := range dirs {
+	for i, dir := range dirs {
+		// Sorted, so a repeat sits next to its twin. Skipped here rather
+		// than compacted away: slices.Compact zeroes the tail it drops, and
+		// an empty directory name carries no embed inputs, so keeping or
+		// dropping the `dirs = slices.Compact(dirs)` assignment hashed the
+		// same — an unobservable statement. The rel-path Compact below is
+		// observable for the opposite reason: an empty rel path resolves to
+		// the directory itself, which fails to read.
+		if i > 0 && dir == dirs[i-1] {
+			continue
+		}
 		rels := slices.Clone(h.embeds[dir])
 		slices.Sort(rels)
 		rels = slices.Compact(rels)

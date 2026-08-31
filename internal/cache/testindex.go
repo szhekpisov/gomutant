@@ -230,14 +230,22 @@ func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string, crossPkg b
 			// point means FilesFor returned a file, which a nil index
 			// never does.
 			if dir := filepath.Dir(f); dir != pkgDir {
-				for _, tf := range ti.AllInDir(dir) {
-					add(tf)
-				}
-				for _, src := range ti.srcDir[dir] {
-					add(src)
-				}
+				ti.addWholePackage(dir, add)
 			}
 		}
 	}
 	return files
+}
+
+// addWholePackage feeds every indexed file of dir — its test files and its
+// production sources both — to add. Split out of CoveringFiles so that
+// method stays within the cognitive-complexity budget: inlined, its two
+// loops sit four levels deep inside the name resolution above.
+func (ti *TestIndex) addWholePackage(dir string, add func(string)) {
+	for _, f := range ti.AllInDir(dir) {
+		add(f)
+	}
+	for _, f := range ti.srcDir[dir] {
+		add(f)
+	}
 }
