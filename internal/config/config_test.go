@@ -46,6 +46,7 @@ timeout-coefficient: 20
 coverpkg: "./pkg/..."
 test-flags: "-rapid.checks=20 -short"
 output: report.json
+baseline: .gomutants-baseline.json
 dry-run: true
 verbose: true
 quiet: true
@@ -80,6 +81,9 @@ only:
 	}
 	if cfg.Output != "report.json" {
 		t.Errorf("Output=%q, want %q", cfg.Output, "report.json")
+	}
+	if cfg.Baseline != ".gomutants-baseline.json" {
+		t.Errorf("Baseline=%q, want .gomutants-baseline.json", cfg.Baseline)
 	}
 	if !cfg.DryRun {
 		t.Error("DryRun should be true")
@@ -231,6 +235,7 @@ func TestApplyFlags(t *testing.T) {
 		ChangedSince:       "main",
 		RunMutantID:        "a.go:F:ARITHMETIC_BASE#1",
 		Cache:              "cache.json",
+		Baseline:           "baseline.json",
 		DryRun:             true,
 		Verbose:            true,
 		Quiet:              true,
@@ -288,6 +293,9 @@ func TestApplyFlags(t *testing.T) {
 	if cfg.Cache != "cache.json" {
 		t.Errorf("Cache=%q, want cache.json", cfg.Cache)
 	}
+	if cfg.Baseline != "baseline.json" {
+		t.Errorf("Baseline=%q, want baseline.json", cfg.Baseline)
+	}
 	if !cfg.DryRun {
 		t.Error("DryRun should be true")
 	}
@@ -304,6 +312,7 @@ func TestApplyFlagsZeroValuesNoOverride(t *testing.T) {
 	cfg.TestCPU = 7
 	cfg.Tags = "integration" // e.g. set via YAML
 	cfg.TestFlags = "-short" // e.g. set via YAML
+	cfg.Baseline = ".gomutants-baseline.json"
 	orig := cfg
 
 	// Zero/empty values should not override defaults.
@@ -342,6 +351,9 @@ func TestApplyFlagsZeroValuesNoOverride(t *testing.T) {
 	}
 	if cfg.TestFlags != orig.TestFlags {
 		t.Errorf("TestFlags changed from %q to %q; an empty --test-flags must not clobber a YAML value", orig.TestFlags, cfg.TestFlags)
+	}
+	if cfg.Baseline != orig.Baseline {
+		t.Errorf("Baseline changed from %q to %q; an omitted --baseline must not clobber a YAML value", orig.Baseline, cfg.Baseline)
 	}
 }
 
@@ -574,6 +586,28 @@ func TestResolveCache(t *testing.T) {
 			c.ResolveCache()
 			if c.Cache != tc.want {
 				t.Errorf("Cache=%q, want %q", c.Cache, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveBaseline(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty stays disabled", "", ""},
+		{"off disables", "off", ""},
+		{"explicit path passes through", "/tmp/x.json", "/tmp/x.json"},
+		{"relative path passes through", ".gomutants-baseline.json", ".gomutants-baseline.json"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Config{Baseline: tc.in}
+			c.ResolveBaseline()
+			if c.Baseline != tc.want {
+				t.Errorf("Baseline=%q, want %q", c.Baseline, tc.want)
 			}
 		})
 	}

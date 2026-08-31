@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -282,6 +283,8 @@ func run(ctx context.Context, args []string) error {
 		changedSince      string
 		runMutantID       string
 		cachePath         string
+		baselinePath      string
+		baselineUpdate    bool
 		annotations       string
 		strykerOutput     string
 		htmlOutput        string
@@ -374,6 +377,8 @@ func run(ctx context.Context, args []string) error {
 	// position within the string matters.
 	fs.StringVar(&runMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
 	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source package and covering tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
+	fs.StringVar(&baselinePath, "baseline", "", "path to committed known-survivor baseline; fail only on LIVED mutants absent from it. Pass --baseline=off to disable a configured baseline")
+	fs.BoolVar(&baselineUpdate, "baseline-update", false, "create or shrink --baseline after a successful full run; refuses to accept new survivors")
 	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
 	fs.StringVar(&strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
 	fs.StringVar(&htmlOutput, "html-output", "", "also write a self-contained interactive HTML mutation report at this path (Stryker mutation-testing-elements viewer, no network deps)")
@@ -441,6 +446,7 @@ func run(ctx context.Context, args []string) error {
 		ChangedSince:       changedSince,
 		RunMutantID:        runMutantID,
 		Cache:              cachePath,
+		Baseline:           baselinePath,
 		DryRun:             dryRun,
 		Verbose:            verbose,
 		Quiet:              quiet,
@@ -449,6 +455,7 @@ func run(ctx context.Context, args []string) error {
 		ExcludeCallsDefaults: excludeCallsDefaults,
 	})
 	cfg.ResolveCache()
+	cfg.ResolveBaseline()
 
 	// Integration mode computes -coverpkg from the target packages so that
 	// tests in importing packages record coverage on the mutated code. An
@@ -466,6 +473,27 @@ func run(ctx context.Context, args []string) error {
 	// caller and cannot be turned back off from the command line.
 	if cfg.RunMutantID != "" && cfg.DryRun {
 		return usageErrorf("--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report")
+	}
+
+	// Ratchet comparisons require a complete mutant universe. Partial or
+	// verdict-free modes would otherwise erase unseen baseline entries during
+	// an update, or let a targeted known survivor answer the single-mutant
+	// question with exit 0. The absolute efficacy gate also defeats the point
+	// of accepting known survivor debt, so make that conflict explicit.
+	if baselineUpdate && cfg.Baseline == "" {
+		return usageErrorf("--baseline-update requires --baseline <file> (or a baseline path in .gomutants.yml)")
+	}
+	if cfg.Baseline != "" {
+		switch {
+		case cfg.ChangedSince != "":
+			return usageErrorf("--baseline cannot be used with --changed-since: ratchet mode requires a full run")
+		case cfg.RunMutantID != "":
+			return usageErrorf("--baseline cannot be used with --run-mutant-id: targeted replay has its own verdict exit contract")
+		case cfg.DryRun:
+			return usageErrorf("--baseline cannot be used with --dry-run: a dry run produces no verdicts")
+		case thresholdEfficacy > 0:
+			return usageErrorf("--baseline cannot be used with --threshold-efficacy: the absolute threshold would reject known survivor debt")
+		}
 	}
 
 	// Checked after ApplyFlags so a value from .gomutants.yml is screened
@@ -553,6 +581,39 @@ func run(ctx context.Context, args []string) error {
 		fmt.Fprintln(stderr, `gomutants: run "gomutants --list-mutators" to see valid mutator names`)
 	}
 	enabledMutators := reg.EnabledMutators(cfg.Only, cfg.Disable)
+
+	// Load the ratchet before package resolution or test execution. A bad or
+	// stale policy file is configuration, not a mutation result, and should
+	// fail cheaply. A missing file is accepted only for the explicit bootstrap
+	// operation --baseline-update.
+	baselinePolicy := baselinePolicyFor(packages, enabledMutators, &cfg)
+	var (
+		loadedBaseline    *report.Baseline
+		baselineBootstrap bool
+	)
+	if cfg.Baseline != "" {
+		loadedBaseline, err = report.ReadBaseline(cfg.Baseline)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && baselineUpdate {
+				baselineBootstrap = true
+			} else if errors.Is(err, os.ErrNotExist) {
+				return usageErrorf("baseline %s does not exist; create it with --baseline-update", cfg.Baseline)
+			} else {
+				return usageError(err)
+			}
+		}
+		if loadedBaseline != nil {
+			if loadedBaseline.GoModule != goModule {
+				return usageErrorf("baseline %s belongs to module %q, not %q", cfg.Baseline, loadedBaseline.GoModule, goModule)
+			}
+			if differences := loadedBaseline.Policy.Differences(baselinePolicy); len(differences) > 0 {
+				if !baselineUpdate {
+					return usageErrorf("baseline policy differs in %s; rerun deliberately with --baseline-update to migrate it", strings.Join(differences, ", "))
+				}
+				fmt.Fprintf(stderr, "gomutants: warning: updating baseline across policy changes: %s\n", strings.Join(differences, ", "))
+			}
+		}
+	}
 
 	term := report.NewTerminal(stdout, 0, cfg.Verbose, cfg.Quiet)
 	term.Header(effectiveVersion(), fmt.Sprintf("%v", packages), cfg.Workers, len(enabledMutators))
@@ -952,9 +1013,30 @@ func run(ctx context.Context, args []string) error {
 	// switch, so even --checkpoint-interval=0 still writes the cache once.
 	checkpoint(true)
 
+	// Compare only after TCE has had the chance to reclassify LIVED mutants
+	// as EQUIVALENT. On first-time bootstrap, compare against the snapshot we
+	// are about to write so every accepted survivor is reported as KNOWN, not
+	// as a regression in its own initialization run.
+	var baselineComparison *report.BaselineComparison
+	if cfg.Baseline != "" {
+		baselineForComparison := loadedBaseline
+		if baselineBootstrap {
+			baselineForComparison = report.NewBaseline(goModule, effectiveVersion(), baselinePolicy, mutants, projectDir)
+		}
+		comparison := report.CompareBaseline(baselineForComparison, mutants, projectDir)
+		baselineComparison = &comparison
+		for _, fallback := range comparison.Fallbacks {
+			fmt.Fprintf(stderr, "gomutants: warning: baseline matched by %s after stable ID changed: %s -> %s\n",
+				fallback.Kind, fallback.OldID, fallback.NewID)
+		}
+	}
+
 	// 9. Generate report.
 	totalElapsed := time.Since(coverStart)
 	r := report.Generate(mutants, goModule, totalElapsed, len(suppressed))
+	if baselineComparison != nil {
+		report.ApplyBaselineComparison(r, *baselineComparison)
+	}
 	// Breakdown only; the aggregate stays in MutantsSuppressed so the two
 	// suppression sources share one bucket everywhere else.
 	r.MutantsSuppressedByCalls = len(callSuppressed)
@@ -1019,6 +1101,12 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", cfg.RunMutantID, s)
 		}
 	}
+	if baselineComparison != nil && len(baselineComparison.New) > 0 {
+		return &exitError{
+			code: exitCodeEfficacy,
+			err:  newBaselineSurvivorsError(cfg.Baseline, baselineComparison.New),
+		}
+	}
 	tested := r.MutantsKilled + r.MutantsLived
 	mcoverDenom := tested + r.MutantsNotCovered
 	mcover := 0.0
@@ -1046,7 +1134,50 @@ func run(ctx context.Context, args []string) error {
 			}
 		}
 	}
+	if baselineUpdate {
+		next := report.UpdatedBaseline(goModule, effectiveVersion(), baselinePolicy, *baselineComparison)
+		if err := report.WriteBaseline(cfg.Baseline, next); err != nil {
+			return fmt.Errorf("writing baseline: %w", err)
+		}
+		if !cfg.Quiet {
+			fmt.Fprintf(stdout, "Baseline updated: %s (%d survivors)\n", cfg.Baseline, len(next.Survivors))
+		}
+	}
 	return nil
+}
+
+// baselinePolicyFor captures the semantic surface against which a committed
+// baseline was created. Sorting is handled by BaselinePolicy.Canonical.
+func baselinePolicyFor(packages []string, enabled []mutator.Mutator, cfg *config.Config) report.BaselinePolicy {
+	mutators := make([]string, len(enabled))
+	for i, m := range enabled {
+		mutators[i] = string(m.Type())
+	}
+	return report.BaselinePolicy{
+		Packages:         slices.Clone(packages),
+		Mutators:         mutators,
+		BuildTags:        cfg.Tags,
+		TestFlags:        cfg.CanonicalTestFlags(),
+		Integration:      cfg.Integration,
+		CoverPkg:         cfg.CoverPkg,
+		DetectEquivalent: cfg.DetectEquivalentEnabled(),
+		ExcludeFiles:     slices.Clone(cfg.ExcludeFiles),
+		ExcludeCalls:     cfg.ResolvedExcludeCalls(),
+	}.Canonical()
+}
+
+func newBaselineSurvivorsError(path string, entries []report.BaselineEntry) error {
+	const maxListed = 10
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d new surviving mutant(s) absent from baseline %s", len(entries), path)
+	for i, entry := range entries {
+		if i == maxListed {
+			fmt.Fprintf(&b, "\n  ... and %d more", len(entries)-maxListed)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %s (%s:%d:%d)", entry.ID, entry.File, entry.Line, entry.Column)
+	}
+	return errors.New(b.String())
 }
 
 // runMutantDroppedError explains which filter dropped the mutant that

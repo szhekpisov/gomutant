@@ -83,6 +83,10 @@ type Config struct {
 	// to switch it off from the CLI. It is set from --run-mutant-id only.
 	RunMutantID string `yaml:"-"`
 	Cache       string `yaml:"cache"`
+	// Baseline is the committed known-survivor file used by ratchet mode.
+	// Empty disables the gate; "off" is accepted as an explicit CLI
+	// override for a baseline configured in YAML.
+	Baseline string `yaml:"baseline"`
 	// CheckpointInterval is how often completed mutant outcomes are
 	// flushed to the cache file mid-run, so a hard kill (OOM, CI timeout,
 	// SIGKILL) loses at most this much progress. 0 disables periodic
@@ -308,6 +312,15 @@ func (c *Config) ResolveCache() {
 	}
 }
 
+// ResolveBaseline materializes the baseline off-switch after YAML and CLI
+// values have been merged. Unlike the cache, baseline mode is opt-in and has
+// no default path.
+func (c *Config) ResolveBaseline() {
+	if c.Baseline == "off" {
+		c.Baseline = ""
+	}
+}
+
 // AdaptiveTimeoutFlag captures the `--adaptive-timeout` CLI flag value.
 // Used as a parameter to ApplyFlags so the CLI layer can express three
 // states ("set to true", "set to false", "not provided") that a plain
@@ -366,6 +379,7 @@ type Flags struct {
 	ChangedSince       string
 	RunMutantID        string
 	Cache              string
+	Baseline           string
 	DryRun             bool
 	Verbose            bool
 	Quiet              bool
@@ -447,6 +461,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.Cache != "" {
 		c.Cache = f.Cache
+	}
+	if f.Baseline != "" {
+		c.Baseline = f.Baseline
 	}
 }
 

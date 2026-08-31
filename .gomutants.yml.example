@@ -60,6 +60,12 @@ output: mutation-report.json
 # identical to the cached run are skipped.
 # cache: .gomutants-cache.json
 
+# Committed known-survivor baseline for ratchet mode. A full run fails only
+# when a LIVED mutant is absent from this file. Create or shrink it explicitly
+# with --baseline-update; updates refuse to accept new survivors. Set to "off"
+# on the CLI to disable a configured baseline for one run.
+# baseline: .gomutants-baseline.json
+
 # How often to flush completed mutant outcomes to the cache file while a
 # run is still in progress (default: 10s). A run killed mid-way — OOM, CI
 # timeout, SIGKILL, double Ctrl-C — loses at most this much progress; the

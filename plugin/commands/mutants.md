@@ -31,6 +31,7 @@ Run from the repo root (the directory containing `go.mod`). If the user invoked 
 
 ```
 <gomutants> -quiet \
+  -baseline=off \
   -output /tmp/gomutants-report.json \
   -html-output /tmp/gomutants-report.html \
   [scope from step 1]
@@ -41,6 +42,7 @@ Notes:
 - `-html-output` writes a self-contained, click-through HTML viewer (per-file efficacy sidebar, annotated source). Surface its path in step 5 so the user can open it.
 - Do **not** pass `-dry-run` — real KILLED/LIVED status is required.
 - Do **not** pass `-cache=off`. The default `.gomutants-cache.json` is on, which makes repeat runs in the same session fast.
+- Pass `-baseline=off`. This command deliberately uses changed or ad-hoc package scopes and needs to show all LIVED mutants; a project-wide ratchet requires a full comparable run and would reject `-changed-since`.
 - Exit codes 10 / 11 mean the efficacy / coverage thresholds were not met. Both reports still wrote, so continue.
 - Exit code 2 means the invocation or configuration is invalid. Stop and surface the error; do not continue with a stale or missing report.
 - `INFRA ERROR` entries mean the host ran out of a recognized resource or hit an I/O failure. Do not treat them as killed mutants or propose tests for them; report the count and recommend rerunning after the environment is healthy.
@@ -102,6 +104,7 @@ For up to ~10 surviving mutants (prioritise files with the most survivors):
 
    ```
    <gomutants> -quiet \
+     -baseline=off \
      -output /tmp/gomutants-one-mutant.json \
      --run-mutant-id '<id>' --threshold-efficacy 100 <same package arg>
    ```

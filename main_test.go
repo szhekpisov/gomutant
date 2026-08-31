@@ -1156,6 +1156,139 @@ func TestRunThresholdEfficacySilentWhenClean(t *testing.T) {
 	}
 }
 
+func TestRunBaselineRejectsIncompatibleModes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"update needs path", []string{"--baseline-update"}},
+		{"changed scope", []string{"--baseline", "baseline.json", "--changed-since", "main"}},
+		{"single mutant", []string{"--baseline", "baseline.json", "--run-mutant-id", "x"}},
+		{"dry run", []string{"--baseline", "baseline.json", "--dry-run"}},
+		{"absolute efficacy", []string{"--baseline", "baseline.json", "--threshold-efficacy", "100"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := captureStderr(t, func() error {
+				return run(context.Background(), tc.args)
+			})
+			requireExitCode(t, err, exitCodeUsageError)
+		})
+	}
+}
+
+func TestRunBaselineBootstrapKnownAndNewSurvivor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"add.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go": "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(orig)
+
+	baselinePath := filepath.Join(dir, ".gomutants-baseline.json")
+	firstReport := filepath.Join(dir, "first.json")
+	baseArgs := []string{
+		"--baseline", baselinePath,
+		"--cache=off",
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+	}
+	bootstrapArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", firstReport, "testmod")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), bootstrapArgs) }); err != nil {
+		t.Fatalf("bootstrap baseline: %v", err)
+	}
+	b, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatalf("ReadBaseline: %v", err)
+	}
+	if len(b.Survivors) != 1 {
+		t.Fatalf("bootstrapped survivors=%d, want 1", len(b.Survivors))
+	}
+	knownReport := filepath.Join(dir, "known.json")
+	knownArgs := append(slices.Clone(baseArgs), "-o", knownReport, "testmod")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), knownArgs) }); err != nil {
+		t.Fatalf("known survivor should pass the ratchet: %v", err)
+	}
+	knownData, err := os.ReadFile(knownReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var knownResult report.Report
+	if err := json.Unmarshal(knownData, &knownResult); err != nil {
+		t.Fatal(err)
+	}
+	if knownResult.Baseline == nil || knownResult.Baseline.KnownSurvivors != 1 || knownResult.Baseline.NewSurvivors != 0 {
+		t.Fatalf("known-run baseline report=%+v", knownResult.Baseline)
+	}
+	mismatchArgs := append(slices.Clone(baseArgs), "--test-flags=-short", "testmod")
+	_, err = captureStderr(t, func() error { return run(context.Background(), mismatchArgs) })
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "baseline policy differs in test-flags") {
+		t.Fatalf("policy mismatch error=%v", err)
+	}
+
+	// Adding a second same-type mutation point leaves the accepted survivor
+	// known and introduces one ID that the ratchet must reject.
+	if err := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int { return a + b + 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secondReport := filepath.Join(dir, "second.json")
+	secondArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", secondReport, "testmod")
+	_, err = captureOutput(t, func() error { return run(context.Background(), secondArgs) })
+	requireExitCode(t, err, exitCodeEfficacy)
+	if !strings.Contains(err.Error(), "new surviving mutant") {
+		t.Fatalf("gate error=%v, want new-survivor diagnostic", err)
+	}
+
+	data, readErr := os.ReadFile(secondReport)
+	if readErr != nil {
+		t.Fatalf("report must be written before gate failure: %v", readErr)
+	}
+	var got report.Report
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse report: %v", err)
+	}
+	if got.Baseline == nil || got.Baseline.KnownSurvivors != 1 || got.Baseline.NewSurvivors != 1 {
+		t.Fatalf("baseline report=%+v, want one known and one new", got.Baseline)
+	}
+	after, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Survivors) != 1 {
+		t.Fatalf("failed gate rewrote baseline to %d survivors; want original 1", len(after.Survivors))
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "add_test.go"), []byte("package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 4 { t.Fatal(\"wrong\") } }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	thirdReport := filepath.Join(dir, "third.json")
+	shrinkArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", thirdReport, "testmod")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), shrinkArgs) }); err != nil {
+		t.Fatalf("shrink baseline after killing survivors: %v", err)
+	}
+	shrunk, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shrunk.Survivors) != 0 {
+		t.Fatalf("shrunk baseline has %d survivors, want 0", len(shrunk.Survivors))
+	}
+}
+
 // TestRunThresholdMcover pins the second gate: a function whose mutants
 // are all NOT_COVERED (no test exercises it) drops mutant coverage to 0%,
 // which must surface as exit code 11.

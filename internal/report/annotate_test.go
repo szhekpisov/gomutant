@@ -164,3 +164,24 @@ func TestWriteGitHubAnnotations_EscapesNewlinesInOriginal(t *testing.T) {
 		t.Errorf("expected newline in Original to be encoded as %%0A, got: %q", buf.String())
 	}
 }
+
+func TestWriteGitHubAnnotations_BaselineOnlyAnnotatesNewSurvivors(t *testing.T) {
+	r := &Report{
+		Baseline: &BaselineReport{KnownSurvivors: 1, NewSurvivors: 1},
+		Files: []FileReport{{
+			FileName: "a.go",
+			Mutations: []MutationReport{
+				{ID: "known", Type: "ARITHMETIC_BASE", Status: "LIVED", Line: 3, Column: 1, BaselineStatus: BaselineStatusKnown},
+				{ID: "new", Type: "BRANCH_IF", Status: "LIVED", Line: 7, Column: 1, BaselineStatus: BaselineStatusNew},
+			},
+		}},
+	}
+	var buf bytes.Buffer
+	if err := WriteGitHubAnnotations(&buf, r); err != nil {
+		t.Fatalf("WriteGitHubAnnotations: %v", err)
+	}
+	got := buf.String()
+	if strings.Contains(got, "line=3") || !strings.Contains(got, "line=7") {
+		t.Fatalf("annotations=%q, want only the NEW baseline survivor", got)
+	}
+}

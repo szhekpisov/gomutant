@@ -232,6 +232,21 @@ func TestSummaryInfraErrorsNonZero(t *testing.T) {
 	}
 }
 
+func TestSummaryBaseline(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Summary(&Report{
+		Baseline: &BaselineReport{
+			KnownSurvivors:      4,
+			ResolvedSurvivors:   2,
+			NewSurvivors:        1,
+			UnresolvedSurvivors: 3,
+		},
+	})
+	if !strings.Contains(buf.String(), "Baseline:     4 known, 2 resolved, 1 new, 3 unresolved\n") {
+		t.Fatalf("baseline summary missing: %q", buf.String())
+	}
+}
+
 // TestSummaryTTYLeadingNewline covers the `t.isTTY && !t.verbose` branch
 // that prints a newline before the summary to clear the progress line.
 func TestSummaryTTYLeadingNewline(t *testing.T) {

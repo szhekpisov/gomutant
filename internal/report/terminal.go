@@ -247,6 +247,14 @@ func (t *Terminal) Summary(r *Report) {
 	if r.MutantsEquivalent > 0 {
 		fmt.Fprintf(t.w, "  Equivalent:   %d  (compiler-proven)\n", r.MutantsEquivalent)
 	}
+	if r.Baseline != nil {
+		fmt.Fprintf(t.w, "  Baseline:     %d known, %d resolved, %d new",
+			r.Baseline.KnownSurvivors, r.Baseline.ResolvedSurvivors, r.Baseline.NewSurvivors)
+		if r.Baseline.UnresolvedSurvivors > 0 {
+			fmt.Fprintf(t.w, ", %d unresolved", r.Baseline.UnresolvedSurvivors)
+		}
+		fmt.Fprintln(t.w)
+	}
 	fmt.Fprintf(t.w, "  Efficacy:     %.2f%%\n", r.TestEfficacy)
 	fmt.Fprintln(t.w)
 }

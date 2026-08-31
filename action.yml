@@ -49,6 +49,13 @@ inputs:
       file across CI runs.
     required: false
     default: .gomutants-cache.json
+  baseline:
+    description: |
+      Path to a committed known-survivor baseline. When set, the action uses
+      ratchet mode and omits its default threshold-efficacy=100 gate, so known
+      survivor debt is allowed while new survivors still exit with code 10.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -145,17 +152,21 @@ runs:
         THRESHOLD_EFFICACY: ${{ inputs.threshold-efficacy }}
         THRESHOLD_MCOVER: ${{ inputs.threshold-mcover }}
         CACHE: ${{ inputs.cache }}
+        BASELINE: ${{ inputs.baseline }}
       # --annotations=github goes first because Go's flag package stops
       # parsing flags after the first non-flag token (the package list).
       # Empty threshold/cache inputs forward as --cache= (which disables
       # caching) or omit the gate flag entirely. Non-empty values
       # forward to gomutants directly. Default threshold-efficacy=100
       # means a surviving mutant fails the step (gremlins-compat exit
-      # code 10). $ARGS is intentionally unquoted so multi-token inputs
-      # word-split.
+      # code 10). A baseline replaces that absolute gate: gomutants exits
+      # 10 only for new survivors. $ARGS is intentionally unquoted so
+      # multi-token inputs word-split.
       run: |
         gate=()
-        if [ -n "$THRESHOLD_EFFICACY" ]; then
+        if [ -n "$BASELINE" ]; then
+          gate+=("--baseline=$BASELINE")
+        elif [ -n "$THRESHOLD_EFFICACY" ]; then
           gate+=("--threshold-efficacy=$THRESHOLD_EFFICACY")
         fi
         if [ -n "$THRESHOLD_MCOVER" ]; then
