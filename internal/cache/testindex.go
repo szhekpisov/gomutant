@@ -160,10 +160,13 @@ func (ti *TestIndex) AllInDir(pkgDir string) []string {
 // the covering tests can be declared outside pkgDir entirely, and those
 // files gate the mutant too. Names the index doesn't know contribute
 // nothing — they resolve to no file, and the local set already stands.
+//
+// A nil receiver yields nil, but there is no `ti == nil` guard here: both
+// lookups this delegates to are already nil-safe and return nil, so the
+// loops below iterate zero times and files stays nil. An explicit guard
+// would be an unobservable branch — the same reason BuildTestIndex elides
+// its redundant `|| f == nil`.
 func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string) []string {
-	if ti == nil {
-		return nil
-	}
 	var files []string
 	seen := make(map[string]bool)
 	add := func(f string) {
