@@ -67,7 +67,19 @@ type BaselineEntry struct {
 	File string `json:"file"`
 	// Anchor is the enclosing function as rendered in ID. Empty for
 	// package-level declarations, so it is omitted rather than written blank.
-	Anchor      string `json:"anchor,omitempty"`
+	Anchor string `json:"anchor,omitempty"`
+	// FamilySize is how many mutant-carrying declarations in File shared this
+	// entry's declaration name when the entry was written — the run's own view
+	// of the family, which is what the next run's count is comparable with.
+	// A declaration losing its last mutant therefore reads as a removal, which
+	// is the conservative direction. Anything above one means
+	// the anchors in that family carry source-order suffixes, which shift
+	// whenever such a declaration is added or removed — so comparing this
+	// count with the next run's is what tells a stable family apart from one
+	// whose anchors have been reassigned. Zero means "not recorded": baselines
+	// written before this field existed, which matchExactIDs handles
+	// conservatively.
+	FamilySize  int    `json:"family_size,omitempty"`
 	Line        int    `json:"line"`
 	Column      int    `json:"column"`
 	Type        string `json:"type"`
@@ -202,6 +214,9 @@ func (b *Baseline) Validate() error {
 		if entry.Line <= 0 || entry.Column <= 0 {
 			return fmt.Errorf("survivors[%d] has invalid position %d:%d", i, entry.Line, entry.Column)
 		}
+		if entry.FamilySize < 0 {
+			return fmt.Errorf("survivors[%d] has invalid family_size %d", i, entry.FamilySize)
+		}
 	}
 	return nil
 }
@@ -214,15 +229,20 @@ func NewBaseline(goModule, generatedBy string, policy BaselinePolicy, mutants []
 		GeneratedBy:   generatedBy,
 		Policy:        policy.Canonical(),
 	}
-	for _, m := range mutants {
+	// Entries are rendered for the whole run, not just the survivors, so that
+	// every FamilySize counts the declarations the run actually saw. Counting
+	// only the survivors would undercount any family whose other members were
+	// killed, and the next run — which counts over its own full mutant set —
+	// would read that undercount as a declaration having been removed.
+	entries, err := baselineEntries(mutants, moduleRoot)
+	if err != nil {
+		return nil, err
+	}
+	for i, m := range mutants {
 		if m.Status != mutator.StatusLived {
 			continue
 		}
-		entry, err := baselineEntry(m, moduleRoot)
-		if err != nil {
-			return nil, err
-		}
-		b.Survivors = append(b.Survivors, entry)
+		b.Survivors = append(b.Survivors, entries[i])
 	}
 	sortBaselineEntries(b.Survivors)
 	return b, nil
@@ -300,8 +320,13 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string, s
 	baseMatch, currentMatch := unmatchedIndexes(len(b.Survivors), len(current))
 	matchExactIDs(b.Survivors, current, baseMatch, currentMatch)
 
-	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, locationOf)
-	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, structureOf)
+	// Position is evidence no edit can forge, so the location pass runs
+	// against every unmatched entry. The structure pass matches by base name
+	// alone, which is exactly what makes it able to hand a deleted
+	// declaration's accepted debt to a surviving namesake, so it skips the
+	// families that lost a member.
+	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, locationOf, nil)
+	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, structureOf, shrunkFamilies(b.Survivors, current))
 
 	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch, scope)
 	appendNewSurvivors(&c, current, mutants, currentMatch)
@@ -318,7 +343,18 @@ func baselineEntries(mutants []mutator.Mutant, moduleRoot string) ([]BaselineEnt
 		}
 		current[i] = entry
 	}
+	stampFamilySizes(current)
 	return current, nil
+}
+
+// stampFamilySizes records on every entry how many distinct declarations in
+// its file share its declaration name, so the count travels into the committed
+// baseline and can be compared with the next run's.
+func stampFamilySizes(entries []BaselineEntry) {
+	families := anchorFamilies(entries)
+	for i := range entries {
+		entries[i].FamilySize = families[familyOf(entries[i])]
+	}
 }
 
 func unmatchedIndexes(baseLen, currentLen int) ([]int, []int) {
@@ -338,7 +374,6 @@ func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []
 	for i, entry := range current {
 		byID[entry.ID] = i
 	}
-	families := anchorFamilies(current)
 	for i, entry := range baseline {
 		j, ok := byID[entry.ID]
 		if !ok || currentMatch[j] != -1 {
@@ -350,25 +385,68 @@ func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []
 		if structureOf(entry) != structureOf(current[j]) {
 			continue
 		}
-		// A repeated declaration such as init() is disambiguated by source
-		// order, so inserting one above the others hands an old stable ID to
-		// newly inserted code while the old mutant lives on under a shifted
-		// anchor. The descriptor check above cannot see that — both are the
-		// same kind of mutation in a same-named function — so inside such a
-		// family the ID is not evidence of identity at all. Fall through to
-		// the fallback passes: they still match a member that has not moved,
-		// by its exact position, and refuse the ambiguous bucket an insertion
-		// creates, which leaves the newcomer NEW.
-		if families[familyOf(entry)] > 1 {
+		if !stableFamily(entry, current[j]) {
 			continue
 		}
 		baseMatch[i], currentMatch[j] = j, i
 	}
 }
 
+// stableFamily reports whether a matched ID still names the declaration it
+// named when the baseline was written.
+//
+// A repeated declaration such as init() is disambiguated by source order, so
+// adding or removing one hands an old stable ID to a different function while
+// the old mutant lives on under a shifted anchor. The descriptor check cannot
+// see that — both are the same kind of mutation in a same-named function — so
+// across such a shift the ID is not evidence of identity at all. An unchanged
+// count is the evidence that no such shift happened: line moves, edits
+// elsewhere in the file, and new declarations under other names all leave it
+// alone, so the overwhelmingly common case of a pure line shift keeps matching
+// by ID instead of being resolved and re-reported as new debt.
+//
+// Entries written before family sizes were recorded have nothing to compare,
+// so they keep the older, blunter rule of distrusting every repeated family.
+// That is conservative for insertions and blind to deletions; rewriting the
+// baseline once with --baseline-update closes it.
+func stableFamily(entry, cur BaselineEntry) bool {
+	if entry.FamilySize == 0 {
+		return cur.FamilySize <= 1
+	}
+	return entry.FamilySize == cur.FamilySize
+}
+
+// shrunkFamilies names the declaration families that have fewer same-named
+// declarations in this run than they had when the baseline was written.
+// Something the baseline knew about is gone, and because every member of a
+// family renders under one base name, nothing in an entry says whether it
+// belongs to the declaration that was deleted or to one of its surviving
+// namesakes. Debt must not migrate across that gap: a survivor inheriting a
+// deleted namesake's accepted status is a regression reported as KNOWN.
+//
+// A family missing from current entirely is included too — its declarations
+// are gone, so the same reasoning applies, and no bucket can pair with it
+// anyway. Families that grew are not: every declaration the baseline described
+// still exists, so a unique descriptor still identifies which one it was.
+func shrunkFamilies(baseline, current []BaselineEntry) map[familyKey]struct{} {
+	sizes := make(map[familyKey]int, len(current))
+	for _, entry := range current {
+		sizes[familyOf(entry)] = entry.FamilySize
+	}
+	shrunk := make(map[familyKey]struct{})
+	for _, entry := range baseline {
+		key := familyOf(entry)
+		if entry.FamilySize > sizes[key] {
+			shrunk[key] = struct{}{}
+		}
+	}
+	return shrunk
+}
+
 // anchorFamilies counts the distinct anchors sharing each file and base
-// declaration name. A count above one means that file repeats a name, so its
-// anchors carry source-order suffixes that an insertion can shift.
+// declaration name — that is, how many declarations of that name the entries
+// describe. A count above one means the file repeats a name, so its anchors
+// carry source-order suffixes that adding or removing one shifts.
 func anchorFamilies(entries []BaselineEntry) map[familyKey]int {
 	anchors := make(map[familyKey]map[string]struct{})
 	for _, entry := range entries {
@@ -508,10 +586,19 @@ type structureKey struct {
 // shared by two candidates says nothing about which one the accepted debt
 // belongs to, so neither is matched and an unmatched current survivor stays
 // NEW.
-func fallbackMatch[K comparable](baseline, current []BaselineEntry, baseMatch, currentMatch []int, key func(BaselineEntry) K) {
+//
+// Baseline entries in a skipFamilies family are withheld from the pass. Only
+// the baseline side needs withholding: skipFamilies is used with the key that
+// includes the family's base anchor, so a current entry in a skipped family
+// only ever shares a bucket with baseline entries from that same family, and a
+// bucket with no baseline candidate pairs with nothing.
+func fallbackMatch[K comparable](baseline, current []BaselineEntry, baseMatch, currentMatch []int, key func(BaselineEntry) K, skipFamilies map[familyKey]struct{}) {
 	baseBuckets := make(map[K][]int)
 	currentBuckets := make(map[K][]int)
 	for i, entry := range baseline {
+		if _, skip := skipFamilies[familyOf(entry)]; skip {
+			continue
+		}
 		if baseMatch[i] < 0 {
 			k := key(entry)
 			baseBuckets[k] = append(baseBuckets[k], i)

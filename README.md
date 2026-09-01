@@ -359,8 +359,11 @@ verdict: a run that introduces no new debt writes the shrunk file even when
 `--threshold-mcover` then fails it. `KILLED`, `EQUIVALENT`, and
 `NOT VIABLE` entries are removed by a successful update; `NOT COVERED`,
 `TIMED OUT`, and `INFRA ERROR` entries are retained because those outcomes do
-not prove the old survivor was fixed. The file is schema-versioned, sorted, and
-replaced atomically, so it is suitable for version control.
+not prove the old survivor was fixed. An update is refused outright when the
+run discovered no mutants at all — a typo in `--only` or an over-broad
+`--exclude-files` would otherwise rewrite the committed file as empty. The file
+is schema-versioned, sorted, and replaced atomically, so it is suitable for
+version control.
 
 Stable IDs normally survive line shifts and edits to other functions. For the
 documented churn cases—such as a renamed function or an inserted `init()`—the
@@ -368,10 +371,16 @@ ratchet attempts a unique source-descriptor match and prints the old and new IDs
 as a warning. Both fallbacks stay anchored to the enclosing declaration, so a
 mutant that loses its position *and* its function is left unmatched: that is
 indistinguishable from deleting one function and adding another that happens to
-contain the same kind of mutation. For the same reason, an inserted `init()`
-that shifts the family's suffixes only lets an ID match a mutant that has not
-moved. The ratchet never guesses among ambiguous candidates; an unmatched
-current survivor remains `NEW` and fails safely.
+contain the same kind of mutation. Repeated declaration names — several
+`init()`s in one file — are disambiguated by source order, so each entry also
+records how many declarations shared its name. While that count is unchanged
+the IDs mean what they meant and are trusted as usual, a pure line shift
+included. Adding such a declaration reassigns the suffixes, so the ratchet
+falls back to matching by position or by a unique descriptor; removing one
+additionally stops debt migrating between the remaining namesakes, so a
+namesake that regresses is reported as `NEW` rather than inheriting the deleted
+declaration's accepted status. The ratchet never guesses among ambiguous
+candidates; an unmatched current survivor remains `NEW` and fails safely.
 
 The file records the settings that define the mutant universe — packages,
 `--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`

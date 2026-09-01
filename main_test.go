@@ -1394,6 +1394,27 @@ func TestRunBaselineUpdateWritesDespiteMcoverFailure(t *testing.T) {
 	f.survivors(t, 0, "the mcover failure skipped the update")
 }
 
+// TestRunBaselineUpdateRefusesAnEmptyDiscovery pins that a run which found no
+// mutants cannot empty the committed baseline. A typo in --only leaves no
+// mutator enabled at all, so nothing is discovered, nothing is tested, and
+// every accepted survivor would otherwise be classified as resolved and
+// dropped — a silent, exit-0 erasure of the project's accepted debt.
+func TestRunBaselineUpdateRefusesAnEmptyDiscovery(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// The later --only wins, so this run enables no mutators.
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("empty", "--baseline-update", "--only", "ARITHMETC_BASE", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "discovered no mutants") {
+		t.Fatalf("error=%v, want it to name the empty discovery", err)
+	}
+	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
+}
+
 // TestRunBaselineUnreadableFileIsNotBootstrapped pins that a corrupt baseline
 // fails with actionable advice rather than being silently rebuilt: rebuilding
 // would accept every current survivor as debt, which is what the ratchet

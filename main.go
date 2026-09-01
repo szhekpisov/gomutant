@@ -824,6 +824,18 @@ func run(ctx context.Context, args []string) error {
 	if cfg.RunMutantID != "" && len(mutants) == 0 {
 		return usageError(runMutantDroppedError(cfg.RunMutantID, cfg.ChangedSince, suppressed))
 	}
+	// A run that discovered nothing proves nothing, but every accepted
+	// survivor in a resolved package would still be classified as resolved:
+	// the update would replace the committed file with an empty baseline and
+	// exit 0, erasing the project's accepted debt. Empty discovery is a
+	// configuration problem — an --only that names no known mutator, a
+	// selection whose packages hold no mutable code, an --exclude-files that
+	// swallowed everything — so refuse the write while the file is still
+	// intact. The package-scope guard makes the same refusal along the
+	// package dimension; this is the discovery one.
+	if baselineUpdate && len(mutants) == 0 {
+		return usageErrorf("--baseline-update refused: this run discovered no mutants, so it cannot prove any survivor in %s was fixed", cfg.Baseline)
+	}
 
 	pendingCount := 0
 	notCoveredCount := 0
