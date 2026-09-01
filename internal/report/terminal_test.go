@@ -239,11 +239,22 @@ func TestSummaryBaseline(t *testing.T) {
 			KnownSurvivors:      4,
 			ResolvedSurvivors:   2,
 			NewSurvivors:        1,
-			UnresolvedSurvivors: 3,
+			UnresolvedSurvivors: 1,
 		},
 	})
-	if !strings.Contains(buf.String(), "Baseline:     4 known, 2 resolved, 1 new, 3 unresolved\n") {
+	if !strings.Contains(buf.String(), "Baseline:     4 known, 2 resolved, 1 new, 1 unresolved\n") {
 		t.Fatalf("baseline summary missing: %q", buf.String())
+	}
+}
+
+func TestSummaryBaselineOmitsZeroUnresolved(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Summary(&Report{
+		Baseline: &BaselineReport{KnownSurvivors: 2, ResolvedSurvivors: 1, NewSurvivors: 0},
+	})
+	if strings.Contains(buf.String(), "unresolved") ||
+		!strings.Contains(buf.String(), "Baseline:     2 known, 1 resolved, 0 new\n") {
+		t.Fatalf("baseline summary=%q", buf.String())
 	}
 }
 

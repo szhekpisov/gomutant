@@ -85,6 +85,21 @@ type BaselineComparison struct {
 	newIDs   map[string]struct{}
 }
 
+type baselineSink interface {
+	Write([]byte) (int, error)
+	Close() error
+	Name() string
+}
+
+var (
+	baselineMkdirAll = os.MkdirAll
+	newBaselineSink  = func(dir, pattern string) (baselineSink, error) {
+		return os.CreateTemp(dir, pattern)
+	}
+	baselineRemove = os.Remove
+	baselineRename = os.Rename
+)
+
 // Canonical returns a deterministic policy representation for comparison and
 // serialization. All slices are copied, sorted, and deduplicated.
 func (p BaselinePolicy) Canonical() BaselinePolicy {
@@ -215,25 +230,45 @@ func UpdatedBaseline(goModule, generatedBy string, policy BaselinePolicy, compar
 // debt. Exact IDs win; two unique descriptor fallbacks cover anchor churn and
 // line shifts without ever guessing among ambiguous candidates.
 func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) BaselineComparison {
+	current := baselineEntries(mutants, moduleRoot)
+	baseMatch, currentMatch := unmatchedIndexes(len(b.Survivors), len(current))
+	matchExactIDs(b.Survivors, current, baseMatch, currentMatch)
+
+	fallbackMatchLocation(b.Survivors, current, baseMatch, currentMatch)
+	fallbackMatchStructure(b.Survivors, current, baseMatch, currentMatch)
+
+	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch)
+	appendNewSurvivors(&c, current, mutants, currentMatch)
+	sortBaselineComparison(&c)
+	return c
+}
+
+func baselineEntries(mutants []mutator.Mutant, moduleRoot string) []BaselineEntry {
 	current := make([]BaselineEntry, len(mutants))
 	for i, m := range mutants {
 		current[i] = baselineEntry(m, moduleRoot)
 	}
+	return current
+}
 
-	baseMatch := make([]int, len(b.Survivors))
-	currentMatch := make([]int, len(current))
+func unmatchedIndexes(baseLen, currentLen int) ([]int, []int) {
+	baseMatch := make([]int, baseLen)
+	currentMatch := make([]int, currentLen)
 	for i := range baseMatch {
 		baseMatch[i] = -1
 	}
 	for i := range currentMatch {
 		currentMatch[i] = -1
 	}
+	return baseMatch, currentMatch
+}
 
+func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []int) {
 	byID := make(map[string]int, len(current))
 	for i, entry := range current {
 		byID[entry.ID] = i
 	}
-	for i, entry := range b.Survivors {
+	for i, entry := range baseline {
 		// A repeated declaration such as init() can hand an old stable ID to
 		// newly inserted code. Trust the ID only while its structural mutation
 		// descriptor still agrees; otherwise leave both sides for the unique
@@ -243,15 +278,14 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) B
 			baseMatch[i], currentMatch[j] = j, i
 		}
 	}
+}
 
-	fallbackMatchLocation(b.Survivors, current, baseMatch, currentMatch)
-	fallbackMatchStructure(b.Survivors, current, baseMatch, currentMatch)
-
+func classifyBaselineMatches(baseline, current []BaselineEntry, mutants []mutator.Mutant, baseMatch []int) BaselineComparison {
 	c := BaselineComparison{
 		knownIDs: make(map[string]struct{}),
 		newIDs:   make(map[string]struct{}),
 	}
-	for i, entry := range b.Survivors {
+	for i, entry := range baseline {
 		j := baseMatch[i]
 		if j < 0 {
 			c.Resolved = append(c.Resolved, entry)
@@ -279,7 +313,10 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) B
 			c.Retained = append(c.Retained, cur)
 		}
 	}
+	return c
+}
 
+func appendNewSurvivors(c *BaselineComparison, current []BaselineEntry, mutants []mutator.Mutant, currentMatch []int) {
 	for i, m := range mutants {
 		if m.Status != mutator.StatusLived || currentMatch[i] >= 0 {
 			continue
@@ -288,14 +325,16 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) B
 		c.New = append(c.New, entry)
 		c.newIDs[entry.ID] = struct{}{}
 	}
+}
 
+func sortBaselineComparison(c *BaselineComparison) {
 	sortBaselineEntries(c.Known)
 	sortBaselineEntries(c.New)
 	sortBaselineEntries(c.Resolved)
 	sortBaselineEntries(c.Unresolved)
 	sortBaselineEntries(c.Retained)
+	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="baseline survivor IDs are unique by validation, so < and <= differ only for an unreachable equal-ID comparison"
 	sort.Slice(c.Fallbacks, func(i, j int) bool { return c.Fallbacks[i].OldID < c.Fallbacks[j].OldID })
-	return c
 }
 
 // ApplyBaselineComparison adds machine-readable baseline classifications to
@@ -336,10 +375,10 @@ func WriteBaseline(path string, b *Baseline) error {
 		return err
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := baselineMkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".gomutants-baseline-*.tmp")
+	tmp, err := newBaselineSink(dir, ".gomutants-baseline-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -347,7 +386,7 @@ func WriteBaseline(path string, b *Baseline) error {
 	committed := false
 	defer func() {
 		if !committed {
-			_ = os.Remove(tmpName)
+			_ = baselineRemove(tmpName)
 		}
 	}()
 
@@ -361,10 +400,9 @@ func WriteBaseline(path string, b *Baseline) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
+	// CreateTemp uses owner-only permissions. Keeping that secure default also
+	// avoids a window where a partially written baseline is broadly readable.
+	if err := baselineRename(tmpName, path); err != nil {
 		return err
 	}
 	committed = true
@@ -455,5 +493,6 @@ func canonicalStrings(values []string) []string {
 }
 
 func sortBaselineEntries(entries []BaselineEntry) {
+	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="baseline survivor IDs are unique by validation, so < and <= differ only for an unreachable equal-ID comparison"
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
 }
