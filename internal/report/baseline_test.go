@@ -186,82 +186,79 @@ func TestCompareBaselineNeedsLocationFallbackWhenStructureIsAmbiguous(t *testing
 	}
 }
 
-func TestFallbackMatchersRequireUniquenessOnBothSides(t *testing.T) {
-	entry := func(id, file, original string, line int) BaselineEntry {
-		return BaselineEntry{ID: id, File: file, Line: line, Column: 3, Type: "T", Original: original, Replacement: "r"}
+func baselineTestEntry(id, file, original string, line int) BaselineEntry {
+	return BaselineEntry{ID: id, File: file, Line: line, Column: 3, Type: "T", Original: original, Replacement: "r"}
+}
+
+func TestFallbackMatchLocationMatchesDistinctKeys(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)}
+	current := []BaselineEntry{baselineTestEntry("new-b", "p.go", "+", 20), baselineTestEntry("new-a", "p.go", "+", 10)}
+	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
+	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
+		t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
 	}
+}
 
-	t.Run("location matches multiple distinct keys", func(t *testing.T) {
-		baseline := []BaselineEntry{entry("old-a", "p.go", "+", 10), entry("old-b", "p.go", "+", 20)}
-		current := []BaselineEntry{entry("new-b", "p.go", "+", 20), entry("new-a", "p.go", "+", 10)}
-		baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-		fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-		if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
-			t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
-		}
-	})
+func TestFallbackMatchLocationRejectsDuplicateBaseline(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 10)}
+	current := []BaselineEntry{baselineTestEntry("new", "p.go", "+", 10)}
+	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
+	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{-1, -1}) || !slices.Equal(currentMatch, []int{-1}) {
+		t.Fatalf("ambiguous baseline matched: %v %v", baseMatch, currentMatch)
+	}
+}
 
-	t.Run("location rejects duplicate baseline", func(t *testing.T) {
-		baseline := []BaselineEntry{entry("old-a", "p.go", "+", 10), entry("old-b", "p.go", "+", 10)}
-		current := []BaselineEntry{entry("new", "p.go", "+", 10)}
-		baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-		fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-		if !slices.Equal(baseMatch, []int{-1, -1}) || !slices.Equal(currentMatch, []int{-1}) {
-			t.Fatalf("ambiguous baseline matched: %v %v", baseMatch, currentMatch)
-		}
-	})
+func TestFallbackMatchLocationRejectsDuplicateCurrent(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("old", "p.go", "+", 10)}
+	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 10), baselineTestEntry("new-b", "p.go", "+", 10)}
+	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
+	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{-1}) || !slices.Equal(currentMatch, []int{-1, -1}) {
+		t.Fatalf("ambiguous current matched: %v %v", baseMatch, currentMatch)
+	}
+}
 
-	t.Run("location rejects duplicate current", func(t *testing.T) {
-		baseline := []BaselineEntry{entry("old", "p.go", "+", 10)}
-		current := []BaselineEntry{entry("new-a", "p.go", "+", 10), entry("new-b", "p.go", "+", 10)}
-		baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-		fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-		if !slices.Equal(baseMatch, []int{-1}) || !slices.Equal(currentMatch, []int{-1, -1}) {
-			t.Fatalf("ambiguous current matched: %v %v", baseMatch, currentMatch)
-		}
-	})
+func TestFallbackMatchLocationSkipsPreMatchedIndexZero(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)}
+	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 20), baselineTestEntry("new-b", "p.go", "+", 10)}
+	baseMatch, currentMatch := []int{0, -1}, []int{0, -1}
+	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{0, -1}) || !slices.Equal(currentMatch, []int{0, -1}) {
+		t.Fatalf("pre-matched entries were reconsidered: %v %v", baseMatch, currentMatch)
+	}
+}
 
-	t.Run("location skips pre-matched index zero", func(t *testing.T) {
-		baseline := []BaselineEntry{entry("old-a", "p.go", "+", 10), entry("old-b", "p.go", "+", 20)}
-		current := []BaselineEntry{entry("new-a", "p.go", "+", 20), entry("new-b", "p.go", "+", 10)}
-		baseMatch, currentMatch := []int{0, -1}, []int{0, -1}
-		fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-		if !slices.Equal(baseMatch, []int{0, -1}) || !slices.Equal(currentMatch, []int{0, -1}) {
-			t.Fatalf("pre-matched entries were reconsidered: %v %v", baseMatch, currentMatch)
-		}
-	})
+func TestFallbackMatchStructureMatchesDistinctKeys(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("old-a", "a.go", "+", 10), baselineTestEntry("old-b", "b.go", "*", 20)}
+	current := []BaselineEntry{baselineTestEntry("new-b", "b.go", "*", 40), baselineTestEntry("new-a", "a.go", "+", 30)}
+	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
+	fallbackMatchStructure(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
+		t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
+	}
+}
 
-	t.Run("structure matches multiple distinct keys", func(t *testing.T) {
-		baseline := []BaselineEntry{entry("old-a", "a.go", "+", 10), entry("old-b", "b.go", "*", 20)}
-		current := []BaselineEntry{entry("new-b", "b.go", "*", 40), entry("new-a", "a.go", "+", 30)}
-		baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-		fallbackMatchStructure(baseline, current, baseMatch, currentMatch)
-		if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
-			t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
-		}
-	})
+func TestFallbackMatchStructureRejectsDuplicateBaseline(t *testing.T) {
+	one := baselineTestEntry("one", "p.go", "+", 10)
+	two := baselineTestEntry("two", "p.go", "+", 20)
+	current := []BaselineEntry{baselineTestEntry("new", "p.go", "+", 30)}
+	baseMatch, currentMatch := unmatchedIndexes(2, 1)
+	fallbackMatchStructure([]BaselineEntry{one, two}, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{-1, -1}) || !slices.Equal(currentMatch, []int{-1}) {
+		t.Fatalf("ambiguous baseline matched: %v %v", baseMatch, currentMatch)
+	}
+}
 
-	t.Run("structure rejects ambiguity on either side", func(t *testing.T) {
-		one := entry("one", "p.go", "+", 10)
-		two := entry("two", "p.go", "+", 20)
-		for _, tc := range []struct {
-			name              string
-			baseline, current []BaselineEntry
-		}{
-			{name: "baseline", baseline: []BaselineEntry{one, two}, current: []BaselineEntry{entry("new", "p.go", "+", 30)}},
-			{name: "current", baseline: []BaselineEntry{one}, current: []BaselineEntry{entry("new-a", "p.go", "+", 30), entry("new-b", "p.go", "+", 40)}},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				baseMatch, currentMatch := unmatchedIndexes(len(tc.baseline), len(tc.current))
-				fallbackMatchStructure(tc.baseline, tc.current, baseMatch, currentMatch)
-				for _, match := range append(baseMatch, currentMatch...) {
-					if match != -1 {
-						t.Fatalf("ambiguous structure matched: %v %v", baseMatch, currentMatch)
-					}
-				}
-			})
-		}
-	})
+func TestFallbackMatchStructureRejectsDuplicateCurrent(t *testing.T) {
+	baseline := []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10)}
+	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 30), baselineTestEntry("new-b", "p.go", "+", 40)}
+	baseMatch, currentMatch := unmatchedIndexes(1, 2)
+	fallbackMatchStructure(baseline, current, baseMatch, currentMatch)
+	if !slices.Equal(baseMatch, []int{-1}) || !slices.Equal(currentMatch, []int{-1, -1}) {
+		t.Fatalf("ambiguous current matched: %v %v", baseMatch, currentMatch)
+	}
 }
 
 func TestCompareBaselineReassignedExactIDDoesNotStealOldMutation(t *testing.T) {
@@ -527,97 +524,95 @@ func validBaselineForWrite() *Baseline {
 	}
 }
 
-func TestWriteBaselineErrorPathsAndAtomicCleanup(t *testing.T) {
-	t.Run("empty path", func(t *testing.T) {
-		if err := WriteBaseline("", validBaselineForWrite()); err == nil || !strings.Contains(err.Error(), "path is empty") {
-			t.Fatalf("error=%v", err)
-		}
-	})
+func TestWriteBaselineRejectsEmptyPath(t *testing.T) {
+	if err := WriteBaseline("", validBaselineForWrite()); err == nil || !strings.Contains(err.Error(), "path is empty") {
+		t.Fatalf("error=%v", err)
+	}
+}
 
-	t.Run("invalid snapshot", func(t *testing.T) {
-		b := validBaselineForWrite()
-		b.SchemaVersion = 0
-		if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), b); err == nil || !strings.Contains(err.Error(), "schema_version") {
-			t.Fatalf("error=%v", err)
-		}
-	})
+func TestWriteBaselineRejectsInvalidSnapshot(t *testing.T) {
+	b := validBaselineForWrite()
+	b.SchemaVersion = 0
+	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), b); err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("error=%v", err)
+	}
+}
 
-	t.Run("mkdir", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		var mode os.FileMode
-		baselineMkdirAll = func(_ string, got os.FileMode) error {
-			mode = got
-			return errBaselineIO
-		}
-		err := WriteBaseline(filepath.Join(t.TempDir(), "nested", "baseline.json"), validBaselineForWrite())
-		if !errors.Is(err, errBaselineIO) || mode != 0o755 {
-			t.Fatalf("error=%v mode=%#o", err, mode)
-		}
-	})
+func TestWriteBaselinePropagatesMkdirError(t *testing.T) {
+	resetBaselineIOHooks(t)
+	var mode os.FileMode
+	baselineMkdirAll = func(_ string, got os.FileMode) error {
+		mode = got
+		return errBaselineIO
+	}
+	err := WriteBaseline(filepath.Join(t.TempDir(), "nested", "baseline.json"), validBaselineForWrite())
+	if !errors.Is(err, errBaselineIO) || mode != 0o755 {
+		t.Fatalf("error=%v mode=%#o", err, mode)
+	}
+}
 
-	t.Run("create temp", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		newBaselineSink = func(string, string) (baselineSink, error) { return nil, errBaselineIO }
-		if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-			t.Fatalf("error=%v", err)
-		}
-	})
+func TestWriteBaselinePropagatesCreateTempError(t *testing.T) {
+	resetBaselineIOHooks(t)
+	newBaselineSink = func(string, string) (baselineSink, error) { return nil, errBaselineIO }
+	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
+		t.Fatalf("error=%v", err)
+	}
+}
 
-	t.Run("encode", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), writeErr: errBaselineIO}
-		newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
-		var removes int
-		baselineRemove = func(string) error { removes++; return nil }
-		if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-			t.Fatalf("error=%v", err)
-		}
-		if !sink.closed || removes != 1 {
-			t.Fatalf("closed=%v removes=%d", sink.closed, removes)
-		}
-	})
+func TestWriteBaselinePropagatesEncodeErrorAndCleansUp(t *testing.T) {
+	resetBaselineIOHooks(t)
+	sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), writeErr: errBaselineIO}
+	newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
+	var removes int
+	baselineRemove = func(string) error { removes++; return nil }
+	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
+		t.Fatalf("error=%v", err)
+	}
+	if !sink.closed || removes != 1 {
+		t.Fatalf("closed=%v removes=%d", sink.closed, removes)
+	}
+}
 
-	t.Run("close", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), closeErr: errBaselineIO}
-		newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
-		if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-			t.Fatalf("error=%v", err)
-		}
-	})
+func TestWriteBaselinePropagatesCloseError(t *testing.T) {
+	resetBaselineIOHooks(t)
+	sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), closeErr: errBaselineIO}
+	newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
+	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
+		t.Fatalf("error=%v", err)
+	}
+}
 
-	t.Run("rename", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		baselineRename = func(string, string) error { return errBaselineIO }
-		var removes int
-		baselineRemove = func(name string) error { removes++; return os.Remove(name) }
-		if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-			t.Fatalf("error=%v", err)
-		}
-		if removes != 1 {
-			t.Fatalf("remove calls=%d, want 1", removes)
-		}
-	})
+func TestWriteBaselinePropagatesRenameErrorAndCleansUp(t *testing.T) {
+	resetBaselineIOHooks(t)
+	baselineRename = func(string, string) error { return errBaselineIO }
+	var removes int
+	baselineRemove = func(name string) error { removes++; return os.Remove(name) }
+	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
+		t.Fatalf("error=%v", err)
+	}
+	if removes != 1 {
+		t.Fatalf("remove calls=%d, want 1", removes)
+	}
+}
 
-	t.Run("success does not run failure cleanup", func(t *testing.T) {
-		resetBaselineIOHooks(t)
-		var removes int
-		baselineRemove = func(name string) error { removes++; return os.Remove(name) }
-		path := filepath.Join(t.TempDir(), "baseline.json")
-		if err := WriteBaseline(path, validBaselineForWrite()); err != nil {
-			t.Fatal(err)
-		}
-		if removes != 0 {
-			t.Fatalf("remove calls=%d, want 0", removes)
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.Mode().Perm() != 0o600 {
-			t.Fatalf("baseline permissions=%#o, want owner-only", info.Mode().Perm())
-		}
-	})
+func TestWriteBaselineSuccessDoesNotRunFailureCleanup(t *testing.T) {
+	resetBaselineIOHooks(t)
+	var removes int
+	baselineRemove = func(name string) error { removes++; return os.Remove(name) }
+	path := filepath.Join(t.TempDir(), "baseline.json")
+	if err := WriteBaseline(path, validBaselineForWrite()); err != nil {
+		t.Fatal(err)
+	}
+	if removes != 0 {
+		t.Fatalf("remove calls=%d, want 0", removes)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("baseline permissions=%#o, want owner-only", info.Mode().Perm())
+	}
 }
 
 func TestBaselineEntryUsesModuleRelativeSlashPath(t *testing.T) {
