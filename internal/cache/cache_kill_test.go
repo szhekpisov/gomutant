@@ -508,216 +508,28 @@ func TestUpdate_SortPrecedence(t *testing.T) {
 	}
 }
 
-// --- Save error paths (cache.go:232, 239, 251, 255, 258, 261) ---------------
-
-// withFailingOp swaps one of the os* hooks to a stub returning errSentinel.
-// Restores at test cleanup.
-func withFailingOp(t *testing.T, swap func(restore func())) {
-	t.Helper()
-	swap(func() {})
-}
+// --- Save error paths -------------------------------------------------------
+//
+// Save's atomic-write flow now lives in internal/atomicfile, which owns the
+// injectable syscall hooks and the per-error-path tests that go with them.
+// What remains here is the one decision Save still makes for itself: an empty
+// path is a no-op, because --cache=off leaves nothing to write.
 
 var errSentinel = errors.New("sentinel I/O failure")
 
-func TestSave_PropagatesMkdirAllError(t *testing.T) {
-	orig := osMkdirAll
-	t.Cleanup(func() { osMkdirAll = orig })
-	osMkdirAll = func(string, os.FileMode) error { return errSentinel }
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(t.TempDir(), "cache.json"))
-	if !errors.Is(err, errSentinel) {
-		t.Fatalf("err=%v, want sentinel", err)
-	}
-}
-
-func TestSave_PropagatesCreateTempError(t *testing.T) {
-	orig := newSaveSink
-	t.Cleanup(func() { newSaveSink = orig })
-	newSaveSink = func(string, string) (saveSink, error) { return nil, errSentinel }
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(t.TempDir(), "cache.json"))
-	if !errors.Is(err, errSentinel) {
-		t.Fatalf("err=%v, want sentinel", err)
-	}
-}
-
-// fakeSink is a saveSink whose Write and Close errors can be set
-// independently — what lets the Encode-only and Close-only tests below
-// distinguish those return paths in Save (otherwise indistinguishable
-// when both errors collapse into a single "non-nil error" assertion).
-type fakeSink struct {
-	name     string
-	writeErr error
-	closeErr error
-	closed   bool
-}
-
-func (f *fakeSink) Write(p []byte) (int, error) {
-	if f.writeErr != nil {
-		return 0, f.writeErr
-	}
-	return len(p), nil
-}
-func (f *fakeSink) Close() error { f.closed = true; return f.closeErr }
-func (f *fakeSink) Name() string { return f.name }
-
-// TestSave_PropagatesEncodeError asserts that an Encode failure is
-// returned even when Close subsequently succeeds — kills the
-// `if encodeErr != nil { return encodeErr }` BRANCH_IF mutant by
-// requiring the SPECIFIC encode-error sentinel back, not just
-// "any non-nil error" (which the Close-error branch would also
-// produce on a real *os.File).
-func TestSave_PropagatesEncodeError(t *testing.T) {
+func TestSave_EmptyPathWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	orig := newSaveSink
-	t.Cleanup(func() { newSaveSink = orig })
-
-	encErr := errors.New("encode-only sentinel")
-	newSaveSink = func(string, string) (saveSink, error) {
-		return &fakeSink{
-			name:     filepath.Join(dir, ".gomutants-cache-fake.tmp"),
-			writeErr: encErr,
-			closeErr: nil,
-		}, nil
+	if err := Save(&Cache{SchemaVersion: SchemaVersion}, ""); err != nil {
+		t.Fatalf("empty path must be a no-op, got %v", err)
 	}
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(dir, "cache.json"))
-	if !errors.Is(err, encErr) {
-		t.Fatalf("err=%v, want encode-only sentinel", err)
-	}
-}
-
-// TestSave_PropagatesCloseError asserts that a Close failure is
-// returned when Encode succeeded — kills the
-// `if closeErr != nil { return closeErr }` BRANCH_IF mutant.
-func TestSave_PropagatesCloseError(t *testing.T) {
-	dir := t.TempDir()
-	orig := newSaveSink
-	t.Cleanup(func() { newSaveSink = orig })
-
-	closeErr := errors.New("close-only sentinel")
-	newSaveSink = func(string, string) (saveSink, error) {
-		return &fakeSink{
-			name:     filepath.Join(dir, ".gomutants-cache-fake.tmp"),
-			writeErr: nil,
-			closeErr: closeErr,
-		}, nil
-	}
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(dir, "cache.json"))
-	if !errors.Is(err, closeErr) {
-		t.Fatalf("err=%v, want close-only sentinel", err)
-	}
-}
-
-// TestSave_AlwaysClosesEvenOnEncodeFailure asserts the file
-// descriptor is released regardless of Encode outcome — i.e. Close is
-// invoked on every code path, not gated on Encode success.
-func TestSave_AlwaysClosesEvenOnEncodeFailure(t *testing.T) {
-	dir := t.TempDir()
-	orig := newSaveSink
-	t.Cleanup(func() { newSaveSink = orig })
-
-	sink := &fakeSink{
-		name:     filepath.Join(dir, ".gomutants-cache-fake.tmp"),
-		writeErr: errSentinel,
-	}
-	newSaveSink = func(string, string) (saveSink, error) { return sink, nil }
-
-	_ = Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(dir, "cache.json"))
-	if !sink.closed {
-		t.Fatal("Save did not Close the sink on encode failure")
-	}
-}
-
-func TestSave_PropagatesChmodError(t *testing.T) {
-	orig := osChmod
-	t.Cleanup(func() { osChmod = orig })
-	osChmod = func(string, os.FileMode) error { return errSentinel }
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(t.TempDir(), "cache.json"))
-	if !errors.Is(err, errSentinel) {
-		t.Fatalf("err=%v, want sentinel", err)
-	}
-}
-
-func TestSave_PropagatesRenameError(t *testing.T) {
-	dir := t.TempDir()
-	orig := osRename
-	t.Cleanup(func() { osRename = orig })
-	osRename = func(string, string) error { return errSentinel }
-
-	err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(dir, "cache.json"))
-	if !errors.Is(err, errSentinel) {
-		t.Fatalf("err=%v, want sentinel", err)
-	}
-
-	// Rename failed → tmp should still exist (deferred Remove cleans
-	// up only on the error path; verify cleanup happened).
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		if e.Name() != "cache.json" {
-			// Any remaining .tmp file means cleanup leaked.
-			t.Errorf("temp file leaked after rename failure: %s", e.Name())
-		}
+	if len(entries) != 0 {
+		t.Fatalf("empty path wrote %v", entries)
 	}
 }
-
-// TestSave_TmpFileCleanedUpAfterEncodeFailure asserts that a failed
-// Encode triggers the deferred temp-file cleanup. The fakeSink's
-// writeErr forces Encode to fail; the spy on osRemove confirms the
-// deferred cleanup ran exactly once.
-func TestSave_TmpFileCleanedUpAfterEncodeFailure(t *testing.T) {
-	dir := t.TempDir()
-	tmpPath := filepath.Join(dir, ".gomutants-cache-fake.tmp")
-
-	origSink := newSaveSink
-	t.Cleanup(func() { newSaveSink = origSink })
-	newSaveSink = func(string, string) (saveSink, error) {
-		return &fakeSink{name: tmpPath, writeErr: errSentinel}, nil
-	}
-
-	origRemove := osRemove
-	t.Cleanup(func() { osRemove = origRemove })
-	var removeCalls int
-	osRemove = func(name string) error {
-		removeCalls++
-		return os.Remove(name)
-	}
-
-	if err := Save(&Cache{SchemaVersion: SchemaVersion}, filepath.Join(dir, "cache.json")); err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if removeCalls != 1 {
-		t.Errorf("osRemove calls=%d, want 1 (deferred cleanup must fire on encode failure)", removeCalls)
-	}
-}
-
-// TestSave_TmpClearedAfterRenameSuccess asserts the post-rename
-// tmpName="" assignment (cache.go:264). With the assignment removed,
-// the deferred Remove still fires and would attempt to delete the
-// just-renamed file (which is now at `path`, not tmpName) — but
-// tmpName still holds the *original* temp name, which no longer
-// exists, so Remove returns ENOENT (silently swallowed). Detection:
-// inject a custom os.Rename that *moves* tmp to path, then assert that
-// after Save returns, calling osRename again on the same tmpName fails
-// with ENOENT — i.e. nothing else tried to remove it.
-//
-// Simpler observable: count how many times the deferred Remove fires
-// by overriding tmpName's would-be removal path. Easiest: track the
-// invariant via a stub on os.Remove via the global, but cache.go uses
-// os.Remove directly. Pragmatic approach: assert the file exists at
-// path AND no .tmp remains in dir (which TestSave_LeavesNoTempFiles
-// already covers). The mutation `tmpName = ""` → `_ = ""` would still
-// produce the same end state (target file at path), since the deferred
-// Remove on the now-missing tmpName silently no-ops. Equivalent
-// mutant; not separately killable without a refactor.
-//
-// To kill it, we'd need to observe the deferred Remove. Refactor: make
-// the cleanup a named function we can spy on. Skipped — equivalent.
 
 // --- testindex.go mutants ----------------------------------------------------
 
@@ -863,50 +675,6 @@ func TestUpdate_ContinuesPastRunMutantWithMissingFile(t *testing.T) {
 	if len(c.Entries) != 1 || c.Entries[0].RelFile != "good.go" {
 		t.Errorf("entries=%v, want 1 entry for good.go (loop must continue past missing-file mutant)", c.Entries)
 	}
-}
-
-// --- Save osRemove cleanup count (cache.go:278) ------------------------------
-
-// TestSave_RemovesTmpOnlyOnFailurePath asserts the `committed` flag
-// at the end of Save: the deferred Remove must fire on the failure
-// path (rename fails) and must NOT fire on the success path. With
-// `committed = true` removed (or replaced with `_ = true`), defer
-// would call osRemove(tmpName) after the successful rename, and our
-// stub increments the call count.
-func TestSave_RemovesTmpOnlyOnFailurePath(t *testing.T) {
-	orig := osRemove
-	t.Cleanup(func() { osRemove = orig })
-	var calls int
-	osRemove = func(name string) error {
-		calls++
-		return os.Remove(name)
-	}
-
-	t.Run("success path: no Remove", func(t *testing.T) {
-		calls = 0
-		path := filepath.Join(t.TempDir(), "cache.json")
-		if err := Save(&Cache{SchemaVersion: SchemaVersion}, path); err != nil {
-			t.Fatalf("save: %v", err)
-		}
-		if calls != 0 {
-			t.Errorf("osRemove called %d times on success path, want 0 — committed flag broken", calls)
-		}
-	})
-
-	t.Run("failure path: one Remove", func(t *testing.T) {
-		calls = 0
-		origRename := osRename
-		t.Cleanup(func() { osRename = origRename })
-		osRename = func(string, string) error { return errSentinel }
-
-		path := filepath.Join(t.TempDir(), "cache.json")
-		if err := Save(&Cache{SchemaVersion: SchemaVersion}, path); !errors.Is(err, errSentinel) {
-			t.Fatalf("expected sentinel, got %v", err)
-		}
-		if calls != 1 {
-			t.Errorf("osRemove called %d times on failure path, want 1 — cleanup did not fire", calls)
-		}
-	})
 }
 
 // --- testindex.go INVERT_LOOP_CTRL + INVERT_LOGICAL --------------------------
@@ -1242,7 +1010,6 @@ func TestUpdate_PkgHashMismatchContinuesCarryOver(t *testing.T) {
 }
 
 // Compile-time sanity for unused helpers.
-var _ = withFailingOp
 var _ = fmt.Sprintf
 
 // --- pkg_hash: //go:embed inputs ---------------------------------------------

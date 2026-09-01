@@ -1177,115 +1177,242 @@ func TestRunBaselineRejectsIncompatibleModes(t *testing.T) {
 	}
 }
 
-func TestRunBaselineBootstrapKnownAndNewSurvivor(t *testing.T) {
+// mustWriteFile writes a file, failing the test on error.
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// baselineFixture is the shared setup for the ratchet's end-to-end tests: a
+// throwaway module, the run's working directory pointed at it, and the flags
+// every case needs. Each test then writes its own sources and drives run().
+type baselineFixture struct {
+	dir      string
+	path     string
+	baseArgs []string
+}
+
+// newBaselineFixture writes files into a temp module, chdirs into it for the
+// duration of the test, and returns the fixture. files is keyed by
+// module-relative slash path; any parent directories are created.
+func newBaselineFixture(t *testing.T, files map[string]string) *baselineFixture {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
 	}
 	dir := t.TempDir()
-	files := map[string]string{
-		"go.mod":      "module testmod\n\ngo 1.26\n",
-		"add.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
-		"add_test.go": "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
-	}
 	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	orig, _ := os.Getwd()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
-	defer os.Chdir(orig)
+	t.Cleanup(func() { _ = os.Chdir(orig) })
 
 	baselinePath := filepath.Join(dir, ".gomutants-baseline.json")
-	firstReport := filepath.Join(dir, "first.json")
-	baseArgs := []string{
-		"--baseline", baselinePath,
-		"--cache=off",
-		"--only", "ARITHMETIC_BASE",
-		"-w", "1",
+	return &baselineFixture{
+		dir:  dir,
+		path: baselinePath,
+		baseArgs: []string{
+			"--baseline", baselinePath,
+			"--cache=off",
+			"--only", "ARITHMETIC_BASE",
+			"-w", "1",
+		},
 	}
-	bootstrapArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", firstReport, "testmod")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), bootstrapArgs) }); err != nil {
-		t.Fatalf("bootstrap baseline: %v", err)
+}
+
+// args builds a command line: the fixture's shared flags, a report path named
+// after reportName, then extra — any per-case flags followed by the packages,
+// which must stay last.
+func (f *baselineFixture) args(reportName string, extra ...string) []string {
+	args := append(slices.Clone(f.baseArgs), "-o", filepath.Join(f.dir, reportName+".json"))
+	return append(args, extra...)
+}
+
+// mustRun drives run() and fails the test if it does not succeed.
+func (f *baselineFixture) mustRun(t *testing.T, what string, args []string) {
+	t.Helper()
+	if _, err := captureOutput(t, func() error { return run(context.Background(), args) }); err != nil {
+		t.Fatalf("%s: %v", what, err)
 	}
-	b, err := report.ReadBaseline(baselinePath)
+}
+
+// survivors reads the committed baseline back and asserts its size.
+func (f *baselineFixture) survivors(t *testing.T, want int, what string) []report.BaselineEntry {
+	t.Helper()
+	b, err := report.ReadBaseline(f.path)
 	if err != nil {
 		t.Fatalf("ReadBaseline: %v", err)
 	}
-	if len(b.Survivors) != 1 {
-		t.Fatalf("bootstrapped survivors=%d, want 1", len(b.Survivors))
+	if len(b.Survivors) != want {
+		t.Fatalf("%s: survivors=%d, want %d", what, len(b.Survivors), want)
 	}
-	knownReport := filepath.Join(dir, "known.json")
-	knownArgs := append(slices.Clone(baseArgs), "-o", knownReport, "testmod")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), knownArgs) }); err != nil {
-		t.Fatalf("known survivor should pass the ratchet: %v", err)
-	}
-	knownData, err := os.ReadFile(knownReport)
+	return b.Survivors
+}
+
+// readReport parses one of the JSON reports the fixture's args() named.
+func (f *baselineFixture) readReport(t *testing.T, reportName string) report.Report {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(f.dir, reportName+".json"))
 	if err != nil {
-		t.Fatal(err)
-	}
-	var knownResult report.Report
-	if err := json.Unmarshal(knownData, &knownResult); err != nil {
-		t.Fatal(err)
-	}
-	if knownResult.Baseline == nil || knownResult.Baseline.KnownSurvivors != 1 || knownResult.Baseline.NewSurvivors != 0 {
-		t.Fatalf("known-run baseline report=%+v", knownResult.Baseline)
-	}
-	mismatchArgs := append(slices.Clone(baseArgs), "--test-flags=-short", "testmod")
-	_, err = captureStderr(t, func() error { return run(context.Background(), mismatchArgs) })
-	requireExitCode(t, err, exitCodeUsageError)
-	if !strings.Contains(err.Error(), "baseline policy differs in test-flags") {
-		t.Fatalf("policy mismatch error=%v", err)
-	}
-
-	// Adding a second same-type mutation point leaves the accepted survivor
-	// known and introduces one ID that the ratchet must reject.
-	if err := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int { return a + b + 1 }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	secondReport := filepath.Join(dir, "second.json")
-	secondArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", secondReport, "testmod")
-	_, err = captureOutput(t, func() error { return run(context.Background(), secondArgs) })
-	requireExitCode(t, err, exitCodeEfficacy)
-	if !strings.Contains(err.Error(), "new surviving mutant") {
-		t.Fatalf("gate error=%v, want new-survivor diagnostic", err)
-	}
-
-	data, readErr := os.ReadFile(secondReport)
-	if readErr != nil {
-		t.Fatalf("report must be written before gate failure: %v", readErr)
+		t.Fatalf("report must be written: %v", err)
 	}
 	var got report.Report
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("parse report: %v", err)
 	}
-	if got.Baseline == nil || got.Baseline.KnownSurvivors != 1 || got.Baseline.NewSurvivors != 1 {
-		t.Fatalf("baseline report=%+v, want one known and one new", got.Baseline)
+	return got
+}
+
+// simpleModule is a one-package module whose single ARITHMETIC_BASE mutant
+// survives: the test calls Add but never checks its result.
+func simpleModule() map[string]string {
+	return map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"add.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go": "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
 	}
-	after, err := report.ReadBaseline(baselinePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(after.Survivors) != 1 {
-		t.Fatalf("failed gate rewrote baseline to %d survivors; want original 1", len(after.Survivors))
+}
+
+func TestRunBaselineBootstrapKnownAndNewSurvivor(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	f.mustRun(t, "known survivor should pass the ratchet", f.args("known", "testmod"))
+	if got := f.readReport(t, "known").Baseline; got == nil || got.KnownSurvivors != 1 || got.NewSurvivors != 0 {
+		t.Fatalf("known-run baseline report=%+v", got)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "add_test.go"), []byte("package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 4 { t.Fatal(\"wrong\") } }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("mismatch", "--test-flags=-short", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "baseline policy differs in test-flags") {
+		t.Fatalf("policy mismatch error=%v", err)
 	}
-	thirdReport := filepath.Join(dir, "third.json")
-	shrinkArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", thirdReport, "testmod")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), shrinkArgs) }); err != nil {
-		t.Fatalf("shrink baseline after killing survivors: %v", err)
+
+	// A second same-type mutation point inside Add leaves the accepted
+	// survivor known and introduces one ID that the ratchet must reject. The
+	// existing test calls Add without checking it, so both survive.
+	mustWriteFile(t, filepath.Join(f.dir, "add.go"), "package testmod\n\nfunc Add(a, b int) int { return a + b + 1 }\n")
+	_, err = captureOutput(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeEfficacy)
+	if !strings.Contains(err.Error(), "new surviving mutant") {
+		t.Fatalf("gate error=%v, want new-survivor diagnostic", err)
 	}
-	shrunk, err := report.ReadBaseline(baselinePath)
+	if got := f.readReport(t, "second").Baseline; got == nil || got.KnownSurvivors != 1 || got.NewSurvivors != 1 {
+		t.Fatalf("baseline report=%+v, want one known and one new", got)
+	}
+	f.survivors(t, 1, "failed gate must not rewrite the baseline")
+
+	// Assert the result and both mutants die, so the update shrinks to nothing.
+	mustWriteFile(t, filepath.Join(f.dir, "add_test.go"), "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 4 { t.Fatal(\"wrong\") } }\n")
+	f.mustRun(t, "shrink baseline after killing survivors", f.args("third", "--baseline-update", "testmod"))
+	f.survivors(t, 0, "shrink")
+}
+
+// TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope pins the data-loss
+// guard: an update that asks for fewer packages than the committed baseline
+// covers must retain the debt it never examined instead of reading "no current
+// mutant" as "fixed".
+func TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope(t *testing.T) {
+	files := simpleModule()
+	files["sub/sub.go"] = "package sub\n\nfunc Mul(a, b int) int { return a + b }\n"
+	files["sub/sub_test.go"] = "package sub\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(1, 2) }\n"
+	f := newBaselineFixture(t, files)
+
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "./..."))
+	f.survivors(t, 2, "bootstrap must record one survivor per package")
+
+	// Narrow the update to the root package. The sub package is never
+	// examined, so its accepted survivor must survive the rewrite.
+	stderr, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "testmod"))
+	})
 	if err != nil {
+		t.Fatalf("narrowed update: %v", err)
+	}
+	if !strings.Contains(stderr, "outside this run's packages") {
+		t.Fatalf("stderr=%q, want a retained-out-of-scope warning", stderr)
+	}
+	var kept bool
+	for _, entry := range f.survivors(t, 2, "narrowed update erased unexamined debt") {
+		kept = kept || strings.HasPrefix(entry.File, "sub/")
+	}
+	if !kept {
+		t.Fatal("the sub package entry was not the one retained")
+	}
+
+	// The update rewrote the policy to the narrowed package set, so the next
+	// narrowed run no longer sees a policy change. Scoping must still hold.
+	f.mustRun(t, "repeat narrowed update", f.args("third", "--baseline-update", "testmod"))
+	f.survivors(t, 2, "repeat narrowed update")
+
+	// Deleting the package the narrowed run never examines is the one thing
+	// that may shrink it: the accepted debt is genuinely gone.
+	if err := os.RemoveAll(filepath.Join(f.dir, "sub")); err != nil {
 		t.Fatal(err)
 	}
-	if len(shrunk.Survivors) != 0 {
-		t.Fatalf("shrunk baseline has %d survivors, want 0", len(shrunk.Survivors))
+	f.mustRun(t, "update after deleting the sub package", f.args("fourth", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "deleting a package must still shrink the baseline")
+}
+
+// TestRunBaselineUpdateWritesDespiteMcoverFailure pins the gate ordering: the
+// ratchet's own verdict is independent of the mutant-coverage score, so a run
+// that killed known survivors must still shrink the committed file even when
+// --threshold-mcover fails it.
+func TestRunBaselineUpdateWritesDespiteMcoverFailure(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Kill the known survivor, then add an untested function so mutant
+	// coverage drops below the threshold and the run fails on it.
+	mustWriteFile(t, filepath.Join(f.dir, "add_test.go"), "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"wrong\") } }\n")
+	mustWriteFile(t, filepath.Join(f.dir, "sub.go"), "package testmod\n\nfunc Sub(a, b int) int { return a - b }\n")
+
+	_, err := captureOutput(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "--threshold-mcover", "100", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeMutantCoverage)
+	f.survivors(t, 0, "the mcover failure skipped the update")
+}
+
+// TestRunBaselineUnreadableFileIsNotBootstrapped pins that a corrupt baseline
+// fails with actionable advice rather than being silently rebuilt: rebuilding
+// would accept every current survivor as debt, which is what the ratchet
+// exists to prevent.
+func TestRunBaselineUnreadableFileIsNotBootstrapped(t *testing.T) {
+	baselinePath := filepath.Join(t.TempDir(), "baseline.json")
+	mustWriteFile(t, baselinePath, "<<<<<<< HEAD\n{}\n")
+	for _, name := range []string{"read", "update"} {
+		t.Run(name, func(t *testing.T) {
+			args := []string{"--baseline", baselinePath, "--cache=off", "testmod"}
+			if name == "update" {
+				args = append(args, "--baseline-update")
+			}
+			_, err := captureStderr(t, func() error { return run(context.Background(), args) })
+			requireExitCode(t, err, exitCodeUsageError)
+			if !strings.Contains(err.Error(), "restore") || !strings.Contains(err.Error(), "--baseline-update") {
+				t.Fatalf("error=%v, want the recovery path spelled out", err)
+			}
+		})
 	}
 }
 
@@ -2682,106 +2809,5 @@ func TestBaselinePolicyForRecordsUserMutatorSelection(t *testing.T) {
 	changed := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"INVERT_NEGATIVES"}}
 	if diff := onlyPolicy.Differences(baselinePolicyFor([]string{"./..."}, &changed)); len(diff) != 0 {
 		t.Fatalf("inert --disable change differs in %v", diff)
-	}
-}
-
-// TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope pins the data-loss
-// guard: an update that asks for fewer packages than the committed baseline
-// covers must retain the debt it never examined instead of reading "no current
-// mutant" as "fixed".
-func TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
-	}
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	files := map[string]string{
-		"go.mod":          "module testmod\n\ngo 1.26\n",
-		"add.go":          "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
-		"add_test.go":     "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
-		"sub/sub.go":      "package sub\n\nfunc Mul(a, b int) int { return a + b }\n",
-		"sub/sub_test.go": "package sub\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(1, 2) }\n",
-	}
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	orig, _ := os.Getwd()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(orig)
-
-	baselinePath := filepath.Join(dir, ".gomutants-baseline.json")
-	baseArgs := []string{"--baseline", baselinePath, "--cache=off", "--only", "ARITHMETIC_BASE", "-w", "1"}
-	bootstrap := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "first.json"), "./...")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), bootstrap) }); err != nil {
-		t.Fatalf("bootstrap baseline: %v", err)
-	}
-	b, err := report.ReadBaseline(baselinePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(b.Survivors) != 2 {
-		t.Fatalf("bootstrapped survivors=%d, want one per package", len(b.Survivors))
-	}
-
-	// Narrow the update to the root package. The sub package is never
-	// examined, so its accepted survivor must survive the rewrite.
-	narrowed := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "second.json"), "testmod")
-	stderr, err := captureStderr(t, func() error { return run(context.Background(), narrowed) })
-	if err != nil {
-		t.Fatalf("narrowed update: %v", err)
-	}
-	if !strings.Contains(stderr, "outside this run's packages") {
-		t.Fatalf("stderr=%q, want a retained-out-of-scope warning", stderr)
-	}
-	after, err := report.ReadBaseline(baselinePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(after.Survivors) != 2 {
-		t.Fatalf("narrowed update left %d survivors, want both: unexamined debt was erased", len(after.Survivors))
-	}
-	var kept bool
-	for _, entry := range after.Survivors {
-		kept = kept || strings.HasPrefix(entry.File, "sub/")
-	}
-	if !kept {
-		t.Fatalf("survivors=%+v, want the sub package entry retained", after.Survivors)
-	}
-
-	// The update rewrote the policy to the narrowed package set, so the next
-	// narrowed run no longer sees a policy change. Scoping must still hold.
-	repeat := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "third.json"), "testmod")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), repeat) }); err != nil {
-		t.Fatalf("repeat narrowed update: %v", err)
-	}
-	again, err := report.ReadBaseline(baselinePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(again.Survivors) != 2 {
-		t.Fatalf("repeat narrowed update left %d survivors, want both", len(again.Survivors))
-	}
-
-	// Deleting the package the narrowed run never examines is the one thing
-	// that may shrink it: the accepted debt is genuinely gone.
-	if err := os.RemoveAll(filepath.Join(dir, "sub")); err != nil {
-		t.Fatal(err)
-	}
-	deleteArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "fourth.json"), "testmod")
-	if _, err := captureOutput(t, func() error { return run(context.Background(), deleteArgs) }); err != nil {
-		t.Fatalf("update after deleting the sub package: %v", err)
-	}
-	shrunk, err := report.ReadBaseline(baselinePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(shrunk.Survivors) != 1 {
-		t.Fatalf("survivors=%d after deleting the sub package, want only the root entry", len(shrunk.Survivors))
 	}
 }

@@ -9,12 +9,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/szhekpisov/gomutants/internal/atomicfile"
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
 
+// baselineMutant builds a mutant whose Anchor agrees with its stable ID, as
+// discovery guarantees: the ID's middle segment is the enclosing declaration.
 func baselineMutant(root, id string, line int, status mutator.MutantStatus) mutator.Mutant {
+	anchor := ""
+	if parts := strings.Split(id, ":"); len(parts) == 3 {
+		anchor = parts[1]
+	}
 	return mutator.Mutant{
 		StableID:    id,
+		Anchor:      anchor,
 		File:        filepath.Join(root, "p.go"),
 		RelFile:     "p.go",
 		Line:        line,
@@ -26,6 +34,22 @@ func baselineMutant(root, id string, line int, status mutator.MutantStatus) muta
 	}
 }
 
+// mustEntries renders mutants as baseline entries, failing the test on the
+// path error that only a mutant outside the module root can produce.
+func mustEntries(t *testing.T, mutants []mutator.Mutant, root string) []BaselineEntry {
+	t.Helper()
+	entries, err := baselineEntries(mutants, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+func mustEntry(t *testing.T, m mutator.Mutant, root string) BaselineEntry {
+	t.Helper()
+	return mustEntries(t, []mutator.Mutant{m}, root)[0]
+}
+
 func TestCompareBaselineClassifiesAndRetainsInconclusive(t *testing.T) {
 	root := t.TempDir()
 	before := []mutator.Mutant{
@@ -33,7 +57,10 @@ func TestCompareBaselineClassifiesAndRetainsInconclusive(t *testing.T) {
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#2", 20, mutator.StatusLived),
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#3", 30, mutator.StatusLived),
 	}
-	b := NewBaseline("example.com/p", "v1", BaselinePolicy{Packages: []string{"./..."}}, before, root)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{Packages: []string{"./..."}}, before, root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	current := []mutator.Mutant{
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 10, mutator.StatusLived),
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#2", 20, mutator.StatusKilled),
@@ -41,7 +68,10 @@ func TestCompareBaselineClassifiesAndRetainsInconclusive(t *testing.T) {
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#4", 40, mutator.StatusLived),
 	}
 
-	got := CompareBaseline(b, current, root, nil)
+	got, err := CompareBaseline(b, current, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 1 || got.Known[0].ID != "p.go:F:ARITHMETIC_BASE#1" {
 		t.Fatalf("Known=%v, want #1", got.Known)
 	}
@@ -77,7 +107,7 @@ func TestCompareBaselineSortsEveryResultAndPopulatesReportIDs(t *testing.T) {
 		mutant("a-known", 5, mutator.StatusLived),
 		mutant("a-unresolved", 3, mutator.StatusLived),
 	}
-	b := &Baseline{Survivors: baselineEntries(baselineMutants, root)}
+	b := &Baseline{Survivors: mustEntries(t, baselineMutants, root)}
 	current := []mutator.Mutant{
 		mutant("z-new", 10, mutator.StatusLived),
 		mutant("z-unresolved", 6, mutator.StatusNotCovered),
@@ -87,7 +117,10 @@ func TestCompareBaselineSortsEveryResultAndPopulatesReportIDs(t *testing.T) {
 		mutant("a-new", 11, mutator.StatusLived),
 	}
 
-	got := CompareBaseline(b, current, root, nil)
+	got, err := CompareBaseline(b, current, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ids := func(entries []BaselineEntry) []string {
 		out := make([]string, len(entries))
 		for i, entry := range entries {
@@ -120,32 +153,60 @@ func TestCompareBaselineSortsEveryResultAndPopulatesReportIDs(t *testing.T) {
 
 func TestCompareBaselineFallbacksAreConservative(t *testing.T) {
 	root := t.TempDir()
-	b := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{
 		baselineMutant(root, "p.go:Old:ARITHMETIC_BASE#1", 10, mutator.StatusLived),
 	}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	rename := baselineMutant(root, "p.go:New:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
-	got := CompareBaseline(b, []mutator.Mutant{rename}, root, nil)
+	got, err := CompareBaseline(b, []mutator.Mutant{rename}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 1 || len(got.New) != 0 || len(got.Fallbacks) != 1 || got.Fallbacks[0].Kind != "location" {
 		t.Fatalf("rename comparison=%+v, want one location fallback known survivor", got)
 	}
 
-	lineShift := rename
-	lineShift.Line = 25
-	got = CompareBaseline(b, []mutator.Mutant{lineShift}, root, nil)
+	// A shifted mutant whose ordinal changed — another mutation of the same
+	// type was added earlier in the same declaration — keeps neither its ID
+	// nor its position, but stays inside Old. That is what the structure
+	// fallback is for.
+	lineShift := baselineMutant(root, "p.go:Old:ARITHMETIC_BASE#2", 25, mutator.StatusLived)
+	got, err = CompareBaseline(b, []mutator.Mutant{lineShift}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 1 || len(got.New) != 0 || len(got.Fallbacks) != 1 || got.Fallbacks[0].Kind != "structure" {
 		t.Fatalf("line-shift comparison=%+v, want one structure fallback known survivor", got)
+	}
+
+	// Losing both the position and the declaration is indistinguishable from
+	// deleting one function and adding an unrelated one that happens to
+	// contain the same kind of mutation, so it must not be matched: brand-new
+	// untested debt would otherwise inherit the accepted status.
+	moved := baselineMutant(root, "p.go:Elsewhere:ARITHMETIC_BASE#1", 25, mutator.StatusLived)
+	got, err = CompareBaseline(b, []mutator.Mutant{moved}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.New) != 1 || len(got.Known) != 0 || len(got.Fallbacks) != 0 {
+		t.Fatalf("relocated comparison=%+v, want a fail-safe new survivor", got)
 	}
 
 	ambiguous := &Baseline{
 		SchemaVersion: BaselineSchemaVersion,
 		GoModule:      "example.com/p",
 		Survivors: []BaselineEntry{
-			baselineEntry(baselineMutant(root, "p.go:A:ARITHMETIC_BASE#1", 5, mutator.StatusLived), root),
-			baselineEntry(baselineMutant(root, "p.go:B:ARITHMETIC_BASE#1", 15, mutator.StatusLived), root),
+			mustEntry(t, baselineMutant(root, "p.go:A:ARITHMETIC_BASE#1", 5, mutator.StatusLived), root),
+			mustEntry(t, baselineMutant(root, "p.go:B:ARITHMETIC_BASE#1", 15, mutator.StatusLived), root),
 		},
 	}
-	got = CompareBaseline(ambiguous, []mutator.Mutant{lineShift}, root, nil)
+	got, err = CompareBaseline(ambiguous, []mutator.Mutant{lineShift}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.New) != 1 || len(got.Known) != 0 || len(got.Fallbacks) != 0 {
 		t.Fatalf("ambiguous comparison=%+v, want fail-safe new survivor", got)
 	}
@@ -159,13 +220,16 @@ func TestCompareBaselineSortsFallbacks(t *testing.T) {
 	oldA.Original = "*"
 	oldM := baselineMutant(root, "m-old", 30, mutator.StatusLived)
 	oldM.Original = "/"
-	b := &Baseline{Survivors: baselineEntries([]mutator.Mutant{oldZ, oldA, oldM}, root)}
+	b := &Baseline{Survivors: mustEntries(t, []mutator.Mutant{oldZ, oldA, oldM}, root)}
 	newZ, newA, newM := oldZ, oldA, oldM
 	newZ.StableID, newZ.Line = "z-new", 30
 	newA.StableID, newA.Line = "a-new", 40
 	newM.StableID, newM.Line = "m-new", 50
 
-	got := CompareBaseline(b, []mutator.Mutant{newZ, newA, newM}, root, nil)
+	got, err := CompareBaseline(b, []mutator.Mutant{newZ, newA, newM}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Fallbacks) != 3 || got.Fallbacks[0].OldID != "a-old" ||
 		got.Fallbacks[1].OldID != "m-old" || got.Fallbacks[2].OldID != "z-old" {
 		t.Fatalf("Fallbacks=%+v, want sorted by old ID", got.Fallbacks)
@@ -178,9 +242,12 @@ func TestCompareBaselineNeedsLocationFallbackWhenStructureIsAmbiguous(t *testing
 	oldB := baselineMutant(root, "old-b", 20, mutator.StatusLived)
 	newA, newB := oldA, oldB
 	newA.StableID, newB.StableID = "new-a", "new-b"
-	b := &Baseline{Survivors: baselineEntries([]mutator.Mutant{oldA, oldB}, root)}
+	b := &Baseline{Survivors: mustEntries(t, []mutator.Mutant{oldA, oldB}, root)}
 
-	got := CompareBaseline(b, []mutator.Mutant{newA, newB}, root, nil)
+	got, err := CompareBaseline(b, []mutator.Mutant{newA, newB}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 2 || len(got.New) != 0 || len(got.Fallbacks) != 2 {
 		t.Fatalf("comparison=%+v, want two unique location fallbacks", got)
 	}
@@ -190,90 +257,112 @@ func baselineTestEntry(id, file, original string, line int) BaselineEntry {
 	return BaselineEntry{ID: id, File: file, Line: line, Column: 3, Type: "T", Original: original, Replacement: "r"}
 }
 
-func TestFallbackMatchLocationMatchesDistinctKeys(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)}
-	current := []BaselineEntry{baselineTestEntry("new-b", "p.go", "+", 20), baselineTestEntry("new-a", "p.go", "+", 10)}
-	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
-		t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
+// TestFallbackMatchPairsOnlyUniqueKeys drives the one generic pass both
+// fallbacks share. The location key separates entries by position and the
+// structure key by file and descriptor, so each is fed inputs that are
+// distinct, ambiguous, and already matched under its own key.
+func TestFallbackMatchPairsOnlyUniqueKeys(t *testing.T) {
+	cases := []struct {
+		name                    string
+		byStructure             bool
+		baseline, current       []BaselineEntry
+		baseMatch, currentMatch []int
+		wantBase, wantCurrent   []int
+	}{
+		{
+			name:        "location: distinct keys pair across input order",
+			baseline:    []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)},
+			current:     []BaselineEntry{baselineTestEntry("new-b", "p.go", "+", 20), baselineTestEntry("new-a", "p.go", "+", 10)},
+			wantBase:    []int{1, 0},
+			wantCurrent: []int{1, 0},
+		},
+		{
+			name:        "location: two baseline entries on one key match nothing",
+			baseline:    []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 10)},
+			current:     []BaselineEntry{baselineTestEntry("new", "p.go", "+", 10)},
+			wantBase:    []int{-1, -1},
+			wantCurrent: []int{-1},
+		},
+		{
+			name:        "location: two current entries on one key match nothing",
+			baseline:    []BaselineEntry{baselineTestEntry("old", "p.go", "+", 10)},
+			current:     []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 10), baselineTestEntry("new-b", "p.go", "+", 10)},
+			wantBase:    []int{-1},
+			wantCurrent: []int{-1, -1},
+		},
+		{
+			name:         "location: already-matched entries are not reconsidered",
+			baseline:     []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)},
+			current:      []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 20), baselineTestEntry("new-b", "p.go", "+", 10)},
+			baseMatch:    []int{0, -1},
+			currentMatch: []int{0, -1},
+			wantBase:     []int{0, -1},
+			wantCurrent:  []int{0, -1},
+		},
+		{
+			name:        "structure: distinct keys pair despite moved lines",
+			byStructure: true,
+			baseline:    []BaselineEntry{baselineTestEntry("old-a", "a.go", "+", 10), baselineTestEntry("old-b", "b.go", "*", 20)},
+			current:     []BaselineEntry{baselineTestEntry("new-b", "b.go", "*", 40), baselineTestEntry("new-a", "a.go", "+", 30)},
+			wantBase:    []int{1, 0},
+			wantCurrent: []int{1, 0},
+		},
+		{
+			name:        "structure: two baseline entries on one key match nothing",
+			byStructure: true,
+			baseline:    []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10), baselineTestEntry("two", "p.go", "+", 20)},
+			current:     []BaselineEntry{baselineTestEntry("new", "p.go", "+", 30)},
+			wantBase:    []int{-1, -1},
+			wantCurrent: []int{-1},
+		},
+		{
+			name:        "structure: two current entries on one key match nothing",
+			byStructure: true,
+			baseline:    []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10)},
+			current:     []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 30), baselineTestEntry("new-b", "p.go", "+", 40)},
+			wantBase:    []int{-1},
+			wantCurrent: []int{-1, -1},
+		},
 	}
-}
 
-func TestFallbackMatchLocationRejectsDuplicateBaseline(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 10)}
-	current := []BaselineEntry{baselineTestEntry("new", "p.go", "+", 10)}
-	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{-1, -1}) || !slices.Equal(currentMatch, []int{-1}) {
-		t.Fatalf("ambiguous baseline matched: %v %v", baseMatch, currentMatch)
-	}
-}
-
-func TestFallbackMatchLocationRejectsDuplicateCurrent(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("old", "p.go", "+", 10)}
-	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 10), baselineTestEntry("new-b", "p.go", "+", 10)}
-	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{-1}) || !slices.Equal(currentMatch, []int{-1, -1}) {
-		t.Fatalf("ambiguous current matched: %v %v", baseMatch, currentMatch)
-	}
-}
-
-func TestFallbackMatchLocationSkipsPreMatchedIndexZero(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("old-a", "p.go", "+", 10), baselineTestEntry("old-b", "p.go", "+", 20)}
-	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 20), baselineTestEntry("new-b", "p.go", "+", 10)}
-	baseMatch, currentMatch := []int{0, -1}, []int{0, -1}
-	fallbackMatchLocation(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{0, -1}) || !slices.Equal(currentMatch, []int{0, -1}) {
-		t.Fatalf("pre-matched entries were reconsidered: %v %v", baseMatch, currentMatch)
-	}
-}
-
-func TestFallbackMatchStructureMatchesDistinctKeys(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("old-a", "a.go", "+", 10), baselineTestEntry("old-b", "b.go", "*", 20)}
-	current := []BaselineEntry{baselineTestEntry("new-b", "b.go", "*", 40), baselineTestEntry("new-a", "a.go", "+", 30)}
-	baseMatch, currentMatch := unmatchedIndexes(len(baseline), len(current))
-	fallbackMatchStructure(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{1, 0}) || !slices.Equal(currentMatch, []int{1, 0}) {
-		t.Fatalf("baseMatch=%v currentMatch=%v", baseMatch, currentMatch)
-	}
-}
-
-func TestFallbackMatchStructureRejectsDuplicateBaseline(t *testing.T) {
-	one := baselineTestEntry("one", "p.go", "+", 10)
-	two := baselineTestEntry("two", "p.go", "+", 20)
-	current := []BaselineEntry{baselineTestEntry("new", "p.go", "+", 30)}
-	baseMatch, currentMatch := unmatchedIndexes(2, 1)
-	fallbackMatchStructure([]BaselineEntry{one, two}, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{-1, -1}) || !slices.Equal(currentMatch, []int{-1}) {
-		t.Fatalf("ambiguous baseline matched: %v %v", baseMatch, currentMatch)
-	}
-}
-
-func TestFallbackMatchStructureRejectsDuplicateCurrent(t *testing.T) {
-	baseline := []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10)}
-	current := []BaselineEntry{baselineTestEntry("new-a", "p.go", "+", 30), baselineTestEntry("new-b", "p.go", "+", 40)}
-	baseMatch, currentMatch := unmatchedIndexes(1, 2)
-	fallbackMatchStructure(baseline, current, baseMatch, currentMatch)
-	if !slices.Equal(baseMatch, []int{-1}) || !slices.Equal(currentMatch, []int{-1, -1}) {
-		t.Fatalf("ambiguous current matched: %v %v", baseMatch, currentMatch)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseMatch, currentMatch := tc.baseMatch, tc.currentMatch
+			if baseMatch == nil {
+				baseMatch, currentMatch = unmatchedIndexes(len(tc.baseline), len(tc.current))
+			}
+			if tc.byStructure {
+				fallbackMatch(tc.baseline, tc.current, baseMatch, currentMatch, structureOf)
+			} else {
+				fallbackMatch(tc.baseline, tc.current, baseMatch, currentMatch, locationOf)
+			}
+			if !slices.Equal(baseMatch, tc.wantBase) || !slices.Equal(currentMatch, tc.wantCurrent) {
+				t.Fatalf("baseMatch=%v currentMatch=%v, want %v and %v", baseMatch, currentMatch, tc.wantBase, tc.wantCurrent)
+			}
+		})
 	}
 }
 
 func TestCompareBaselineReassignedExactIDDoesNotStealOldMutation(t *testing.T) {
 	root := t.TempDir()
 	old := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
-	b := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{old}, root)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{old}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	inserted := baselineMutant(root, old.StableID, 5, mutator.StatusKilled)
 	inserted.Original = "*"
 	inserted.Replacement = "/"
 	movedOld := old
 	movedOld.StableID = "p.go:init~2:ARITHMETIC_BASE#1"
+	movedOld.Anchor = "init~2"
 	movedOld.Line = 20
 
-	got := CompareBaseline(b, []mutator.Mutant{inserted, movedOld}, root, nil)
+	got, err := CompareBaseline(b, []mutator.Mutant{inserted, movedOld}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 1 || got.Known[0].ID != movedOld.StableID || len(got.New) != 0 {
 		t.Fatalf("comparison=%+v, want the moved old mutation matched and no new survivor", got)
 	}
@@ -282,12 +371,68 @@ func TestCompareBaselineReassignedExactIDDoesNotStealOldMutation(t *testing.T) {
 	}
 }
 
+// TestCompareBaselineReassignedExactIDWithSameDescriptorIsNotTrusted covers
+// the case the descriptor check alone cannot see: the inserted declaration
+// contains the *same* kind of mutation, so the old ID's new owner is
+// structurally identical to the accepted debt. Matching it would report a
+// brand-new untested survivor as KNOWN while the real one was killed.
+func TestCompareBaselineReassignedExactIDWithSameDescriptorIsNotTrusted(t *testing.T) {
+	root := t.TempDir()
+	old := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 30, mutator.StatusLived)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{old}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second init() above the first takes the bare anchor; the original
+	// becomes init~2 and shifts down. The newcomer survives, the original is
+	// now killed.
+	inserted := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 5, mutator.StatusLived)
+	movedOld := baselineMutant(root, "p.go:init~2:ARITHMETIC_BASE#1", 40, mutator.StatusKilled)
+
+	got, err := CompareBaseline(b, []mutator.Mutant{inserted, movedOld}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 0 {
+		t.Fatalf("Known=%+v, want none: neither candidate is provably the accepted debt", got.Known)
+	}
+	if len(got.New) != 1 || got.New[0].ID != inserted.StableID {
+		t.Fatalf("New=%+v, want the inserted survivor reported as new debt", got.New)
+	}
+}
+
+// TestCompareBaselineKeepsUnmovedMembersOfARepeatedFamily pins the other half
+// of that guard: distrusting the ID inside a repeated family must not cost
+// accepted debt, because the location fallback still matches every member that
+// has not moved — by position, which no insertion can forge.
+func TestCompareBaselineKeepsUnmovedMembersOfARepeatedFamily(t *testing.T) {
+	root := t.TempDir()
+	first := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
+	second := baselineMutant(root, "p.go:init~2:ARITHMETIC_BASE#1", 20, mutator.StatusLived)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{first, second}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := CompareBaseline(b, []mutator.Mutant{first, second}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 2 || len(got.New) != 0 || len(got.Fallbacks) != 0 {
+		t.Fatalf("comparison=%+v, want both matched by exact ID", got)
+	}
+}
+
 func TestCompareBaselineDoesNotMatchOneCurrentMutantTwice(t *testing.T) {
 	root := t.TempDir()
 	current := baselineMutant(root, "duplicate-id", 10, mutator.StatusLived)
-	entry := baselineEntry(current, root)
+	entry := mustEntry(t, current, root)
 	b := &Baseline{Survivors: []BaselineEntry{entry, entry}}
-	got := CompareBaseline(b, []mutator.Mutant{current}, root, nil)
+	got, err := CompareBaseline(b, []mutator.Mutant{current}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got.Known) != 1 || len(got.Resolved) != 1 {
 		t.Fatalf("comparison=%+v, want one known and one unmatched baseline entry", got)
 	}
@@ -297,6 +442,7 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 	p := BaselinePolicy{
 		Packages:     []string{"./b", "./a", "./a"},
 		Only:         []string{"B", "A", "A"},
+		Disable:      []string{"D", "C", "C"},
 		ExcludeFiles: []string{"z/**", "a/**", "a/**"},
 		ExcludeCalls: []string{"log.*", "fmt.Print*"},
 	}
@@ -305,6 +451,7 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 		t.Fatalf("Packages=%v", canonical.Packages)
 	}
 	if !slices.Equal(canonical.Only, []string{"A", "B"}) ||
+		!slices.Equal(canonical.Disable, []string{"C", "D"}) ||
 		!slices.Equal(canonical.ExcludeFiles, []string{"a/**", "z/**"}) ||
 		!slices.Equal(canonical.ExcludeCalls, []string{"fmt.Print*", "log.*"}) {
 		t.Fatalf("canonical policy=%+v", canonical)
@@ -312,14 +459,16 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 	if diff := p.Differences(BaselinePolicy{
 		Packages:     []string{"./b", "./a"},
 		Only:         []string{"A", "B"},
+		Disable:      []string{"D", "C"},
 		ExcludeFiles: []string{"z/**", "a/**"},
 		ExcludeCalls: []string{"fmt.Print*", "log.*"},
 	}); len(diff) != 0 {
 		t.Fatalf("equivalent policies differ: %v", diff)
 	}
-	p.Packages[0], p.Only[0], p.ExcludeFiles[0], p.ExcludeCalls[0] = "changed", "changed", "changed", "changed"
+	p.Packages[0], p.Only[0], p.Disable[0], p.ExcludeFiles[0], p.ExcludeCalls[0] = "changed", "changed", "changed", "changed", "changed"
 	if !slices.Equal(canonical.Packages, []string{"./a", "./b"}) ||
 		!slices.Equal(canonical.Only, []string{"A", "B"}) ||
+		!slices.Equal(canonical.Disable, []string{"C", "D"}) ||
 		!slices.Equal(canonical.ExcludeFiles, []string{"a/**", "z/**"}) ||
 		!slices.Equal(canonical.ExcludeCalls, []string{"fmt.Print*", "log.*"}) {
 		t.Fatalf("Canonical aliases its input: %+v", canonical)
@@ -397,7 +546,10 @@ func TestNewAndUpdatedBaselineCanonicalizeSortAndClone(t *testing.T) {
 	z := baselineMutant(root, "z", 2, mutator.StatusLived)
 	a := baselineMutant(root, "a", 1, mutator.StatusLived)
 	dead := baselineMutant(root, "dead", 3, mutator.StatusKilled)
-	b := NewBaseline("example.com/p", "v1", BaselinePolicy{Packages: []string{"z", "a"}}, []mutator.Mutant{z, dead, a}, root)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{Packages: []string{"z", "a"}}, []mutator.Mutant{z, dead, a}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := []string{b.Survivors[0].ID, b.Survivors[1].ID}; !slices.Equal(got, []string{"a", "z"}) {
 		t.Fatalf("new baseline survivors=%v", got)
 	}
@@ -486,37 +638,6 @@ func TestReadBaselineRejectsMissingMalformedAndDuplicate(t *testing.T) {
 	}
 }
 
-type fakeBaselineSink struct {
-	name     string
-	writeErr error
-	closeErr error
-	closed   bool
-}
-
-func (f *fakeBaselineSink) Write(p []byte) (int, error) {
-	if f.writeErr != nil {
-		return 0, f.writeErr
-	}
-	return len(p), nil
-}
-
-func (f *fakeBaselineSink) Close() error {
-	f.closed = true
-	return f.closeErr
-}
-
-func (f *fakeBaselineSink) Name() string { return f.name }
-
-var errBaselineIO = errors.New("baseline I/O sentinel")
-
-func resetBaselineIOHooks(t *testing.T) {
-	t.Helper()
-	mkdirAll, newSink, remove, rename, chmod := baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename, baselineChmod
-	t.Cleanup(func() {
-		baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename, baselineChmod = mkdirAll, newSink, remove, rename, chmod
-	})
-}
-
 func validBaselineForWrite() *Baseline {
 	return &Baseline{
 		SchemaVersion: BaselineSchemaVersion,
@@ -539,89 +660,48 @@ func TestWriteBaselineRejectsInvalidSnapshot(t *testing.T) {
 	}
 }
 
-func TestWriteBaselinePropagatesMkdirError(t *testing.T) {
-	resetBaselineIOHooks(t)
-	var mode os.FileMode
-	baselineMkdirAll = func(_ string, got os.FileMode) error {
-		mode = got
-		return errBaselineIO
+// WriteBaseline's atomic-write flow lives in internal/atomicfile, which owns
+// the per-error-path tests. What this pins is the contract WriteBaseline
+// asks of it: an indented, sorted, canonical snapshot at the shared mode, in
+// a file the next ReadBaseline accepts.
+func TestWriteBaselineWritesSortedIndentedSnapshotAtSharedMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "baseline.json")
+	b := validBaselineForWrite()
+	b.Policy = BaselinePolicy{Packages: []string{"./z", "./a"}}
+	b.Survivors = []BaselineEntry{
+		{ID: "z", File: "p.go", Line: 2, Column: 1, Type: "T"},
+		{ID: "a", File: "p.go", Line: 1, Column: 1, Type: "T"},
 	}
-	err := WriteBaseline(filepath.Join(t.TempDir(), "nested", "baseline.json"), validBaselineForWrite())
-	if !errors.Is(err, errBaselineIO) || mode != 0o755 {
-		t.Fatalf("error=%v mode=%#o", err, mode)
-	}
-}
-
-func TestWriteBaselinePropagatesCreateTempError(t *testing.T) {
-	resetBaselineIOHooks(t)
-	newBaselineSink = func(string, string) (baselineSink, error) { return nil, errBaselineIO }
-	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestWriteBaselinePropagatesEncodeErrorAndCleansUp(t *testing.T) {
-	resetBaselineIOHooks(t)
-	sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), writeErr: errBaselineIO}
-	newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
-	var removes int
-	baselineRemove = func(string) error { removes++; return nil }
-	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-		t.Fatalf("error=%v", err)
-	}
-	if !sink.closed || removes != 1 {
-		t.Fatalf("closed=%v removes=%d", sink.closed, removes)
-	}
-}
-
-func TestWriteBaselinePropagatesCloseError(t *testing.T) {
-	resetBaselineIOHooks(t)
-	sink := &fakeBaselineSink{name: filepath.Join(t.TempDir(), "tmp"), closeErr: errBaselineIO}
-	newBaselineSink = func(string, string) (baselineSink, error) { return sink, nil }
-	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestWriteBaselinePropagatesRenameErrorAndCleansUp(t *testing.T) {
-	resetBaselineIOHooks(t)
-	baselineRename = func(string, string) error { return errBaselineIO }
-	var removes int
-	baselineRemove = func(name string) error { removes++; return os.Remove(name) }
-	if err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite()); !errors.Is(err, errBaselineIO) {
-		t.Fatalf("error=%v", err)
-	}
-	if removes != 1 {
-		t.Fatalf("remove calls=%d, want 1", removes)
-	}
-}
-
-func TestWriteBaselineSuccessDoesNotRunFailureCleanup(t *testing.T) {
-	resetBaselineIOHooks(t)
-	var removes int
-	baselineRemove = func(name string) error { removes++; return os.Remove(name) }
-	path := filepath.Join(t.TempDir(), "baseline.json")
-	if err := WriteBaseline(path, validBaselineForWrite()); err != nil {
+	if err := WriteBaseline(path, b); err != nil {
 		t.Fatal(err)
 	}
-	if removes != 0 {
-		t.Fatalf("remove calls=%d, want 0", removes)
+	// The caller's slice must not be reordered under it.
+	if b.Survivors[0].ID != "z" {
+		t.Fatalf("WriteBaseline sorted the caller's slice in place: %v", b.Survivors)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "\n  \"schema_version\"") {
+		t.Fatalf("baseline is not indented: %s", data)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o644 {
-		t.Fatalf("baseline permissions=%#o, want world-readable committed policy", info.Mode().Perm())
+	if info.Mode().Perm() != atomicfile.Mode {
+		t.Fatalf("permissions=%#o, want %#o: a committed baseline is not a secret", info.Mode().Perm(), atomicfile.Mode)
 	}
-}
-
-func TestWriteBaselinePropagatesChmodError(t *testing.T) {
-	resetBaselineIOHooks(t)
-	baselineChmod = func(string, os.FileMode) error { return errBaselineIO }
-	err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite())
-	if !errors.Is(err, errBaselineIO) {
-		t.Fatalf("err=%v, want %v", err, errBaselineIO)
+	written, err := ReadBaseline(path)
+	if err != nil {
+		t.Fatalf("written baseline does not read back: %v", err)
+	}
+	if got := []string{written.Survivors[0].ID, written.Survivors[1].ID}; !slices.Equal(got, []string{"a", "z"}) {
+		t.Fatalf("survivors=%v, want sorted", got)
+	}
+	if !slices.Equal(written.Policy.Packages, []string{"./a", "./z"}) {
+		t.Fatalf("policy=%v, want canonical", written.Policy.Packages)
 	}
 }
 
@@ -630,9 +710,39 @@ func TestBaselineEntryUsesModuleRelativeSlashPath(t *testing.T) {
 	m := baselineMutant(root, "id", 1, mutator.StatusLived)
 	m.File = filepath.Join(root, "nested", "p.go")
 	m.RelFile = "wrong.go"
-	entry := baselineEntry(m, root)
+	entry := mustEntry(t, m, root)
 	if entry.File != "nested/p.go" {
 		t.Fatalf("File=%q, want module-relative slash path", entry.File)
+	}
+}
+
+// TestBaselineEntryRejectsFileOutsideModuleRoot pins that an unrelatable path
+// is an error rather than a silent fall back to RelFile, whose value depends
+// on the run's package arguments. A baseline keyed in that path space matches
+// nothing on the next run, so every known survivor would resurface as new.
+func TestBaselineEntryRejectsFileOutsideModuleRoot(t *testing.T) {
+	m := baselineMutant(t.TempDir(), "id", 1, mutator.StatusLived)
+	m.File = "relative/p.go"
+	m.RelFile = "p.go"
+	err := func() error {
+		_, err := baselineEntry(m, "/abs/module")
+		return err
+	}()
+	if err == nil {
+		t.Fatal("a path that cannot be made module-relative must be an error")
+	}
+	// %w, not %v: callers inspecting the cause must reach filepath.Rel's.
+	if errors.Unwrap(err) == nil {
+		t.Fatalf("error does not wrap the underlying failure: %v", err)
+	}
+	if _, err := baselineEntries([]mutator.Mutant{m}, "/abs/module"); err == nil {
+		t.Fatal("baselineEntries must propagate the entry error")
+	}
+	if _, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{m}, "/abs/module"); err == nil {
+		t.Fatal("NewBaseline must propagate the entry error")
+	}
+	if _, err := CompareBaseline(&Baseline{}, []mutator.Mutant{m}, "/abs/module", nil); err == nil {
+		t.Fatal("CompareBaseline must propagate the entry error")
 	}
 }
 
@@ -666,13 +776,19 @@ func TestCompareBaselineRetainsSurvivorsOutsideTheRunScope(t *testing.T) {
 	inScope := baselineMutant(root, "kept:in-scope", 10, mutator.StatusLived)
 	outOfScope := baselineMutant(root, "kept:out-of-scope", 20, mutator.StatusLived)
 	outOfScope.File = filepath.Join(root, "other", "q.go")
-	b := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{inScope, outOfScope}, root)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{inScope, outOfScope}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// The narrowed rerun resolves only the root package, and its one mutant
 	// is now killed. The other package was never examined.
 	killed := baselineMutant(root, "kept:in-scope", 10, mutator.StatusKilled)
 	scope := NewBaselineScope(root, []string{root})
-	got := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+	got, err := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if len(got.Resolved) != 1 || got.Resolved[0].ID != "kept:in-scope" {
 		t.Fatalf("Resolved=%v, want only the examined package's fixed survivor", got.Resolved)
@@ -692,7 +808,10 @@ func TestCompareBaselineRetainsSurvivorsOutsideTheRunScope(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "other", "q.go")); err != nil {
 		t.Fatal(err)
 	}
-	deleted := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+	deleted, err := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(deleted.Resolved) != 2 || len(deleted.Retained) != 0 {
 		t.Fatalf("Resolved=%v Retained=%v: a deleted file must still resolve", deleted.Resolved, deleted.Retained)
 	}
@@ -718,5 +837,125 @@ func TestNewBaselineScopeIgnoresDirectoriesOutsideTheModule(t *testing.T) {
 	}
 	if !scope.resolvable(BaselineEntry{File: "a/gone.go"}) {
 		t.Fatal("a file that no longer exists must be resolvable even unexamined")
+	}
+}
+
+// TestMatchExactIDsWalksTheWholeBaseline drives every branch of the exact-ID
+// pass in one comparison, with the entries whose ID must NOT be trusted placed
+// before the entries whose ID must be. F's two mutants are the load-bearing
+// assertion: they share a structure key and both moved, so neither fallback
+// can recover them and only the exact ID can. Anything that stops the walk
+// early, or that widens the repeated-family guard to cover them, loses both.
+func TestMatchExactIDsWalksTheWholeBaseline(t *testing.T) {
+	root := t.TempDir()
+	entry := func(id, original, replacement string, line int) BaselineEntry {
+		m := baselineMutant(root, id, line, mutator.StatusLived)
+		m.Original, m.Replacement = original, replacement
+		return mustEntry(t, m, root)
+	}
+	b := &Baseline{Survivors: []BaselineEntry{
+		// Deleted outright: its ID is absent from the run.
+		entry("p.go:Gone:ARITHMETIC_BASE#1", "+", "-", 5),
+		// Same ID, different mutation: the ID was reused by an edit.
+		entry("p.go:Changed:ARITHMETIC_BASE#1", "+", "-", 15),
+		// Same ID, but a second init() shifted the family's suffixes.
+		entry("p.go:init:ARITHMETIC_BASE#1", "+", "-", 25),
+		// Same IDs, moved, structurally indistinguishable from each other.
+		entry("p.go:F:ARITHMETIC_BASE#1", "+", "-", 30),
+		entry("p.go:F:ARITHMETIC_BASE#2", "+", "-", 31),
+	}}
+
+	mutant := func(id, original, replacement string, line int) mutator.Mutant {
+		m := baselineMutant(root, id, line, mutator.StatusLived)
+		m.Original, m.Replacement = original, replacement
+		return m
+	}
+	current := []mutator.Mutant{
+		mutant("p.go:Changed:ARITHMETIC_BASE#1", "*", "/", 15),
+		mutant("p.go:init:ARITHMETIC_BASE#1", "+", "-", 1),
+		mutant("p.go:init~2:ARITHMETIC_BASE#1", "+", "-", 40),
+		mutant("p.go:F:ARITHMETIC_BASE#1", "+", "-", 60),
+		mutant("p.go:F:ARITHMETIC_BASE#2", "+", "-", 61),
+	}
+
+	got, err := CompareBaseline(b, current, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := make([]string, len(got.Known))
+	for i, e := range got.Known {
+		known[i] = e.ID
+	}
+	if !slices.Equal(known, []string{"p.go:F:ARITHMETIC_BASE#1", "p.go:F:ARITHMETIC_BASE#2"}) {
+		t.Fatalf("Known=%v, want exactly F's two mutants matched by exact ID", known)
+	}
+	if len(got.Resolved) != 3 || len(got.New) != 3 {
+		t.Fatalf("Resolved=%v New=%v, want the three untrusted entries resolved and their three candidates new", got.Resolved, got.New)
+	}
+}
+
+// TestCompareBaselineSortsAndClassifiesPastOutOfScopeEntries pins that an
+// out-of-scope entry neither stops the classification walk nor lands in the
+// output unsorted.
+func TestCompareBaselineSortsAndClassifiesPastOutOfScopeEntries(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := func(id, name string) BaselineEntry {
+		if err := os.WriteFile(filepath.Join(root, "other", name), []byte("package other\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m := baselineMutant(root, id, 1, mutator.StatusLived)
+		m.File = filepath.Join(root, "other", name)
+		return mustEntry(t, m, root)
+	}
+	inScope := baselineMutant(root, "z-in-scope", 10, mutator.StatusLived)
+	b := &Baseline{Survivors: []BaselineEntry{
+		outside("b-outside", "b.go"),
+		outside("a-outside", "a.go"),
+		mustEntry(t, inScope, root),
+	}}
+
+	got, err := CompareBaseline(b, []mutator.Mutant{inScope}, root, NewBaselineScope(root, []string{root}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 1 || got.Known[0].ID != "z-in-scope" {
+		t.Fatalf("Known=%v: the walk stopped at the first out-of-scope entry", got.Known)
+	}
+	ids := []string{got.OutOfScope[0].ID, got.OutOfScope[1].ID}
+	if !slices.Equal(ids, []string{"a-outside", "b-outside"}) {
+		t.Fatalf("OutOfScope=%v, want sorted by ID", ids)
+	}
+}
+
+// TestNewBaselineScopeSkipsPastDirectoriesOutsideTheModule pins that a
+// directory the run resolved outside the module root is skipped rather than
+// stored, and that skipping it does not abandon the directories after it.
+func TestNewBaselineScopeSkipsPastDirectoriesOutsideTheModule(t *testing.T) {
+	root := t.TempDir()
+	sibling := filepath.Join(filepath.Dir(root), "sibling")
+	inside := filepath.Join(root, "pkg")
+	scope := NewBaselineScope(root, []string{sibling, filepath.Dir(root), inside})
+	if len(scope.dirs) != 1 {
+		t.Fatalf("scope dirs=%v, want only the directory inside the module", scope.dirs)
+	}
+	if !scope.resolvable(BaselineEntry{File: "pkg/p.go"}) {
+		t.Fatal("the directory after the skipped ones was dropped")
+	}
+}
+
+// TestBaselineScopeResolvesExaminedPackagesWithoutTouchingDisk pins that
+// membership in the examined set is the whole answer for an in-scope entry:
+// the run had its chance to produce that mutant, so the file being present is
+// not evidence the debt survives.
+func TestBaselineScopeResolvesExaminedPackagesWithoutTouchingDisk(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "p.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !NewBaselineScope(root, []string{root}).resolvable(BaselineEntry{File: "p.go"}) {
+		t.Fatal("an entry in an examined package must be resolvable even though its file still exists")
 	}
 }

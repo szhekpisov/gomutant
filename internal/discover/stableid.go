@@ -47,12 +47,6 @@ func funcSpans(fset *token.FileSet, f *ast.File) []funcSpan {
 	return spans
 }
 
-// anchorRepeatSep joins a repeated declaration name to its occurrence
-// number. It is deliberately a character Go identifiers cannot contain, so
-// the disambiguated anchor of one declaration can never collide with the
-// plain name of another.
-const anchorRepeatSep = "~"
-
 // anchorName renders the anchor for the occurrence'th declaration sharing
 // name in a file. The first occurrence keeps the bare name: only files that
 // actually repeat a name pay the suffix, which keeps IDs unchanged for the
@@ -69,7 +63,7 @@ func anchorName(name string, occurrence int) string {
 	if occurrence == 1 {
 		return name
 	}
-	return name + anchorRepeatSep + strconv.Itoa(occurrence)
+	return name + mutator.AnchorRepeatSep + strconv.Itoa(occurrence)
 }
 
 // funcName renders a declaration's anchor name: "Run" for a plain

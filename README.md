@@ -354,7 +354,9 @@ gomutants --baseline .gomutants-baseline.json --baseline-update ./...
 ```
 
 Updates are shrink-only. If a run contains any new survivor, it exits 10 and
-leaves the previous baseline untouched. `KILLED`, `EQUIVALENT`, and
+leaves the previous baseline untouched. Any other gate is independent of that
+verdict: a run that introduces no new debt writes the shrunk file even when
+`--threshold-mcover` then fails it. `KILLED`, `EQUIVALENT`, and
 `NOT VIABLE` entries are removed by a successful update; `NOT COVERED`,
 `TIMED OUT`, and `INFRA ERROR` entries are retained because those outcomes do
 not prove the old survivor was fixed. The file is schema-versioned, sorted, and
@@ -363,8 +365,13 @@ replaced atomically, so it is suitable for version control.
 Stable IDs normally survive line shifts and edits to other functions. For the
 documented churn cases—such as a renamed function or an inserted `init()`—the
 ratchet attempts a unique source-descriptor match and prints the old and new IDs
-as a warning. It never guesses among ambiguous candidates; an unmatched current
-survivor remains `NEW` and fails safely.
+as a warning. Both fallbacks stay anchored to the enclosing declaration, so a
+mutant that loses its position *and* its function is left unmatched: that is
+indistinguishable from deleting one function and adding another that happens to
+contain the same kind of mutation. For the same reason, an inserted `init()`
+that shifts the family's suffixes only lets an ID match a mutant that has not
+moved. The ratchet never guesses among ambiguous candidates; an unmatched
+current survivor remains `NEW` and fails safely.
 
 The file records the settings that define the mutant universe — packages,
 `--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`

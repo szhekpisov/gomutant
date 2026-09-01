@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/szhekpisov/gomutants/internal/atomicfile"
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
 
@@ -25,8 +26,11 @@ const (
 )
 
 // Baseline records the surviving-mutant debt a project has explicitly
-// accepted. Only survivors are persisted; every other outcome is derived from
-// the next run.
+// accepted. Survivors is what a run must not regress against: LIVED mutants at
+// write time, plus prior entries whose latest outcome was inconclusive
+// (NOT_COVERED, TIMED_OUT, INFRA_ERROR) or that this run's package selection
+// never examined. Those are retained precisely because nothing proved them
+// fixed. Every other outcome is derived from the next run.
 type Baseline struct {
 	SchemaVersion int             `json:"schema_version"`
 	GoModule      string          `json:"go_module"`
@@ -59,8 +63,11 @@ type BaselinePolicy struct {
 // conservatively from the documented stable-ID churn cases. File is always
 // relative to the module root and slash-separated.
 type BaselineEntry struct {
-	ID          string `json:"id"`
-	File        string `json:"file"`
+	ID   string `json:"id"`
+	File string `json:"file"`
+	// Anchor is the enclosing function as rendered in ID. Empty for
+	// package-level declarations, so it is omitted rather than written blank.
+	Anchor      string `json:"anchor,omitempty"`
 	Line        int    `json:"line"`
 	Column      int    `json:"column"`
 	Type        string `json:"type"`
@@ -92,21 +99,10 @@ type BaselineComparison struct {
 	newIDs   map[string]struct{}
 }
 
-type baselineSink interface {
-	Write([]byte) (int, error)
-	Close() error
-	Name() string
-}
-
-var (
-	baselineMkdirAll = os.MkdirAll
-	newBaselineSink  = func(dir, pattern string) (baselineSink, error) {
-		return os.CreateTemp(dir, pattern)
-	}
-	baselineRemove = os.Remove
-	baselineRename = os.Rename
-	baselineChmod  = os.Chmod
-)
+// baselineTmpPattern names the temp file WriteBaseline renames into place. It
+// is matched by .gitignore, so an interrupted --baseline-update cannot leave a
+// file `git add -A` would commit.
+const baselineTmpPattern = ".gomutants-baseline-*.tmp"
 
 // Canonical returns a deterministic policy representation for comparison and
 // serialization. All slices are copied, sorted, and deduplicated.
@@ -211,7 +207,7 @@ func (b *Baseline) Validate() error {
 }
 
 // NewBaseline creates an initial baseline from the LIVED outcomes in mutants.
-func NewBaseline(goModule, generatedBy string, policy BaselinePolicy, mutants []mutator.Mutant, moduleRoot string) *Baseline {
+func NewBaseline(goModule, generatedBy string, policy BaselinePolicy, mutants []mutator.Mutant, moduleRoot string) (*Baseline, error) {
 	b := &Baseline{
 		SchemaVersion: BaselineSchemaVersion,
 		GoModule:      goModule,
@@ -219,12 +215,17 @@ func NewBaseline(goModule, generatedBy string, policy BaselinePolicy, mutants []
 		Policy:        policy.Canonical(),
 	}
 	for _, m := range mutants {
-		if m.Status == mutator.StatusLived {
-			b.Survivors = append(b.Survivors, baselineEntry(m, moduleRoot))
+		if m.Status != mutator.StatusLived {
+			continue
 		}
+		entry, err := baselineEntry(m, moduleRoot)
+		if err != nil {
+			return nil, err
+		}
+		b.Survivors = append(b.Survivors, entry)
 	}
 	sortBaselineEntries(b.Survivors)
-	return b
+	return b, nil
 }
 
 // UpdatedBaseline builds the next shrink-only snapshot after CompareBaseline.
@@ -291,26 +292,33 @@ func (s *BaselineScope) resolvable(entry BaselineEntry) bool {
 // debt. Exact IDs win; two unique descriptor fallbacks cover anchor churn and
 // line shifts without ever guessing among ambiguous candidates. scope may be
 // nil; see BaselineScope for when it must not be.
-func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string, scope *BaselineScope) BaselineComparison {
-	current := baselineEntries(mutants, moduleRoot)
+func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string, scope *BaselineScope) (BaselineComparison, error) {
+	current, err := baselineEntries(mutants, moduleRoot)
+	if err != nil {
+		return BaselineComparison{}, err
+	}
 	baseMatch, currentMatch := unmatchedIndexes(len(b.Survivors), len(current))
 	matchExactIDs(b.Survivors, current, baseMatch, currentMatch)
 
-	fallbackMatchLocation(b.Survivors, current, baseMatch, currentMatch)
-	fallbackMatchStructure(b.Survivors, current, baseMatch, currentMatch)
+	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, locationOf)
+	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, structureOf)
 
 	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch, scope)
 	appendNewSurvivors(&c, current, mutants, currentMatch)
 	sortBaselineComparison(&c)
-	return c
+	return c, nil
 }
 
-func baselineEntries(mutants []mutator.Mutant, moduleRoot string) []BaselineEntry {
+func baselineEntries(mutants []mutator.Mutant, moduleRoot string) ([]BaselineEntry, error) {
 	current := make([]BaselineEntry, len(mutants))
 	for i, m := range mutants {
-		current[i] = baselineEntry(m, moduleRoot)
+		entry, err := baselineEntry(m, moduleRoot)
+		if err != nil {
+			return nil, err
+		}
+		current[i] = entry
 	}
-	return current
+	return current, nil
 }
 
 func unmatchedIndexes(baseLen, currentLen int) ([]int, []int) {
@@ -330,16 +338,51 @@ func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []
 	for i, entry := range current {
 		byID[entry.ID] = i
 	}
+	families := anchorFamilies(current)
 	for i, entry := range baseline {
-		// A repeated declaration such as init() can hand an old stable ID to
-		// newly inserted code. Trust the ID only while its structural mutation
-		// descriptor still agrees; otherwise leave both sides for the unique
-		// fallback passes below. This is conservative for edits to the mutant
-		// itself and prevents an ID collision from accepting new debt.
-		if j, ok := byID[entry.ID]; ok && currentMatch[j] == -1 && structureOf(entry) == structureOf(current[j]) {
-			baseMatch[i], currentMatch[j] = j, i
+		j, ok := byID[entry.ID]
+		if !ok || currentMatch[j] != -1 {
+			continue
 		}
+		// Trust the ID only while its structural mutation descriptor still
+		// agrees; otherwise leave both sides for the unique fallback passes
+		// below. This is conservative for edits to the mutant itself.
+		if structureOf(entry) != structureOf(current[j]) {
+			continue
+		}
+		// A repeated declaration such as init() is disambiguated by source
+		// order, so inserting one above the others hands an old stable ID to
+		// newly inserted code while the old mutant lives on under a shifted
+		// anchor. The descriptor check above cannot see that — both are the
+		// same kind of mutation in a same-named function — so inside such a
+		// family the ID is not evidence of identity at all. Fall through to
+		// the fallback passes: they still match a member that has not moved,
+		// by its exact position, and refuse the ambiguous bucket an insertion
+		// creates, which leaves the newcomer NEW.
+		if families[familyOf(entry)] > 1 {
+			continue
+		}
+		baseMatch[i], currentMatch[j] = j, i
 	}
+}
+
+// anchorFamilies counts the distinct anchors sharing each file and base
+// declaration name. A count above one means that file repeats a name, so its
+// anchors carry source-order suffixes that an insertion can shift.
+func anchorFamilies(entries []BaselineEntry) map[familyKey]int {
+	anchors := make(map[familyKey]map[string]struct{})
+	for _, entry := range entries {
+		key := familyOf(entry)
+		if anchors[key] == nil {
+			anchors[key] = make(map[string]struct{})
+		}
+		anchors[key][entry.Anchor] = struct{}{}
+	}
+	counts := make(map[familyKey]int, len(anchors))
+	for key, set := range anchors {
+		counts[key] = len(set)
+	}
+	return counts
 }
 
 func classifyBaselineMatches(baseline, current []BaselineEntry, mutants []mutator.Mutant, baseMatch []int, scope *BaselineScope) BaselineComparison {
@@ -419,10 +462,12 @@ func ApplyBaselineComparison(r *Report, comparison BaselineComparison) {
 	for fi := range r.Files {
 		for mi := range r.Files[fi].Mutations {
 			m := &r.Files[fi].Mutations[mi]
+			// else-if rather than two independent assignments: an ID in both
+			// sets would otherwise be relabelled NEW by whichever check runs
+			// last, turning accepted debt into a reported regression.
 			if _, ok := comparison.knownIDs[m.ID]; ok {
 				m.BaselineStatus = BaselineStatusKnown
-			}
-			if _, ok := comparison.newIDs[m.ID]; ok {
+			} else if _, ok := comparison.newIDs[m.ID]; ok {
 				m.BaselineStatus = BaselineStatusNew
 			}
 		}
@@ -442,44 +487,11 @@ func WriteBaseline(path string, b *Baseline) error {
 	if err := snapshot.Validate(); err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	if err := baselineMkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := newBaselineSink(dir, ".gomutants-baseline-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = baselineRemove(tmpName)
-		}
-	}()
+	return atomicfile.WriteJSON(path, baselineTmpPattern, "  ", &snapshot)
+}
 
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	encodeErr := enc.Encode(&snapshot)
-	closeErr := tmp.Close()
-	if encodeErr != nil {
-		return encodeErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	// CreateTemp is owner-only (0600); a baseline is committed project policy,
-	// not a secret, and is read by whichever account the next CI step runs as.
-	// Widen before the rename so the file is never briefly visible at the
-	// wrong mode under its final name.
-	if err := baselineChmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	if err := baselineRename(tmpName, path); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+type familyKey struct {
+	file, baseAnchor string
 }
 
 type locationKey struct {
@@ -488,75 +500,89 @@ type locationKey struct {
 }
 
 type structureKey struct {
-	file, typ, original, replacement string
+	file, baseAnchor, typ, original, replacement string
 }
 
-func fallbackMatchLocation(baseline, current []BaselineEntry, baseMatch, currentMatch []int) {
-	baseBuckets := make(map[locationKey][]int)
-	currentBuckets := make(map[locationKey][]int)
+// fallbackMatch pairs entries whose key is unique on both sides, leaving
+// everything else unmatched. Uniqueness is the whole safety property: a key
+// shared by two candidates says nothing about which one the accepted debt
+// belongs to, so neither is matched and an unmatched current survivor stays
+// NEW.
+func fallbackMatch[K comparable](baseline, current []BaselineEntry, baseMatch, currentMatch []int, key func(BaselineEntry) K) {
+	baseBuckets := make(map[K][]int)
+	currentBuckets := make(map[K][]int)
 	for i, entry := range baseline {
 		if baseMatch[i] < 0 {
-			baseBuckets[locationOf(entry)] = append(baseBuckets[locationOf(entry)], i)
+			k := key(entry)
+			baseBuckets[k] = append(baseBuckets[k], i)
 		}
 	}
 	for i, entry := range current {
 		if currentMatch[i] < 0 {
-			currentBuckets[locationOf(entry)] = append(currentBuckets[locationOf(entry)], i)
+			k := key(entry)
+			currentBuckets[k] = append(currentBuckets[k], i)
 		}
 	}
-	for key, bi := range baseBuckets {
-		ci := currentBuckets[key]
+	for k, bi := range baseBuckets {
+		ci := currentBuckets[k]
 		if len(bi) == 1 && len(ci) == 1 {
 			baseMatch[bi[0]], currentMatch[ci[0]] = ci[0], bi[0]
 		}
 	}
 }
 
-func fallbackMatchStructure(baseline, current []BaselineEntry, baseMatch, currentMatch []int) {
-	baseBuckets := make(map[structureKey][]int)
-	currentBuckets := make(map[structureKey][]int)
-	for i, entry := range baseline {
-		if baseMatch[i] < 0 {
-			baseBuckets[structureOf(entry)] = append(baseBuckets[structureOf(entry)], i)
-		}
-	}
-	for i, entry := range current {
-		if currentMatch[i] < 0 {
-			currentBuckets[structureOf(entry)] = append(currentBuckets[structureOf(entry)], i)
-		}
-	}
-	for key, bi := range baseBuckets {
-		ci := currentBuckets[key]
-		if len(bi) == 1 && len(ci) == 1 {
-			baseMatch[bi[0]], currentMatch[ci[0]] = ci[0], bi[0]
-		}
-	}
+func familyOf(e BaselineEntry) familyKey {
+	return familyKey{file: e.File, baseAnchor: baseAnchor(e.Anchor)}
 }
 
 func locationOf(e BaselineEntry) locationKey {
 	return locationKey{file: e.File, line: e.Line, column: e.Column, typ: e.Type, original: e.Original, replacement: e.Replacement}
 }
 
+// structureOf keys the line-shift fallback. It includes the enclosing
+// declaration, without which the key is bounded only by the file: deleting a
+// function and adding an unrelated one that happens to contain the same kind
+// of mutation would then match, and brand-new untested debt would inherit the
+// deleted function's accepted status. Anchored to the base name so the
+// suffix churn a repeated declaration produces does not defeat the match.
 func structureOf(e BaselineEntry) structureKey {
-	return structureKey{file: e.File, typ: e.Type, original: e.Original, replacement: e.Replacement}
+	return structureKey{file: e.File, baseAnchor: baseAnchor(e.Anchor), typ: e.Type, original: e.Original, replacement: e.Replacement}
+}
+
+// baseAnchor strips the source-order suffix a repeated declaration name
+// carries, so "init" and "init~2" share one family.
+func baseAnchor(anchor string) string {
+	base, _, _ := strings.Cut(anchor, mutator.AnchorRepeatSep)
+	return base
 }
 
 func sameLocation(a, b BaselineEntry) bool { return locationOf(a) == locationOf(b) }
 
-func baselineEntry(m mutator.Mutant, moduleRoot string) BaselineEntry {
-	file := m.RelFile
-	if rel, err := filepath.Rel(moduleRoot, m.File); err == nil {
-		file = filepath.ToSlash(rel)
+// baselineEntry renders one mutant in the baseline's own path space: relative
+// to the module root, always slash-separated.
+//
+// There is deliberately no fallback to mutator.Mutant.RelFile. RelFile strips
+// the longest common import-path prefix of the packages in the run, so it
+// names the same file differently under `./...` than under `./internal/a`.
+// Writing it into a baseline would key every entry in a path space the next
+// run does not share: nothing would match, every known survivor would be
+// reported as new, and the run would fail with a wall of false regressions.
+// An unrelatable path is a bug in the caller, so say so instead.
+func baselineEntry(m mutator.Mutant, moduleRoot string) (BaselineEntry, error) {
+	rel, err := filepath.Rel(moduleRoot, m.File)
+	if err != nil {
+		return BaselineEntry{}, fmt.Errorf("baseline entry %s: %s is not relative to module root %s: %w", m.StableID, m.File, moduleRoot, err)
 	}
 	return BaselineEntry{
 		ID:          m.StableID,
-		File:        file,
+		File:        filepath.ToSlash(rel),
+		Anchor:      m.Anchor,
 		Line:        m.Line,
 		Column:      m.Col,
 		Type:        string(m.Type),
 		Original:    m.Original,
 		Replacement: m.Replacement,
-	}
+	}, nil
 }
 
 func canonicalStrings(values []string) []string {

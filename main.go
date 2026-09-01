@@ -593,14 +593,20 @@ func run(ctx context.Context, args []string) error {
 	)
 	if cfg.Baseline != "" {
 		loadedBaseline, err = report.ReadBaseline(cfg.Baseline)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && baselineUpdate {
-				baselineBootstrap = true
-			} else if errors.Is(err, os.ErrNotExist) {
-				return usageErrorf("baseline %s does not exist; create it with --baseline-update", cfg.Baseline)
-			} else {
-				return usageError(err)
-			}
+		switch {
+		case err == nil:
+		case !errors.Is(err, os.ErrNotExist):
+			// A file that exists but will not parse — a merge left conflict
+			// markers, or a kill between CreateTemp and Rename truncated it —
+			// is not something --baseline-update can repair: rebuilding from
+			// this run would accept every current survivor as debt, which is
+			// the one thing the ratchet exists to prevent. Say what the
+			// recovery is instead of failing with advice that does not apply.
+			return usageErrorf("%w\nrestore %s from version control, or delete it and rebuild the accepted debt with --baseline-update", err, cfg.Baseline)
+		case baselineUpdate:
+			baselineBootstrap = true
+		default:
+			return usageErrorf("baseline %s does not exist; create it with --baseline-update", cfg.Baseline)
 		}
 		if loadedBaseline != nil {
 			if loadedBaseline.GoModule != goModule {
@@ -1021,12 +1027,18 @@ func run(ctx context.Context, args []string) error {
 	if cfg.Baseline != "" {
 		baselineForComparison := loadedBaseline
 		if baselineBootstrap {
-			baselineForComparison = report.NewBaseline(goModule, effectiveVersion(), baselinePolicy, mutants, projectDir)
+			baselineForComparison, err = report.NewBaseline(goModule, effectiveVersion(), baselinePolicy, mutants, projectDir)
+			if err != nil {
+				return err
+			}
 		}
 		// Scope the comparison to the packages this run actually resolved so a
 		// narrowed selection cannot report untouched debt as fixed and drop it.
 		scope := report.NewBaselineScope(projectDir, packageDirs(pkgs))
-		comparison := report.CompareBaseline(baselineForComparison, mutants, projectDir, scope)
+		comparison, err := report.CompareBaseline(baselineForComparison, mutants, projectDir, scope)
+		if err != nil {
+			return err
+		}
 		baselineComparison = &comparison
 		for _, fallback := range comparison.Fallbacks {
 			fmt.Fprintf(stderr, "gomutants: warning: baseline matched by %s after stable ID changed: %s -> %s\n",
@@ -1113,6 +1125,20 @@ func run(ctx context.Context, args []string) error {
 			err:  newBaselineSurvivorsError(cfg.Baseline, baselineComparison.New),
 		}
 	}
+	// The ratchet has now had its say: the run is complete and introduced no
+	// new debt, so the shrunk baseline is trustworthy. Write it before the
+	// score thresholds rather than after — mutant coverage is an independent
+	// question, and failing it would otherwise silently skip the update,
+	// leaving survivors the run proved fixed in the committed file forever.
+	if baselineUpdate {
+		next := report.UpdatedBaseline(goModule, effectiveVersion(), baselinePolicy, *baselineComparison)
+		if err := report.WriteBaseline(cfg.Baseline, next); err != nil {
+			return fmt.Errorf("writing baseline: %w", err)
+		}
+		if !cfg.Quiet {
+			fmt.Fprintf(stdout, "Baseline updated: %s (%d survivors)\n", cfg.Baseline, len(next.Survivors))
+		}
+	}
 	tested := r.MutantsKilled + r.MutantsLived
 	mcoverDenom := tested + r.MutantsNotCovered
 	mcover := 0.0
@@ -1138,15 +1164,6 @@ func run(ctx context.Context, args []string) error {
 				code: exitCodeMutantCoverage,
 				err:  fmt.Errorf("mutant coverage %.2f%% below --threshold-mcover=%.2f%% (test efficacy: %.2f%%)", mcover, thresholdMcover, r.TestEfficacy),
 			}
-		}
-	}
-	if baselineUpdate {
-		next := report.UpdatedBaseline(goModule, effectiveVersion(), baselinePolicy, *baselineComparison)
-		if err := report.WriteBaseline(cfg.Baseline, next); err != nil {
-			return fmt.Errorf("writing baseline: %w", err)
-		}
-		if !cfg.Quiet {
-			fmt.Fprintf(stdout, "Baseline updated: %s (%d survivors)\n", cfg.Baseline, len(next.Survivors))
 		}
 	}
 	return nil

@@ -24,6 +24,12 @@ mutation-report.json
 # Incremental-analysis cache
 .gomutants-cache.json
 
+# Atomic-write temp files. Both writers rename into place, but a run killed
+# between CreateTemp and Rename leaves one behind for `git add -A` to pick up.
+# The baseline itself is committed on purpose and is deliberately not listed.
+.gomutants-cache-*.tmp
+.gomutants-baseline-*.tmp
+
 # Dependency directories
 # vendor/
 
