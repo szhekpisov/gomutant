@@ -48,3 +48,6 @@ go.work.sum
 # Claude Code
 CLAUDE.md
 .claude/
+
+# Local competitive analysis (not tracked)
+COMPETITIVE-ANALYSIS.md
