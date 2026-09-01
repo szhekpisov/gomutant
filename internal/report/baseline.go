@@ -208,27 +208,39 @@ func (b *Baseline) Validate() error {
 	if strings.TrimSpace(b.GoModule) == "" {
 		return errors.New("go_module is empty")
 	}
+	// Uniqueness is the one invariant that spans entries, so it stays here
+	// with the map; everything an entry can be judged on alone lives in
+	// validateEntry.
 	seen := make(map[string]struct{}, len(b.Survivors))
 	for i, entry := range b.Survivors {
-		if entry.ID == "" {
-			return fmt.Errorf("survivors[%d].id is empty", i)
+		if err := validateEntry(i, entry); err != nil {
+			return err
 		}
 		if _, duplicate := seen[entry.ID]; duplicate {
 			return fmt.Errorf("duplicate survivor id %q", entry.ID)
 		}
 		seen[entry.ID] = struct{}{}
-		if entry.File == "" {
-			return fmt.Errorf("survivors[%d].file is empty", i)
-		}
-		if entry.Type == "" {
-			return fmt.Errorf("survivors[%d].type is empty", i)
-		}
-		if entry.Line <= 0 || entry.Column <= 0 {
-			return fmt.Errorf("survivors[%d] has invalid position %d:%d", i, entry.Line, entry.Column)
-		}
-		if entry.FamilySize < 0 {
-			return fmt.Errorf("survivors[%d] has invalid family_size %d", i, entry.FamilySize)
-		}
+	}
+	return nil
+}
+
+// validateEntry checks the invariants one survivor entry satisfies on its own.
+// i names the entry in the error the way the on-disk file indexes it.
+func validateEntry(i int, entry BaselineEntry) error {
+	if entry.ID == "" {
+		return fmt.Errorf("survivors[%d].id is empty", i)
+	}
+	if entry.File == "" {
+		return fmt.Errorf("survivors[%d].file is empty", i)
+	}
+	if entry.Type == "" {
+		return fmt.Errorf("survivors[%d].type is empty", i)
+	}
+	if entry.Line <= 0 || entry.Column <= 0 {
+		return fmt.Errorf("survivors[%d] has invalid position %d:%d", i, entry.Line, entry.Column)
+	}
+	if entry.FamilySize < 0 {
+		return fmt.Errorf("survivors[%d] has invalid family_size %d", i, entry.FamilySize)
 	}
 	return nil
 }
