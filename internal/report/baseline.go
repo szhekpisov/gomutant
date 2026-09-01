@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -38,8 +39,13 @@ type Baseline struct {
 // mutant universe or the tests used to classify it. Operational knobs such as
 // workers, cache path, and timeout margins deliberately stay out.
 type BaselinePolicy struct {
-	Packages         []string `json:"packages"`
-	Mutators         []string `json:"mutators"`
+	Packages []string `json:"packages"`
+	// Only and Disable record the user's mutator selection rather than the
+	// mutator set it resolved to. The resolved set grows whenever gomutants
+	// ships a new mutator, and fingerprinting it would make every such
+	// release a policy change — see Differences.
+	Only             []string `json:"only,omitempty"`
+	Disable          []string `json:"disable,omitempty"`
 	BuildTags        string   `json:"tags,omitempty"`
 	TestFlags        string   `json:"test_flags,omitempty"`
 	Integration      bool     `json:"integration,omitempty"`
@@ -78,6 +84,7 @@ type BaselineComparison struct {
 	New        []BaselineEntry
 	Resolved   []BaselineEntry
 	Unresolved []BaselineEntry
+	OutOfScope []BaselineEntry
 	Fallbacks  []BaselineFallback
 	Retained   []BaselineEntry
 
@@ -98,21 +105,26 @@ var (
 	}
 	baselineRemove = os.Remove
 	baselineRename = os.Rename
+	baselineChmod  = os.Chmod
 )
 
 // Canonical returns a deterministic policy representation for comparison and
 // serialization. All slices are copied, sorted, and deduplicated.
 func (p BaselinePolicy) Canonical() BaselinePolicy {
 	p.Packages = canonicalStrings(p.Packages)
-	p.Mutators = canonicalStrings(p.Mutators)
+	p.Only = canonicalStrings(p.Only)
+	p.Disable = canonicalStrings(p.Disable)
 	p.ExcludeFiles = canonicalStrings(p.ExcludeFiles)
 	p.ExcludeCalls = canonicalStrings(p.ExcludeCalls)
 	return p
 }
 
-// Differences names policy dimensions that differ. The generated tool
-// version is intentionally not policy: a baseline is meant to survive tool
-// upgrades, with descriptor fallback covering conservative ID migrations.
+// Differences names policy dimensions that differ. Neither the generated tool
+// version nor the mutator set it resolved is policy: a baseline is meant to
+// survive tool upgrades, with descriptor fallback covering conservative ID
+// migrations. A release that adds a mutator would otherwise fail every run
+// with a policy mismatch, and the suggested --baseline-update recovery would
+// itself be refused by the new-survivor gate the added mutator just tripped.
 func (p BaselinePolicy) Differences(other BaselinePolicy) []string {
 	p = p.Canonical()
 	other = other.Canonical()
@@ -120,8 +132,11 @@ func (p BaselinePolicy) Differences(other BaselinePolicy) []string {
 	if !slices.Equal(p.Packages, other.Packages) {
 		fields = append(fields, "packages")
 	}
-	if !slices.Equal(p.Mutators, other.Mutators) {
-		fields = append(fields, "mutators")
+	if !slices.Equal(p.Only, other.Only) {
+		fields = append(fields, "only")
+	}
+	if !slices.Equal(p.Disable, other.Disable) {
+		fields = append(fields, "disable")
 	}
 	if p.BuildTags != other.BuildTags {
 		fields = append(fields, "tags")
@@ -226,10 +241,57 @@ func UpdatedBaseline(goModule, generatedBy string, policy BaselinePolicy, compar
 	}
 }
 
+// BaselineScope names the package directories a run actually examined, as
+// module-relative slash paths. A run that asks for fewer packages than the
+// baseline covers generates no mutants for the rest, so an unmatched entry
+// there means "never looked", not "fixed" — resolving it would erase accepted
+// debt for packages nothing inspected. The scope is what lets the comparison
+// tell those two apart. A nil scope disables the distinction and treats every
+// unmatched entry as resolved; only tests and callers that genuinely ran the
+// whole module should pass one.
+type BaselineScope struct {
+	moduleRoot string
+	dirs       map[string]struct{}
+}
+
+// NewBaselineScope builds a scope from the absolute package directories a run
+// resolved. Directories outside moduleRoot are dropped: nothing under them can
+// match a module-relative entry anyway.
+func NewBaselineScope(moduleRoot string, pkgDirs []string) *BaselineScope {
+	s := &BaselineScope{moduleRoot: moduleRoot, dirs: make(map[string]struct{}, len(pkgDirs))}
+	for _, dir := range pkgDirs {
+		rel, err := filepath.Rel(moduleRoot, dir)
+		// A ".." prefix means dir escaped the module root. Match the
+		// separator too, so a real directory named "..cache" still counts.
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		s.dirs[filepath.ToSlash(rel)] = struct{}{}
+	}
+	return s
+}
+
+// resolvable reports whether an unmatched baseline entry may be dropped as
+// fixed. Entries in an examined package always may: the run had its chance to
+// produce them. For the rest, only a source file that no longer exists proves
+// the debt is gone — a deleted package must still shrink the baseline, while
+// untouched code this run never asked about must not.
+func (s *BaselineScope) resolvable(entry BaselineEntry) bool {
+	if s == nil {
+		return true
+	}
+	if _, ok := s.dirs[path.Dir(entry.File)]; ok {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(s.moduleRoot, filepath.FromSlash(entry.File)))
+	return errors.Is(err, os.ErrNotExist)
+}
+
 // CompareBaseline matches the completed mutant set against known survivor
 // debt. Exact IDs win; two unique descriptor fallbacks cover anchor churn and
-// line shifts without ever guessing among ambiguous candidates.
-func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) BaselineComparison {
+// line shifts without ever guessing among ambiguous candidates. scope may be
+// nil; see BaselineScope for when it must not be.
+func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string, scope *BaselineScope) BaselineComparison {
 	current := baselineEntries(mutants, moduleRoot)
 	baseMatch, currentMatch := unmatchedIndexes(len(b.Survivors), len(current))
 	matchExactIDs(b.Survivors, current, baseMatch, currentMatch)
@@ -237,7 +299,7 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string) B
 	fallbackMatchLocation(b.Survivors, current, baseMatch, currentMatch)
 	fallbackMatchStructure(b.Survivors, current, baseMatch, currentMatch)
 
-	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch)
+	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch, scope)
 	appendNewSurvivors(&c, current, mutants, currentMatch)
 	sortBaselineComparison(&c)
 	return c
@@ -280,7 +342,7 @@ func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []
 	}
 }
 
-func classifyBaselineMatches(baseline, current []BaselineEntry, mutants []mutator.Mutant, baseMatch []int) BaselineComparison {
+func classifyBaselineMatches(baseline, current []BaselineEntry, mutants []mutator.Mutant, baseMatch []int, scope *BaselineScope) BaselineComparison {
 	c := BaselineComparison{
 		knownIDs: make(map[string]struct{}),
 		newIDs:   make(map[string]struct{}),
@@ -288,6 +350,11 @@ func classifyBaselineMatches(baseline, current []BaselineEntry, mutants []mutato
 	for i, entry := range baseline {
 		j := baseMatch[i]
 		if j < 0 {
+			if !scope.resolvable(entry) {
+				c.OutOfScope = append(c.OutOfScope, entry)
+				c.Retained = append(c.Retained, entry)
+				continue
+			}
 			c.Resolved = append(c.Resolved, entry)
 			continue
 		}
@@ -332,6 +399,7 @@ func sortBaselineComparison(c *BaselineComparison) {
 	sortBaselineEntries(c.New)
 	sortBaselineEntries(c.Resolved)
 	sortBaselineEntries(c.Unresolved)
+	sortBaselineEntries(c.OutOfScope)
 	sortBaselineEntries(c.Retained)
 	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="baseline survivor IDs are unique by validation, so < and <= differ only for an unreachable equal-ID comparison"
 	sort.Slice(c.Fallbacks, func(i, j int) bool { return c.Fallbacks[i].OldID < c.Fallbacks[j].OldID })
@@ -400,8 +468,13 @@ func WriteBaseline(path string, b *Baseline) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	// CreateTemp uses owner-only permissions. Keeping that secure default also
-	// avoids a window where a partially written baseline is broadly readable.
+	// CreateTemp is owner-only (0600); a baseline is committed project policy,
+	// not a secret, and is read by whichever account the next CI step runs as.
+	// Widen before the rename so the file is never briefly visible at the
+	// wrong mode under its final name.
+	if err := baselineChmod(tmpName, 0o644); err != nil {
+		return err
+	}
 	if err := baselineRename(tmpName, path); err != nil {
 		return err
 	}

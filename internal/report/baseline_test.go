@@ -41,7 +41,7 @@ func TestCompareBaselineClassifiesAndRetainsInconclusive(t *testing.T) {
 		baselineMutant(root, "p.go:F:ARITHMETIC_BASE#4", 40, mutator.StatusLived),
 	}
 
-	got := CompareBaseline(b, current, root)
+	got := CompareBaseline(b, current, root, nil)
 	if len(got.Known) != 1 || got.Known[0].ID != "p.go:F:ARITHMETIC_BASE#1" {
 		t.Fatalf("Known=%v, want #1", got.Known)
 	}
@@ -87,7 +87,7 @@ func TestCompareBaselineSortsEveryResultAndPopulatesReportIDs(t *testing.T) {
 		mutant("a-new", 11, mutator.StatusLived),
 	}
 
-	got := CompareBaseline(b, current, root)
+	got := CompareBaseline(b, current, root, nil)
 	ids := func(entries []BaselineEntry) []string {
 		out := make([]string, len(entries))
 		for i, entry := range entries {
@@ -125,14 +125,14 @@ func TestCompareBaselineFallbacksAreConservative(t *testing.T) {
 	}, root)
 
 	rename := baselineMutant(root, "p.go:New:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
-	got := CompareBaseline(b, []mutator.Mutant{rename}, root)
+	got := CompareBaseline(b, []mutator.Mutant{rename}, root, nil)
 	if len(got.Known) != 1 || len(got.New) != 0 || len(got.Fallbacks) != 1 || got.Fallbacks[0].Kind != "location" {
 		t.Fatalf("rename comparison=%+v, want one location fallback known survivor", got)
 	}
 
 	lineShift := rename
 	lineShift.Line = 25
-	got = CompareBaseline(b, []mutator.Mutant{lineShift}, root)
+	got = CompareBaseline(b, []mutator.Mutant{lineShift}, root, nil)
 	if len(got.Known) != 1 || len(got.New) != 0 || len(got.Fallbacks) != 1 || got.Fallbacks[0].Kind != "structure" {
 		t.Fatalf("line-shift comparison=%+v, want one structure fallback known survivor", got)
 	}
@@ -145,7 +145,7 @@ func TestCompareBaselineFallbacksAreConservative(t *testing.T) {
 			baselineEntry(baselineMutant(root, "p.go:B:ARITHMETIC_BASE#1", 15, mutator.StatusLived), root),
 		},
 	}
-	got = CompareBaseline(ambiguous, []mutator.Mutant{lineShift}, root)
+	got = CompareBaseline(ambiguous, []mutator.Mutant{lineShift}, root, nil)
 	if len(got.New) != 1 || len(got.Known) != 0 || len(got.Fallbacks) != 0 {
 		t.Fatalf("ambiguous comparison=%+v, want fail-safe new survivor", got)
 	}
@@ -165,7 +165,7 @@ func TestCompareBaselineSortsFallbacks(t *testing.T) {
 	newA.StableID, newA.Line = "a-new", 40
 	newM.StableID, newM.Line = "m-new", 50
 
-	got := CompareBaseline(b, []mutator.Mutant{newZ, newA, newM}, root)
+	got := CompareBaseline(b, []mutator.Mutant{newZ, newA, newM}, root, nil)
 	if len(got.Fallbacks) != 3 || got.Fallbacks[0].OldID != "a-old" ||
 		got.Fallbacks[1].OldID != "m-old" || got.Fallbacks[2].OldID != "z-old" {
 		t.Fatalf("Fallbacks=%+v, want sorted by old ID", got.Fallbacks)
@@ -180,7 +180,7 @@ func TestCompareBaselineNeedsLocationFallbackWhenStructureIsAmbiguous(t *testing
 	newA.StableID, newB.StableID = "new-a", "new-b"
 	b := &Baseline{Survivors: baselineEntries([]mutator.Mutant{oldA, oldB}, root)}
 
-	got := CompareBaseline(b, []mutator.Mutant{newA, newB}, root)
+	got := CompareBaseline(b, []mutator.Mutant{newA, newB}, root, nil)
 	if len(got.Known) != 2 || len(got.New) != 0 || len(got.Fallbacks) != 2 {
 		t.Fatalf("comparison=%+v, want two unique location fallbacks", got)
 	}
@@ -273,7 +273,7 @@ func TestCompareBaselineReassignedExactIDDoesNotStealOldMutation(t *testing.T) {
 	movedOld.StableID = "p.go:init~2:ARITHMETIC_BASE#1"
 	movedOld.Line = 20
 
-	got := CompareBaseline(b, []mutator.Mutant{inserted, movedOld}, root)
+	got := CompareBaseline(b, []mutator.Mutant{inserted, movedOld}, root, nil)
 	if len(got.Known) != 1 || got.Known[0].ID != movedOld.StableID || len(got.New) != 0 {
 		t.Fatalf("comparison=%+v, want the moved old mutation matched and no new survivor", got)
 	}
@@ -287,7 +287,7 @@ func TestCompareBaselineDoesNotMatchOneCurrentMutantTwice(t *testing.T) {
 	current := baselineMutant(root, "duplicate-id", 10, mutator.StatusLived)
 	entry := baselineEntry(current, root)
 	b := &Baseline{Survivors: []BaselineEntry{entry, entry}}
-	got := CompareBaseline(b, []mutator.Mutant{current}, root)
+	got := CompareBaseline(b, []mutator.Mutant{current}, root, nil)
 	if len(got.Known) != 1 || len(got.Resolved) != 1 {
 		t.Fatalf("comparison=%+v, want one known and one unmatched baseline entry", got)
 	}
@@ -296,7 +296,7 @@ func TestCompareBaselineDoesNotMatchOneCurrentMutantTwice(t *testing.T) {
 func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 	p := BaselinePolicy{
 		Packages:     []string{"./b", "./a", "./a"},
-		Mutators:     []string{"B", "A", "A"},
+		Only:         []string{"B", "A", "A"},
 		ExcludeFiles: []string{"z/**", "a/**", "a/**"},
 		ExcludeCalls: []string{"log.*", "fmt.Print*"},
 	}
@@ -304,29 +304,29 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 	if !slices.Equal(canonical.Packages, []string{"./a", "./b"}) {
 		t.Fatalf("Packages=%v", canonical.Packages)
 	}
-	if !slices.Equal(canonical.Mutators, []string{"A", "B"}) ||
+	if !slices.Equal(canonical.Only, []string{"A", "B"}) ||
 		!slices.Equal(canonical.ExcludeFiles, []string{"a/**", "z/**"}) ||
 		!slices.Equal(canonical.ExcludeCalls, []string{"fmt.Print*", "log.*"}) {
 		t.Fatalf("canonical policy=%+v", canonical)
 	}
 	if diff := p.Differences(BaselinePolicy{
 		Packages:     []string{"./b", "./a"},
-		Mutators:     []string{"A", "B"},
+		Only:         []string{"A", "B"},
 		ExcludeFiles: []string{"z/**", "a/**"},
 		ExcludeCalls: []string{"fmt.Print*", "log.*"},
 	}); len(diff) != 0 {
 		t.Fatalf("equivalent policies differ: %v", diff)
 	}
-	p.Packages[0], p.Mutators[0], p.ExcludeFiles[0], p.ExcludeCalls[0] = "changed", "changed", "changed", "changed"
+	p.Packages[0], p.Only[0], p.ExcludeFiles[0], p.ExcludeCalls[0] = "changed", "changed", "changed", "changed"
 	if !slices.Equal(canonical.Packages, []string{"./a", "./b"}) ||
-		!slices.Equal(canonical.Mutators, []string{"A", "B"}) ||
+		!slices.Equal(canonical.Only, []string{"A", "B"}) ||
 		!slices.Equal(canonical.ExcludeFiles, []string{"a/**", "z/**"}) ||
 		!slices.Equal(canonical.ExcludeCalls, []string{"fmt.Print*", "log.*"}) {
 		t.Fatalf("Canonical aliases its input: %+v", canonical)
 	}
 
 	base := BaselinePolicy{
-		Packages: []string{"./..."}, Mutators: []string{"A"}, BuildTags: "tag", TestFlags: "-short",
+		Packages: []string{"./..."}, Only: []string{"A"}, Disable: []string{"D"}, BuildTags: "tag", TestFlags: "-short",
 		Integration: true, CoverPkg: "./...", DetectEquivalent: true,
 		ExcludeFiles: []string{"vendor/**"}, ExcludeCalls: []string{"fmt.Print*"},
 	}
@@ -335,7 +335,8 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 		change func(*BaselinePolicy)
 	}{
 		{"packages", func(p *BaselinePolicy) { p.Packages = []string{"./other"} }},
-		{"mutators", func(p *BaselinePolicy) { p.Mutators = []string{"B"} }},
+		{"only", func(p *BaselinePolicy) { p.Only = []string{"B"} }},
+		{"disable", func(p *BaselinePolicy) { p.Disable = []string{"E"} }},
 		{"tags", func(p *BaselinePolicy) { p.BuildTags = "other" }},
 		{"test-flags", func(p *BaselinePolicy) { p.TestFlags = "-run TestOne" }},
 		{"integration", func(p *BaselinePolicy) { p.Integration = false }},
@@ -405,7 +406,7 @@ func TestNewAndUpdatedBaselineCanonicalizeSortAndClone(t *testing.T) {
 	}
 
 	comparison := BaselineComparison{Retained: []BaselineEntry{{ID: "z"}, {ID: "a"}}}
-	updated := UpdatedBaseline("example.com/p", "v2", BaselinePolicy{Mutators: []string{"Z", "A"}}, comparison)
+	updated := UpdatedBaseline("example.com/p", "v2", BaselinePolicy{Only: []string{"Z", "A"}}, comparison)
 	comparison.Retained[0].ID = "changed"
 	if updated.SchemaVersion != BaselineSchemaVersion || updated.GoModule != "example.com/p" || updated.GeneratedBy != "v2" {
 		t.Fatalf("updated baseline metadata=%+v", updated)
@@ -413,8 +414,8 @@ func TestNewAndUpdatedBaselineCanonicalizeSortAndClone(t *testing.T) {
 	if got := []string{updated.Survivors[0].ID, updated.Survivors[1].ID}; !slices.Equal(got, []string{"a", "z"}) {
 		t.Fatalf("updated baseline survivors=%v", got)
 	}
-	if !slices.Equal(updated.Policy.Mutators, []string{"A", "Z"}) {
-		t.Fatalf("updated baseline policy=%v", updated.Policy.Mutators)
+	if !slices.Equal(updated.Policy.Only, []string{"A", "Z"}) {
+		t.Fatalf("updated baseline policy=%v", updated.Policy.Only)
 	}
 }
 
@@ -510,9 +511,9 @@ var errBaselineIO = errors.New("baseline I/O sentinel")
 
 func resetBaselineIOHooks(t *testing.T) {
 	t.Helper()
-	mkdirAll, newSink, remove, rename := baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename
+	mkdirAll, newSink, remove, rename, chmod := baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename, baselineChmod
 	t.Cleanup(func() {
-		baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename = mkdirAll, newSink, remove, rename
+		baselineMkdirAll, newBaselineSink, baselineRemove, baselineRename, baselineChmod = mkdirAll, newSink, remove, rename, chmod
 	})
 }
 
@@ -610,8 +611,17 @@ func TestWriteBaselineSuccessDoesNotRunFailureCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("baseline permissions=%#o, want owner-only", info.Mode().Perm())
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("baseline permissions=%#o, want world-readable committed policy", info.Mode().Perm())
+	}
+}
+
+func TestWriteBaselinePropagatesChmodError(t *testing.T) {
+	resetBaselineIOHooks(t)
+	baselineChmod = func(string, os.FileMode) error { return errBaselineIO }
+	err := WriteBaseline(filepath.Join(t.TempDir(), "baseline.json"), validBaselineForWrite())
+	if !errors.Is(err, errBaselineIO) {
+		t.Fatalf("err=%v, want %v", err, errBaselineIO)
 	}
 }
 
@@ -642,5 +652,71 @@ func TestApplyBaselineComparisonClassifiesReport(t *testing.T) {
 	got := r.Files[0].Mutations
 	if got[0].BaselineStatus != BaselineStatusKnown || got[1].BaselineStatus != BaselineStatusNew || got[2].BaselineStatus != "" {
 		t.Fatalf("mutation classifications=%+v", got)
+	}
+}
+
+func TestCompareBaselineRetainsSurvivorsOutsideTheRunScope(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "other", "q.go"), []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inScope := baselineMutant(root, "kept:in-scope", 10, mutator.StatusLived)
+	outOfScope := baselineMutant(root, "kept:out-of-scope", 20, mutator.StatusLived)
+	outOfScope.File = filepath.Join(root, "other", "q.go")
+	b := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{inScope, outOfScope}, root)
+
+	// The narrowed rerun resolves only the root package, and its one mutant
+	// is now killed. The other package was never examined.
+	killed := baselineMutant(root, "kept:in-scope", 10, mutator.StatusKilled)
+	scope := NewBaselineScope(root, []string{root})
+	got := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+
+	if len(got.Resolved) != 1 || got.Resolved[0].ID != "kept:in-scope" {
+		t.Fatalf("Resolved=%v, want only the examined package's fixed survivor", got.Resolved)
+	}
+	if len(got.OutOfScope) != 1 || got.OutOfScope[0].ID != "kept:out-of-scope" {
+		t.Fatalf("OutOfScope=%v, want the unexamined package's survivor", got.OutOfScope)
+	}
+	if len(got.Retained) != 1 || got.Retained[0].ID != "kept:out-of-scope" {
+		t.Fatalf("Retained=%v: a narrowed run must not drop unexamined debt", got.Retained)
+	}
+	if len(got.New) != 0 {
+		t.Fatalf("New=%v, want none", got.New)
+	}
+
+	// Deleting the unexamined package's source proves the debt is gone, so
+	// the same narrowed run must now shrink the baseline to nothing.
+	if err := os.Remove(filepath.Join(root, "other", "q.go")); err != nil {
+		t.Fatal(err)
+	}
+	deleted := CompareBaseline(b, []mutator.Mutant{killed}, root, scope)
+	if len(deleted.Resolved) != 2 || len(deleted.Retained) != 0 {
+		t.Fatalf("Resolved=%v Retained=%v: a deleted file must still resolve", deleted.Resolved, deleted.Retained)
+	}
+}
+
+func TestNewBaselineScopeIgnoresDirectoriesOutsideTheModule(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a", "p.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scope := NewBaselineScope(root, []string{root, filepath.Join(root, "a", "b"), filepath.Dir(root)})
+	if len(scope.dirs) != 2 {
+		t.Fatalf("scope dirs=%v, want only the two directories inside the module", scope.dirs)
+	}
+	if !scope.resolvable(BaselineEntry{File: "main.go"}) || !scope.resolvable(BaselineEntry{File: "a/b/p.go"}) {
+		t.Fatal("entries in a resolved package must stay resolvable")
+	}
+	if scope.resolvable(BaselineEntry{File: "a/p.go"}) {
+		t.Fatal("an existing file in an unexamined directory must not be resolvable")
+	}
+	if !scope.resolvable(BaselineEntry{File: "a/gone.go"}) {
+		t.Fatal("a file that no longer exists must be resolvable even unexamined")
 	}
 }

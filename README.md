@@ -366,6 +366,21 @@ ratchet attempts a unique source-descriptor match and prints the old and new IDs
 as a warning. It never guesses among ambiguous candidates; an unmatched current
 survivor remains `NEW` and fails safely.
 
+The file records the settings that define the mutant universe — packages,
+`--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`
+and the exclusion patterns. A run whose settings differ from the committed ones
+is rejected until you rerun with `--baseline-update` to migrate the file
+deliberately. The gomutants version is not part of that fingerprint, and neither
+is the mutator set it resolves to: upgrading to a release that ships a new
+mutator is not a policy change, so it surfaces as ordinary new survivor debt
+rather than as a rejected run.
+
+Every comparison is scoped to the packages the run actually resolved, so
+narrowing the selection is safe: survivors in packages the run never examined
+are retained verbatim, with a warning, instead of being read as fixed. Deleting
+the code is the one thing that still shrinks them — an entry whose source file
+no longer exists is resolved whether or not the run looked at its package.
+
 Ratchet mode requires a full comparable run, so it cannot be combined with
 `--changed-since`, `--run-mutant-id`, or `--dry-run`. It also conflicts with
 `--threshold-efficacy`, whose absolute score would reject the known debt;

@@ -586,7 +586,7 @@ func run(ctx context.Context, args []string) error {
 	// stale policy file is configuration, not a mutation result, and should
 	// fail cheaply. A missing file is accepted only for the explicit bootstrap
 	// operation --baseline-update.
-	baselinePolicy := baselinePolicyFor(packages, enabledMutators, &cfg)
+	baselinePolicy := baselinePolicyFor(packages, &cfg)
 	var (
 		loadedBaseline    *report.Baseline
 		baselineBootstrap bool
@@ -1023,11 +1023,17 @@ func run(ctx context.Context, args []string) error {
 		if baselineBootstrap {
 			baselineForComparison = report.NewBaseline(goModule, effectiveVersion(), baselinePolicy, mutants, projectDir)
 		}
-		comparison := report.CompareBaseline(baselineForComparison, mutants, projectDir)
+		// Scope the comparison to the packages this run actually resolved so a
+		// narrowed selection cannot report untouched debt as fixed and drop it.
+		scope := report.NewBaselineScope(projectDir, packageDirs(pkgs))
+		comparison := report.CompareBaseline(baselineForComparison, mutants, projectDir, scope)
 		baselineComparison = &comparison
 		for _, fallback := range comparison.Fallbacks {
 			fmt.Fprintf(stderr, "gomutants: warning: baseline matched by %s after stable ID changed: %s -> %s\n",
 				fallback.Kind, fallback.OldID, fallback.NewID)
+		}
+		if n := len(comparison.OutOfScope); n > 0 {
+			fmt.Fprintf(stderr, "gomutants: warning: %d baseline survivor(s) live outside this run's packages and were retained unchanged\n", n)
 		}
 	}
 
@@ -1148,14 +1154,19 @@ func run(ctx context.Context, args []string) error {
 
 // baselinePolicyFor captures the semantic surface against which a committed
 // baseline was created. Sorting is handled by BaselinePolicy.Canonical.
-func baselinePolicyFor(packages []string, enabled []mutator.Mutator, cfg *config.Config) report.BaselinePolicy {
-	mutators := make([]string, len(enabled))
-	for i, m := range enabled {
-		mutators[i] = string(m.Type())
+// The mutator selection is recorded as the user wrote it, not as the set it
+// resolves to, so upgrading to a gomutants that ships a new mutator is not a
+// policy change. --only wins over --disable in EnabledMutators, so a
+// no-op --disable is left out rather than fingerprinted.
+func baselinePolicyFor(packages []string, cfg *config.Config) report.BaselinePolicy {
+	only, disable := slices.Clone(cfg.Only), slices.Clone(cfg.Disable)
+	if len(only) > 0 {
+		disable = nil
 	}
 	return report.BaselinePolicy{
 		Packages:         slices.Clone(packages),
-		Mutators:         mutators,
+		Only:             only,
+		Disable:          disable,
 		BuildTags:        cfg.Tags,
 		TestFlags:        cfg.CanonicalTestFlags(),
 		Integration:      cfg.Integration,
@@ -1164,6 +1175,16 @@ func baselinePolicyFor(packages []string, enabled []mutator.Mutator, cfg *config
 		ExcludeFiles:     slices.Clone(cfg.ExcludeFiles),
 		ExcludeCalls:     cfg.ResolvedExcludeCalls(),
 	}.Canonical()
+}
+
+// packageDirs collects the absolute directories a run resolved, for
+// report.NewBaselineScope.
+func packageDirs(pkgs []discover.Package) []string {
+	dirs := make([]string, len(pkgs))
+	for i, p := range pkgs {
+		dirs[i] = p.Dir
+	}
+	return dirs
 }
 
 func newBaselineSurvivorsError(path string, entries []report.BaselineEntry) error {

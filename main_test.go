@@ -2657,3 +2657,131 @@ func TestEmbedFilesByDir(t *testing.T) {
 		t.Errorf("got[\"/m/a\"] = %v, want both embed inputs", got["/m/a"])
 	}
 }
+
+// TestBaselinePolicyForRecordsUserMutatorSelection pins that the fingerprint
+// carries the mutator flags as written, not the set they resolve to: a release
+// that ships a new mutator must not read as a policy change and reject every
+// run with exit 2.
+func TestBaselinePolicyForRecordsUserMutatorSelection(t *testing.T) {
+	cfg := config.Config{Disable: []string{"INVERT_NEGATIVES", "ARITHMETIC_BASE"}}
+	policy := baselinePolicyFor([]string{"./..."}, &cfg)
+	if !slices.Equal(policy.Disable, []string{"ARITHMETIC_BASE", "INVERT_NEGATIVES"}) || len(policy.Only) != 0 {
+		t.Fatalf("policy=%+v, want the --disable list only", policy)
+	}
+	if diff := policy.Differences(baselinePolicyFor([]string{"./..."}, &cfg)); len(diff) != 0 {
+		t.Fatalf("identical config differs in %v", diff)
+	}
+
+	// --only wins over --disable in EnabledMutators, so a --disable that
+	// changes nothing must not be fingerprinted either.
+	only := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"ARITHMETIC_BASE"}}
+	onlyPolicy := baselinePolicyFor([]string{"./..."}, &only)
+	if !slices.Equal(onlyPolicy.Only, []string{"CONDITIONALS_BOUNDARY"}) || len(onlyPolicy.Disable) != 0 {
+		t.Fatalf("policy=%+v, want --only recorded and the inert --disable dropped", onlyPolicy)
+	}
+	changed := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"INVERT_NEGATIVES"}}
+	if diff := onlyPolicy.Differences(baselinePolicyFor([]string{"./..."}, &changed)); len(diff) != 0 {
+		t.Fatalf("inert --disable change differs in %v", diff)
+	}
+}
+
+// TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope pins the data-loss
+// guard: an update that asks for fewer packages than the committed baseline
+// covers must retain the debt it never examined instead of reading "no current
+// mutant" as "fixed".
+func TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"go.mod":          "module testmod\n\ngo 1.26\n",
+		"add.go":          "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go":     "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
+		"sub/sub.go":      "package sub\n\nfunc Mul(a, b int) int { return a + b }\n",
+		"sub/sub_test.go": "package sub\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(1, 2) }\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(orig)
+
+	baselinePath := filepath.Join(dir, ".gomutants-baseline.json")
+	baseArgs := []string{"--baseline", baselinePath, "--cache=off", "--only", "ARITHMETIC_BASE", "-w", "1"}
+	bootstrap := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "first.json"), "./...")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), bootstrap) }); err != nil {
+		t.Fatalf("bootstrap baseline: %v", err)
+	}
+	b, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Survivors) != 2 {
+		t.Fatalf("bootstrapped survivors=%d, want one per package", len(b.Survivors))
+	}
+
+	// Narrow the update to the root package. The sub package is never
+	// examined, so its accepted survivor must survive the rewrite.
+	narrowed := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "second.json"), "testmod")
+	stderr, err := captureStderr(t, func() error { return run(context.Background(), narrowed) })
+	if err != nil {
+		t.Fatalf("narrowed update: %v", err)
+	}
+	if !strings.Contains(stderr, "outside this run's packages") {
+		t.Fatalf("stderr=%q, want a retained-out-of-scope warning", stderr)
+	}
+	after, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Survivors) != 2 {
+		t.Fatalf("narrowed update left %d survivors, want both: unexamined debt was erased", len(after.Survivors))
+	}
+	var kept bool
+	for _, entry := range after.Survivors {
+		kept = kept || strings.HasPrefix(entry.File, "sub/")
+	}
+	if !kept {
+		t.Fatalf("survivors=%+v, want the sub package entry retained", after.Survivors)
+	}
+
+	// The update rewrote the policy to the narrowed package set, so the next
+	// narrowed run no longer sees a policy change. Scoping must still hold.
+	repeat := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "third.json"), "testmod")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), repeat) }); err != nil {
+		t.Fatalf("repeat narrowed update: %v", err)
+	}
+	again, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Survivors) != 2 {
+		t.Fatalf("repeat narrowed update left %d survivors, want both", len(again.Survivors))
+	}
+
+	// Deleting the package the narrowed run never examines is the one thing
+	// that may shrink it: the accepted debt is genuinely gone.
+	if err := os.RemoveAll(filepath.Join(dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	deleteArgs := append(slices.Clone(baseArgs), "--baseline-update", "-o", filepath.Join(dir, "fourth.json"), "testmod")
+	if _, err := captureOutput(t, func() error { return run(context.Background(), deleteArgs) }); err != nil {
+		t.Fatalf("update after deleting the sub package: %v", err)
+	}
+	shrunk, err := report.ReadBaseline(baselinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shrunk.Survivors) != 1 {
+		t.Fatalf("survivors=%d after deleting the sub package, want only the root entry", len(shrunk.Survivors))
+	}
+}
