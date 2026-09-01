@@ -1287,6 +1287,15 @@ func simpleModule() map[string]string {
 	}
 }
 
+// twoPackageModule adds a subpackage with its own surviving mutant, so a case
+// can exclude one package's only production file and leave the other alone.
+func twoPackageModule() map[string]string {
+	m := simpleModule()
+	m["gen/gen.go"] = "package gen\n\nfunc Mul(a, b int) int { return a * b }\n"
+	m["gen/gen_test.go"] = "package gen\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(2, 3) }\n"
+	return m
+}
+
 func TestRunBaselineBootstrapKnownAndNewSurvivor(t *testing.T) {
 	f := newBaselineFixture(t, simpleModule())
 	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
@@ -1413,6 +1422,67 @@ func TestRunBaselineUpdateRefusesAnEmptyDiscovery(t *testing.T) {
 		t.Fatalf("error=%v, want it to name the empty discovery", err)
 	}
 	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
+}
+
+// TestRunBaselineFailsWhenTheRunWasCancelled pins that a truncated run cannot
+// report a passing ratchet. Mutants the pool never reached stay PENDING rather
+// than LIVED, so the new-survivor gate sees an empty set and would exit 0 — a
+// CI step killed at its time limit after testing a fraction of the mutants
+// would go green claiming no new debt.
+func TestRunBaselineFailsWhenTheRunWasCancelled(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Cancel the way a step timeout does: after the setup phases, so the run
+	// reaches the pool and returns from it with every mutant untested.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origBuildTestMap := buildTestMapFunc
+	t.Cleanup(func() { buildTestMapFunc = origBuildTestMap })
+	buildTestMapFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string, workers int) (*coverage.TestMap, error) {
+		m, err := origBuildTestMap(ctx, projectDir, packages, coverPkg, tags, tmpDir, workers)
+		cancel()
+		return m, err
+	}
+
+	_, err := captureStderr(t, func() error {
+		return run(ctx, f.args("cancelled", "--baseline-update", "testmod"))
+	})
+	if err == nil {
+		t.Fatal("cancelled run returned nil: a run that measured nothing must not pass the ratchet")
+	}
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "run cancelled") {
+		t.Fatalf("error=%v, want it to name the cancellation", err)
+	}
+	if got := f.readReport(t, "cancelled"); got.Baseline == nil {
+		t.Fatal("the partial report must still be written: it is the record of what the run did measure")
+	}
+}
+
+// TestRunBaselineUpdateResolvesDebtUnderNewlyExcludedFiles pins that
+// --exclude-files is policy, not blindness. ApplyExcludes drops a package it
+// empties of production files, so scoping the ratchet to what it returns would
+// leave that package's accepted debt unmatchable: retained forever, warned
+// about on every run, and unremovable even by an update.
+func TestRunBaselineUpdateResolvesDebtUnderNewlyExcludedFiles(t *testing.T) {
+	f := newBaselineFixture(t, twoPackageModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "./..."))
+	f.survivors(t, 2, "bootstrap")
+
+	out, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("excluded", "--baseline-update", "--exclude-files", "gen/", "./..."))
+	})
+	if err != nil {
+		t.Fatalf("excluded run: %v", err)
+	}
+	if strings.Contains(out, "outside this run's packages") {
+		t.Fatalf("stderr=%q, want no out-of-scope warning for a deliberate exclusion", out)
+	}
+	got := f.survivors(t, 1, "the excluded package's debt was pinned")
+	if got[0].File != "add.go" {
+		t.Fatalf("survivor=%+v, want only the unexcluded package's debt", got[0])
+	}
 }
 
 // TestRunBaselineUnreadableFileIsNotBootstrapped pins that a corrupt baseline
@@ -2830,5 +2900,31 @@ func TestBaselinePolicyForRecordsUserMutatorSelection(t *testing.T) {
 	changed := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"INVERT_NEGATIVES"}}
 	if diff := onlyPolicy.Differences(baselinePolicyFor([]string{"./..."}, &changed)); len(diff) != 0 {
 		t.Fatalf("inert --disable change differs in %v", diff)
+	}
+}
+
+// TestBaselinePolicyForRecordsUserExcludeCalls pins the same property for call
+// exclusion: the built-in stdlib-logging set grows between releases, so
+// fingerprinting the resolved list would reject every committed baseline with
+// exit 2 on upgrade, with no user-authored config change anywhere.
+func TestBaselinePolicyForRecordsUserExcludeCalls(t *testing.T) {
+	cfg := config.Config{ExcludeCalls: []string{"mypkg.Trace"}}
+	policy := baselinePolicyFor([]string{"./..."}, &cfg)
+	if !slices.Equal(policy.ExcludeCalls, []string{"mypkg.Trace"}) {
+		t.Fatalf("ExcludeCalls=%v, want the user's pattern alone", policy.ExcludeCalls)
+	}
+	if got := cfg.ResolvedExcludeCalls(); len(got) <= len(policy.ExcludeCalls) {
+		t.Fatalf("resolved list=%v, want it to carry built-in defaults this test can drift against", got)
+	}
+	if policy.ExcludeCallsNoDefaults {
+		t.Fatal("ExcludeCallsNoDefaults=true, want the built-ins recorded as on")
+	}
+
+	// Switching the built-ins off is the user's own decision, so it is policy.
+	off := false
+	without := config.Config{ExcludeCalls: []string{"mypkg.Trace"}, ExcludeCallsDefaults: &off}
+	diff := policy.Differences(baselinePolicyFor([]string{"./..."}, &without))
+	if !slices.Equal(diff, []string{"exclude-calls-defaults"}) {
+		t.Fatalf("differences=%v, want exactly the defaults toggle", diff)
 	}
 }

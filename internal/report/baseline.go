@@ -56,7 +56,16 @@ type BaselinePolicy struct {
 	CoverPkg         string   `json:"coverpkg,omitempty"`
 	DetectEquivalent bool     `json:"detect_equivalent,omitempty"`
 	ExcludeFiles     []string `json:"exclude_files,omitempty"`
-	ExcludeCalls     []string `json:"exclude_calls,omitempty"`
+	// ExcludeCalls records the user's own call-exclusion patterns, not the
+	// list they resolve to. That list is prefixed with gomutants' built-in
+	// stdlib-logging set, which grows between releases, so fingerprinting it
+	// would make every such release a policy change that rejects every
+	// committed baseline with exit 2 — exactly what Only and Disable above
+	// avoid for the mutator set. Switching the built-ins off is the user's
+	// decision, so that is recorded, inverted so the default reads as an
+	// absent field.
+	ExcludeCalls           []string `json:"exclude_calls,omitempty"`
+	ExcludeCallsNoDefaults bool     `json:"exclude_calls_no_defaults,omitempty"`
 }
 
 // BaselineEntry carries the stable ID plus enough source identity to recover
@@ -166,6 +175,9 @@ func (p BaselinePolicy) Differences(other BaselinePolicy) []string {
 	}
 	if !slices.Equal(p.ExcludeCalls, other.ExcludeCalls) {
 		fields = append(fields, "exclude-calls")
+	}
+	if p.ExcludeCallsNoDefaults != other.ExcludeCallsNoDefaults {
+		fields = append(fields, "exclude-calls-defaults")
 	}
 	return fields
 }

@@ -92,6 +92,25 @@ func TestWriteJSONIndentsWhenAsked(t *testing.T) {
 	}
 }
 
+// TestWriteJSONWritesOperatorsLiterally pins that the encoder's HTML escaping
+// is off. These files are read by people and by diff tools, and their payloads
+// are mutation records: with escaping on, every <, > and & in an operator is
+// spelled <, > and &, which is most of what a committed
+// baseline's entries contain.
+func TestWriteJSONWritesOperatorsLiterally(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.json")
+	if err := WriteJSON(path, tmpPattern, "", payload{Name: "a < b && c > d"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "{\"name\":\"a < b && c > d\"}\n"; string(data) != want {
+		t.Fatalf("encoded=%q, want %q", data, want)
+	}
+}
+
 func TestWriteJSONLeavesNoTempFileBehind(t *testing.T) {
 	dir := t.TempDir()
 	if err := write(t, filepath.Join(dir, "out.json")); err != nil {

@@ -359,7 +359,11 @@ verdict: a run that introduces no new debt writes the shrunk file even when
 `--threshold-mcover` then fails it. `KILLED`, `EQUIVALENT`, and
 `NOT VIABLE` entries are removed by a successful update; `NOT COVERED`,
 `TIMED OUT`, and `INFRA ERROR` entries are retained because those outcomes do
-not prove the old survivor was fixed. An update is refused outright when the
+not prove the old survivor was fixed. A run that is interrupted — Ctrl-C, or a
+CI step hitting its time limit — fails with exit 1 instead of reporting its
+truncated result: the mutants it never reached are not survivors, and a gate
+that read them as an absence of new debt would pass a run that measured almost
+nothing. An update is refused outright when the
 run discovered no mutants at all — a typo in `--only` or an over-broad
 `--exclude-files` would otherwise rewrite the committed file as empty. The file
 is schema-versioned, sorted, and replaced atomically, so it is suitable for
@@ -386,16 +390,22 @@ The file records the settings that define the mutant universe — packages,
 `--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`
 and the exclusion patterns. A run whose settings differ from the committed ones
 is rejected until you rerun with `--baseline-update` to migrate the file
-deliberately. The gomutants version is not part of that fingerprint, and neither
-is the mutator set it resolves to: upgrading to a release that ships a new
-mutator is not a policy change, so it surfaces as ordinary new survivor debt
-rather than as a rejected run.
+deliberately. What it records is what you wrote, not what that resolves to: the
+gomutants version is not part of the fingerprint, and neither is the mutator set
+`--only`/`--disable` select nor the built-in call-exclusion set your
+`exclude-calls` entries extend. Upgrading to a release that ships a new mutator
+or a new built-in exclusion is therefore not a policy change — it surfaces as
+ordinary new survivor debt rather than as a rejected run. Switching the built-in
+exclusions off is your decision, so that is recorded.
 
 Every comparison is scoped to the packages the run actually resolved, so
 narrowing the selection is safe: survivors in packages the run never examined
 are retained verbatim, with a warning, instead of being read as fixed. Deleting
 the code is the one thing that still shrinks them — an entry whose source file
 no longer exists is resolved whether or not the run looked at its package.
+`--exclude-files` shrinks them too: it is in the fingerprint, so excluding a
+path takes a deliberate `--baseline-update`, and the debt under it is dropped
+rather than pinned as unexamined.
 
 Ratchet mode requires a full comparable run, so it cannot be combined with
 `--changed-since`, `--run-mutant-id`, or `--dry-run`. It also conflicts with

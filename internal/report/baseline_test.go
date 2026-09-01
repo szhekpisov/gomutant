@@ -690,6 +690,7 @@ func TestBaselinePolicyCanonicalAndDifferences(t *testing.T) {
 		{"detect-equivalent", func(p *BaselinePolicy) { p.DetectEquivalent = false }},
 		{"exclude-files", func(p *BaselinePolicy) { p.ExcludeFiles = []string{"generated/**"} }},
 		{"exclude-calls", func(p *BaselinePolicy) { p.ExcludeCalls = []string{"log.*"} }},
+		{"exclude-calls-defaults", func(p *BaselinePolicy) { p.ExcludeCallsNoDefaults = true }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {

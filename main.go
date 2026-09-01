@@ -630,6 +630,15 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The ratchet's scope is the selection the run resolved, captured before
+	// exclusion narrows it. --exclude-files is policy, not blindness — it is
+	// in the baseline fingerprint, so changing it already forces a deliberate
+	// --baseline-update — and debt under a newly excluded path must resolve
+	// there. ApplyExcludes drops a package it empties of production files, so
+	// scoping to what it returns would instead leave those entries
+	// unmatchable and out of scope: retained forever, with a warning on every
+	// run, and unremovable even by an update.
+	baselineScopeDirs := packageDirs(pkgs)
 	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, excluder, projectDir)
 	if hasher != nil {
 		// Feed the cache's pkg_hash the //go:embed inputs go list resolved
@@ -1045,8 +1054,9 @@ func run(ctx context.Context, args []string) error {
 			}
 		}
 		// Scope the comparison to the packages this run actually resolved so a
-		// narrowed selection cannot report untouched debt as fixed and drop it.
-		scope := report.NewBaselineScope(projectDir, packageDirs(pkgs))
+		// narrowed selection cannot report untouched debt as fixed and drop
+		// it. See baselineScopeDirs for why exclusion is not such a narrowing.
+		scope := report.NewBaselineScope(projectDir, baselineScopeDirs)
 		comparison, err := report.CompareBaseline(baselineForComparison, mutants, projectDir, scope)
 		if err != nil {
 			return err
@@ -1118,6 +1128,16 @@ func run(ctx context.Context, args []string) error {
 	// mutants fall out the same way, but unlike EQUIVALENT they represent a
 	// *missing* measurement, so the run warns before evaluating the gates.
 	warnInfraErrors(stderr, r)
+	// A cancelled run — Ctrl-C, or a CI step hitting its time limit — stops
+	// testing wherever it got to and leaves the rest of its mutants PENDING,
+	// not LIVED. Every gate below would then read the truncated result as a
+	// pass: the ratchet in particular would report no new survivors for a run
+	// that measured almost nothing, and it is the gate that replaces
+	// --threshold-efficacy in CI. The reports above are already written, so
+	// the partial results are kept; only the verdict is refused.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("run cancelled after %d of %d mutants: %w", r.MutantsKilled+r.MutantsLived, len(mutants), err)
+	}
 	// --run-mutant-id exists to answer one question — "did the test I just
 	// wrote kill this mutant?" — from an exit code. Every status other than
 	// KILLED and LIVED leaves that unanswered, and the gates below would
@@ -1202,7 +1222,11 @@ func baselinePolicyFor(packages []string, cfg *config.Config) report.BaselinePol
 		CoverPkg:         cfg.CoverPkg,
 		DetectEquivalent: cfg.DetectEquivalentEnabled(),
 		ExcludeFiles:     slices.Clone(cfg.ExcludeFiles),
-		ExcludeCalls:     cfg.ResolvedExcludeCalls(),
+		// The user's own patterns, not ResolvedExcludeCalls: the resolved list
+		// carries the built-in defaults, so a release that adds one to them
+		// would differ from every committed baseline. See BaselinePolicy.
+		ExcludeCalls:           slices.Clone(cfg.ExcludeCalls),
+		ExcludeCallsNoDefaults: !cfg.ExcludeCallsDefaultsEnabled(),
 	}.Canonical()
 }
 

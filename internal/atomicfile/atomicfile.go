@@ -87,6 +87,11 @@ func WriteJSON(path, tmpPattern, indent string, v any) error {
 	// would silently produce a bogus file.
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", indent)
+	// These files are read by people and by diff tools, never embedded in a
+	// web page. Go escapes <, > and & by default, which is exactly the set a
+	// mutation record is made of: a committed baseline would spell every
+	// comparison and logical operator <, > and &.
+	enc.SetEscapeHTML(false)
 	encodeErr := enc.Encode(v)
 	closeErr := tmp.Close()
 	if encodeErr != nil {
