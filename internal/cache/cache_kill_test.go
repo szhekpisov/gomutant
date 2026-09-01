@@ -515,8 +515,6 @@ func TestUpdate_SortPrecedence(t *testing.T) {
 // What remains here is the one decision Save still makes for itself: an empty
 // path is a no-op, because --cache=off leaves nothing to write.
 
-var errSentinel = errors.New("sentinel I/O failure")
-
 func TestSave_EmptyPathWritesNothing(t *testing.T) {
 	dir := t.TempDir()
 	if err := Save(&Cache{SchemaVersion: SchemaVersion}, ""); err != nil {

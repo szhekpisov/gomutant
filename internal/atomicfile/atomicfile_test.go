@@ -51,10 +51,30 @@ func TestWriteJSONRoundTripsThroughParentDirsAtSharedMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != Mode {
-		// CreateTemp is owner-only; without the chmod both artifacts land at
-		// 0600 and a later step running as another account cannot read them.
-		t.Fatalf("permissions=%#o, want %#o", info.Mode().Perm(), Mode)
+	// Spelled out rather than compared against Mode: asserting a constant
+	// against itself holds for any value the constant could drift to, and
+	// CreateTemp's owner-only default is exactly the drift that matters.
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("permissions=%#o, want 0644: neither artifact is a secret, and a later step may run as another account", info.Mode().Perm())
+	}
+}
+
+// TestWriteJSONCreatesParentDirsGroupAndWorldExecutable pins the mode
+// WriteJSON asks MkdirAll for. A directory the owner alone can enter hides a
+// world-readable file just as effectively as an owner-only file does, so the
+// two modes have to agree.
+func TestWriteJSONCreatesParentDirsGroupAndWorldExecutable(t *testing.T) {
+	resetHooks(t)
+	var got os.FileMode
+	osMkdirAll = func(_ string, mode os.FileMode) error {
+		got = mode
+		return errSentinel
+	}
+	if err := write(t, filepath.Join(t.TempDir(), "nested", "out.json")); !errors.Is(err, errSentinel) {
+		t.Fatalf("err=%v, want sentinel", err)
+	}
+	if got != 0o755 {
+		t.Fatalf("MkdirAll mode=%#o, want 0755", got)
 	}
 }
 
