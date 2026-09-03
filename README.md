@@ -372,9 +372,9 @@ for version control.
 
 Stable IDs normally survive line shifts and edits to other functions. For the
 documented churn cases—such as a renamed function or an inserted `init()`—the
-ratchet attempts a unique source-descriptor match and prints the old and new IDs
-as a warning. Both fallbacks stay anchored to the enclosing declaration, so a
-mutant that loses its position *and* its function is left unmatched: that is
+ratchet attempts a unique source-descriptor match and prints the old and new
+IDs as a warning. Both fallbacks stay anchored to the enclosing declaration, so
+a mutant that loses its position *and* its function is left unmatched: that is
 indistinguishable from deleting one function and adding another that happens to
 contain the same kind of mutation. Repeated declaration names — several
 `init()`s in one file — are disambiguated by source order, so each entry also
@@ -384,8 +384,16 @@ included. Adding such a declaration reassigns the suffixes, so the ratchet
 falls back to matching by position or by a unique descriptor; removing one
 additionally stops debt migrating between the remaining namesakes, so a
 namesake that regresses is reported as `NEW` rather than inheriting the deleted
-declaration's accepted status. The ratchet never guesses among ambiguous
-candidates; an unmatched current survivor remains `NEW` and fails safely.
+declaration's accepted status. An ID's trailing `#N` is disambiguated the same
+way, one level down — mutation points are numbered in source order within a
+declaration — so each entry also records how many mutants shared its exact
+descriptor. Adding or removing an identical mutation point renumbers the rest,
+and there the descriptor check cannot tell the accepted debt from its twin, so
+that count is what keeps a renumbered survivor from inheriting a deleted one's
+accepted status. A differently shaped mutation leaves it alone: a wrong pairing
+would have to defeat the descriptor check too. The ratchet never guesses among
+ambiguous candidates; an unmatched current survivor remains `NEW` and fails
+safely.
 
 The file records the settings that define the mutant universe — packages,
 `--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`

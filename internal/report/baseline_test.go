@@ -273,7 +273,7 @@ func TestFallbackMatchPairsOnlyUniqueKeys(t *testing.T) {
 	cases := []struct {
 		name                    string
 		byStructure             bool
-		skipFamilies            map[familyKey]struct{}
+		skip                    func(BaselineEntry) bool
 		baseline, current       []BaselineEntry
 		baseMatch, currentMatch []int
 		wantBase, wantCurrent   []int
@@ -325,13 +325,13 @@ func TestFallbackMatchPairsOnlyUniqueKeys(t *testing.T) {
 			wantCurrent: []int{-1},
 		},
 		{
-			name:         "structure: a skipped family is withheld even when unique",
-			byStructure:  true,
-			baseline:     []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10)},
-			current:      []BaselineEntry{baselineTestEntry("new", "p.go", "+", 30)},
-			skipFamilies: map[familyKey]struct{}{{file: "p.go"}: {}},
-			wantBase:     []int{-1},
-			wantCurrent:  []int{-1},
+			name:        "structure: a skipped entry is withheld even when unique",
+			byStructure: true,
+			baseline:    []BaselineEntry{baselineTestEntry("one", "p.go", "+", 10)},
+			current:     []BaselineEntry{baselineTestEntry("new", "p.go", "+", 30)},
+			skip:        func(e BaselineEntry) bool { return e.File == "p.go" },
+			wantBase:    []int{-1},
+			wantCurrent: []int{-1},
 		},
 		{
 			name:        "structure: two current entries on one key match nothing",
@@ -350,7 +350,7 @@ func TestFallbackMatchPairsOnlyUniqueKeys(t *testing.T) {
 				baseMatch, currentMatch = unmatchedIndexes(len(tc.baseline), len(tc.current))
 			}
 			if tc.byStructure {
-				fallbackMatch(tc.baseline, tc.current, baseMatch, currentMatch, structureOf, tc.skipFamilies)
+				fallbackMatch(tc.baseline, tc.current, baseMatch, currentMatch, structureOf, tc.skip)
 			} else {
 				fallbackMatch(tc.baseline, tc.current, baseMatch, currentMatch, locationOf, nil)
 			}
@@ -538,14 +538,15 @@ func TestCompareBaselineMigratesAnIDChurnInsideAStableRepeatedFamily(t *testing.
 }
 
 // TestCompareBaselineTrustsALegacyEntryOutsideARepeatedFamily pins the
-// compatibility path: an entry from a baseline written before family sizes
-// were recorded has nothing to compare, so it falls back to trusting the ID
-// wherever the run's family is not repeated. Here nothing else can do the job
-// — the mutant moved, and its new sibling makes the descriptor ambiguous.
+// compatibility path: an entry from a baseline written before the population
+// counts were recorded has nothing to compare, so it falls back to trusting
+// the ID wherever the run's family is not repeated. Here nothing else can do
+// the job — the mutant moved, and its new sibling makes the descriptor
+// ambiguous.
 func TestCompareBaselineTrustsALegacyEntryOutsideARepeatedFamily(t *testing.T) {
 	root := t.TempDir()
 	entry := mustEntry(t, baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 10, mutator.StatusLived), root)
-	entry.FamilySize = 0
+	entry.FamilySize, entry.SiblingCount = 0, 0
 	b := &Baseline{Survivors: []BaselineEntry{entry}}
 
 	moved := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 20, mutator.StatusLived)
@@ -572,7 +573,7 @@ func TestCompareBaselineTrustsALegacyEntryOutsideARepeatedFamily(t *testing.T) {
 func TestCompareBaselineDistrustsALegacyEntryInsideARepeatedFamily(t *testing.T) {
 	root := t.TempDir()
 	entry := mustEntry(t, baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 30, mutator.StatusLived), root)
-	entry.FamilySize = 0
+	entry.FamilySize, entry.SiblingCount = 0, 0
 	b := &Baseline{Survivors: []BaselineEntry{entry}}
 
 	// A second init() above the first takes the bare anchor and survives; the
@@ -586,6 +587,102 @@ func TestCompareBaselineDistrustsALegacyEntryInsideARepeatedFamily(t *testing.T)
 	}
 	if len(got.Known) != 0 || len(got.New) != 1 || got.New[0].ID != inserted.StableID {
 		t.Fatalf("comparison=%+v, want the inserted survivor reported as new debt", got)
+	}
+}
+
+// TestCompareBaselineDoesNotInheritADeletedSiblingsDebt is the ordinal
+// counterpart of the deleted-namesake case: the declaration survives, one of
+// its two identical mutation points does not, and the survivor inherits the
+// deleted point's `#1`. Every other check agrees — same ID, same file, same
+// anchor, same descriptor, one declaration named F both times — so only the
+// recorded population of that descriptor separates a renumbered point from
+// the accepted debt it now impersonates.
+func TestCompareBaselineDoesNotInheritADeletedSiblingsDebt(t *testing.T) {
+	root := t.TempDir()
+	// F holds two `+`. The first survives and becomes accepted debt; the
+	// second is killed, but the baseline still records that F held two.
+	first := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
+	second := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#2", 20, mutator.StatusKilled)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{first, second}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Survivors) != 1 || b.Survivors[0].SiblingCount != 2 {
+		t.Fatalf("survivors=%+v, want the one survivor recording two same-descriptor mutants", b.Survivors)
+	}
+
+	// The first `+` is deleted, so the second renumbers to #1 — and the same
+	// edit costs it the test that killed it.
+	regressed := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 14, mutator.StatusLived)
+
+	got, err := CompareBaseline(b, []mutator.Mutant{regressed}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 0 || len(got.New) != 1 || got.New[0].ID != regressed.StableID {
+		t.Fatalf("comparison=%+v, want the renumbered survivor reported as new debt", got)
+	}
+	if len(got.Resolved) != 1 || got.Resolved[0].ID != first.StableID {
+		t.Fatalf("Resolved=%+v, want the deleted mutation point resolved", got.Resolved)
+	}
+}
+
+// TestCompareBaselineWithholdsAShrunkFamilyWithIntactDescriptors keeps the two
+// withholding rules independent. The deleted namesake carried a differently
+// shaped mutation, so every descriptor population is the same before and
+// after and only the family count records that something went — the entry
+// must still be withheld from the descriptor pass.
+func TestCompareBaselineWithholdsAShrunkFamilyWithIntactDescriptors(t *testing.T) {
+	root := t.TempDir()
+	first := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
+	second := baselineMutant(root, "p.go:init~2:ARITHMETIC_BASE#1", 20, mutator.StatusKilled)
+	second.Original, second.Replacement = "*", "/"
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{first, second}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Survivors) != 1 || b.Survivors[0].FamilySize != 2 || b.Survivors[0].SiblingCount != 1 {
+		t.Fatalf("survivors=%+v, want a family of two holding one `+` mutant", b.Survivors)
+	}
+
+	// The second init() is deleted; the survivor keeps its ID and shifts up.
+	moved := baselineMutant(root, "p.go:init:ARITHMETIC_BASE#1", 4, mutator.StatusLived)
+
+	got, err := CompareBaseline(b, []mutator.Mutant{moved}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 0 || len(got.New) != 1 || got.New[0].ID != moved.StableID {
+		t.Fatalf("comparison=%+v, want the survivor left unmatched by the withheld family", got)
+	}
+}
+
+// TestCompareBaselineGuardsOrdinalsPerDescriptor pins that the ordinal guard
+// stays narrow. A mutation point of the same type but a different shape is
+// added to F, which renumbers F's ARITHMETIC_BASE ordinals; the accepted
+// debt's own descriptor population is unchanged, and a wrong pairing would
+// have to defeat the descriptor check anyway, so the ordinary line-shift
+// match still holds.
+func TestCompareBaselineGuardsOrdinalsPerDescriptor(t *testing.T) {
+	root := t.TempDir()
+	survivor := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 10, mutator.StatusLived)
+	b, err := NewBaseline("example.com/p", "v1", BaselinePolicy{}, []mutator.Mutant{survivor}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A `*` is added above the `+`, taking #1 and shifting the survivor down
+	// to #2 and onto a later line.
+	added := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#1", 8, mutator.StatusKilled)
+	added.Original, added.Replacement = "*", "/"
+	moved := baselineMutant(root, "p.go:F:ARITHMETIC_BASE#2", 12, mutator.StatusLived)
+
+	got, err := CompareBaseline(b, []mutator.Mutant{added, moved}, root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Known) != 1 || got.Known[0].ID != moved.StableID || len(got.New) != 0 {
+		t.Fatalf("comparison=%+v, want the renumbered debt still known", got)
 	}
 }
 
@@ -728,6 +825,7 @@ func TestBaselineValidateRejectsEveryInvalidField(t *testing.T) {
 		{"zero column", "invalid position", func(b *Baseline) { b.Survivors[0].Column = 0 }},
 		{"negative column", "invalid position", func(b *Baseline) { b.Survivors[0].Column = -1 }},
 		{"negative family size", "invalid family_size", func(b *Baseline) { b.Survivors[0].FamilySize = -1 }},
+		{"negative sibling count", "invalid sibling_count", func(b *Baseline) { b.Survivors[0].SiblingCount = -1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1044,35 +1142,38 @@ func TestNewBaselineScopeIgnoresDirectoriesOutsideTheModule(t *testing.T) {
 // before the entries whose ID must be. F's two mutants are the load-bearing
 // assertion: they share a structure key and both moved, so neither fallback
 // can recover them and only the exact ID can. Anything that stops the walk
-// early, or that widens the repeated-family guard to cover them, loses both.
+// early, or that widens the repeated-family or renumbered-ordinal guard to
+// cover them, loses both.
 func TestMatchExactIDsWalksTheWholeBaseline(t *testing.T) {
 	root := t.TempDir()
-	entry := func(id, original, replacement string, line int) BaselineEntry {
-		m := baselineMutant(root, id, line, mutator.StatusLived)
-		m.Original, m.Replacement = original, replacement
-		return mustEntry(t, m, root)
-	}
-	b := &Baseline{Survivors: []BaselineEntry{
-		// Deleted outright: its ID is absent from the run.
-		entry("p.go:Gone:ARITHMETIC_BASE#1", "+", "-", 5),
-		// Same ID, different mutation: the ID was reused by an edit.
-		entry("p.go:Changed:ARITHMETIC_BASE#1", "+", "-", 15),
-		// Same ID, but a second init() shifted the family's suffixes.
-		entry("p.go:init:ARITHMETIC_BASE#1", "+", "-", 25),
-		// Same IDs, moved, structurally indistinguishable from each other.
-		entry("p.go:F:ARITHMETIC_BASE#1", "+", "-", 30),
-		entry("p.go:F:ARITHMETIC_BASE#2", "+", "-", 31),
-	}}
-
 	mutant := func(id, original, replacement string, line int) mutator.Mutant {
 		m := baselineMutant(root, id, line, mutator.StatusLived)
 		m.Original, m.Replacement = original, replacement
 		return m
 	}
+	// Stamped as one set, the way the run that wrote them would have: the
+	// population counts an entry carries are taken over its whole run, so
+	// rendering them one at a time would understate F's pair.
+	b := &Baseline{Survivors: mustEntries(t, []mutator.Mutant{
+		// Deleted outright: its ID is absent from the run.
+		mutant("p.go:Gone:ARITHMETIC_BASE#1", "+", "-", 5),
+		// Same ID, different mutation: the ID was reused by an edit.
+		mutant("p.go:Changed:ARITHMETIC_BASE#1", "+", "-", 15),
+		// Same ID, but a second init() shifted the family's suffixes.
+		mutant("p.go:init:ARITHMETIC_BASE#1", "+", "-", 25),
+		// Same ID, but Twin lost one of its two identical mutation points,
+		// so the ordinal that survived names the other one now.
+		mutant("p.go:Twin:ARITHMETIC_BASE#1", "+", "-", 26),
+		mutant("p.go:Twin:ARITHMETIC_BASE#2", "+", "-", 27),
+		// Same IDs, moved, structurally indistinguishable from each other.
+		mutant("p.go:F:ARITHMETIC_BASE#1", "+", "-", 30),
+		mutant("p.go:F:ARITHMETIC_BASE#2", "+", "-", 31),
+	}, root)}
 	current := []mutator.Mutant{
 		mutant("p.go:Changed:ARITHMETIC_BASE#1", "*", "/", 15),
 		mutant("p.go:init:ARITHMETIC_BASE#1", "+", "-", 1),
 		mutant("p.go:init~2:ARITHMETIC_BASE#1", "+", "-", 40),
+		mutant("p.go:Twin:ARITHMETIC_BASE#1", "+", "-", 50),
 		mutant("p.go:F:ARITHMETIC_BASE#1", "+", "-", 60),
 		mutant("p.go:F:ARITHMETIC_BASE#2", "+", "-", 61),
 	}
@@ -1088,8 +1189,8 @@ func TestMatchExactIDsWalksTheWholeBaseline(t *testing.T) {
 	if !slices.Equal(known, []string{"p.go:F:ARITHMETIC_BASE#1", "p.go:F:ARITHMETIC_BASE#2"}) {
 		t.Fatalf("Known=%v, want exactly F's two mutants matched by exact ID", known)
 	}
-	if len(got.Resolved) != 3 || len(got.New) != 3 {
-		t.Fatalf("Resolved=%v New=%v, want the three untrusted entries resolved and their three candidates new", got.Resolved, got.New)
+	if len(got.Resolved) != 5 || len(got.New) != 4 {
+		t.Fatalf("Resolved=%v New=%v, want the five untrusted entries resolved and their four candidates new", got.Resolved, got.New)
 	}
 }
 

@@ -88,12 +88,23 @@ type BaselineEntry struct {
 	// whose anchors have been reassigned. Zero means "not recorded": baselines
 	// written before this field existed, which matchExactIDs handles
 	// conservatively.
-	FamilySize  int    `json:"family_size,omitempty"`
-	Line        int    `json:"line"`
-	Column      int    `json:"column"`
-	Type        string `json:"type"`
-	Original    string `json:"original,omitempty"`
-	Replacement string `json:"replacement,omitempty"`
+	FamilySize int `json:"family_size,omitempty"`
+	// SiblingCount is how many mutants — this one included — shared this
+	// entry's whole descriptor when the entry was written: same file, same
+	// declaration family, same type, original, and replacement. That is
+	// exactly the set neither an equal ID nor an equal descriptor can tell
+	// apart. Ordinals are assigned in source order across a declaration's
+	// mutants of one type, so deleting or inserting one hands this entry's
+	// `#N` to a different mutation point, and when that point carries the
+	// same descriptor nothing else in the entry notices. Comparing this count
+	// with the next run's is what does. Zero means "not recorded": see
+	// stableSiblings.
+	SiblingCount int    `json:"sibling_count,omitempty"`
+	Line         int    `json:"line"`
+	Column       int    `json:"column"`
+	Type         string `json:"type"`
+	Original     string `json:"original,omitempty"`
+	Replacement  string `json:"replacement,omitempty"`
 }
 
 // BaselineFallback describes one non-ID match. Callers surface these on
@@ -242,6 +253,9 @@ func validateEntry(i int, entry BaselineEntry) error {
 	if entry.FamilySize < 0 {
 		return fmt.Errorf("survivors[%d] has invalid family_size %d", i, entry.FamilySize)
 	}
+	if entry.SiblingCount < 0 {
+		return fmt.Errorf("survivors[%d] has invalid sibling_count %d", i, entry.SiblingCount)
+	}
 	return nil
 }
 
@@ -254,10 +268,10 @@ func NewBaseline(goModule, generatedBy string, policy BaselinePolicy, mutants []
 		Policy:        policy.Canonical(),
 	}
 	// Entries are rendered for the whole run, not just the survivors, so that
-	// every FamilySize counts the declarations the run actually saw. Counting
-	// only the survivors would undercount any family whose other members were
-	// killed, and the next run — which counts over its own full mutant set —
-	// would read that undercount as a declaration having been removed.
+	// every FamilySize and SiblingCount is taken over what the run actually
+	// saw. Counting only the survivors would undercount any group whose other
+	// members were killed, and the next run — which counts over its own full
+	// mutant set — would read that undercount as a removal.
 	entries, err := baselineEntries(mutants, moduleRoot)
 	if err != nil {
 		return nil, err
@@ -345,12 +359,12 @@ func CompareBaseline(b *Baseline, mutants []mutator.Mutant, moduleRoot string, s
 	matchExactIDs(b.Survivors, current, baseMatch, currentMatch)
 
 	// Position is evidence no edit can forge, so the location pass runs
-	// against every unmatched entry. The structure pass matches by base name
+	// against every unmatched entry. The structure pass matches by descriptor
 	// alone, which is exactly what makes it able to hand a deleted
-	// declaration's accepted debt to a surviving namesake, so it skips the
-	// families that lost a member.
+	// declaration's — or a deleted mutation point's — accepted debt to a
+	// surviving lookalike, so it skips the groups that lost a member.
 	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, locationOf, nil)
-	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, structureOf, shrunkFamilies(b.Survivors, current))
+	fallbackMatch(b.Survivors, current, baseMatch, currentMatch, structureOf, churnedGroups(b.Survivors, current))
 
 	c := classifyBaselineMatches(b.Survivors, current, mutants, baseMatch, scope)
 	appendNewSurvivors(&c, current, mutants, currentMatch)
@@ -367,18 +381,33 @@ func baselineEntries(mutants []mutator.Mutant, moduleRoot string) ([]BaselineEnt
 		}
 		current[i] = entry
 	}
-	stampFamilySizes(current)
+	stampCounts(current)
 	return current, nil
 }
 
-// stampFamilySizes records on every entry how many distinct declarations in
-// its file share its declaration name, so the count travels into the committed
-// baseline and can be compared with the next run's.
-func stampFamilySizes(entries []BaselineEntry) {
+// stampCounts records on every entry the two population counts a later run
+// compares against its own: how many distinct declarations in its file share
+// its declaration name, and how many mutants in its declaration share its
+// mutation descriptor. Both travel into the committed baseline because
+// neither can be recovered from the entry alone.
+func stampCounts(entries []BaselineEntry) {
 	families := anchorFamilies(entries)
+	siblings := siblingCounts(entries)
 	for i := range entries {
 		entries[i].FamilySize = families[familyOf(entries[i])]
+		entries[i].SiblingCount = siblings[structureOf(entries[i])]
 	}
+}
+
+// siblingCounts counts the mutants sharing each descriptor — the buckets the
+// structure fallback pairs within, and the mutants an ordinal is all that
+// separates.
+func siblingCounts(entries []BaselineEntry) map[structureKey]int {
+	counts := make(map[structureKey]int, len(entries))
+	for _, entry := range entries {
+		counts[structureOf(entry)]++
+	}
+	return counts
 }
 
 func unmatchedIndexes(baseLen, currentLen int) ([]int, []int) {
@@ -412,6 +441,9 @@ func matchExactIDs(baseline, current []BaselineEntry, baseMatch, currentMatch []
 		if !stableFamily(entry, current[j]) {
 			continue
 		}
+		if !stableSiblings(entry, current[j]) {
+			continue
+		}
 		baseMatch[i], currentMatch[j] = j, i
 	}
 }
@@ -440,6 +472,38 @@ func stableFamily(entry, cur BaselineEntry) bool {
 	return entry.FamilySize == cur.FamilySize
 }
 
+// stableSiblings reports whether a matched ID still names the mutation point
+// it named when the baseline was written.
+//
+// stableFamily covers the anchor segment of an ID; this covers the ordinal.
+// Ordinals are assigned in source order across a declaration's mutants of one
+// type, so deleting the first `+` in a function renumbers the second to `#1`.
+// The descriptor check in matchExactIDs then sees two ARITHMETIC_BASE `+`
+// mutations in a function of one name and cannot tell them apart, so across
+// such a renumbering the ID is not evidence of identity at all: a survivor
+// that is genuinely new — the sibling whose test was weakened — would inherit
+// the deleted point's accepted status and be reported KNOWN. An unchanged
+// count of same-descriptor mutants is the evidence that no renumbering
+// reached this entry. Counting by descriptor rather than over the whole
+// ordinal group is what keeps the guard narrow: a wrong pairing has to
+// survive the descriptor check too, so adding or removing a differently
+// shaped mutant of the same type leaves the count, and the ordinary
+// line-shift match, alone.
+//
+// Entries written before the count was recorded have nothing to compare, and
+// unlike stableFamily there is no cheaper signal to fall back to: the
+// descriptor pass would re-pair exactly the entries a blunter rule withheld
+// here, since a group that shrank to one member is unique on both sides
+// again. Distrusting them would therefore trade real matches for no added
+// safety, so they keep the previous behaviour of trusting the ID. Rewriting
+// the baseline once with --baseline-update closes the gap.
+func stableSiblings(entry, cur BaselineEntry) bool {
+	if entry.SiblingCount == 0 {
+		return true
+	}
+	return entry.SiblingCount == cur.SiblingCount
+}
+
 // shrunkFamilies names the declaration families that have fewer same-named
 // declarations in this run than they had when the baseline was written.
 // Something the baseline knew about is gone, and because every member of a
@@ -465,6 +529,50 @@ func shrunkFamilies(baseline, current []BaselineEntry) map[familyKey]struct{} {
 		}
 	}
 	return shrunk
+}
+
+// shrunkSiblings names the declaration-and-descriptor groups that hold fewer
+// mutants in this run than they held when the baseline was written. The same
+// reasoning as shrunkFamilies, one level down: a group that lost a member lost
+// it without saying which, and every remaining member renders under the same
+// descriptor, so pairing the accepted debt with one of them is a guess. It is
+// also the pass that would otherwise undo the ordinal guard — an entry
+// matchExactIDs refuses for a renumbered ordinal arrives here with a
+// descriptor that is unique on both sides, and would be matched after all.
+//
+// Groups that grew are left alone for the reason shrunkFamilies leaves grown
+// families alone: every mutant the baseline described still exists, so the
+// entry either still matches by position or is genuinely ambiguous, and
+// fallbackMatch already refuses the ambiguous case.
+func shrunkSiblings(baseline, current []BaselineEntry) map[structureKey]struct{} {
+	sizes := make(map[structureKey]int, len(current))
+	for _, entry := range current {
+		sizes[structureOf(entry)] = entry.SiblingCount
+	}
+	shrunk := make(map[structureKey]struct{})
+	for _, entry := range baseline {
+		key := structureOf(entry)
+		if entry.SiblingCount > sizes[key] {
+			shrunk[key] = struct{}{}
+		}
+	}
+	return shrunk
+}
+
+// churnedGroups reports which baseline entries the descriptor fallback must
+// leave unmatched: those whose declaration family or whose same-descriptor
+// group lost a member. Both are cases where something the baseline knew about
+// is gone and nothing in an entry says whether it is the thing that went.
+func churnedGroups(baseline, current []BaselineEntry) func(BaselineEntry) bool {
+	families := shrunkFamilies(baseline, current)
+	siblings := shrunkSiblings(baseline, current)
+	return func(entry BaselineEntry) bool {
+		if _, ok := families[familyOf(entry)]; ok {
+			return true
+		}
+		_, ok := siblings[structureOf(entry)]
+		return ok
+	}
 }
 
 // anchorFamilies counts the distinct anchors sharing each file and base
@@ -611,16 +719,15 @@ type structureKey struct {
 // belongs to, so neither is matched and an unmatched current survivor stays
 // NEW.
 //
-// Baseline entries in a skipFamilies family are withheld from the pass. Only
-// the baseline side needs withholding: skipFamilies is used with the key that
-// includes the family's base anchor, so a current entry in a skipped family
-// only ever shares a bucket with baseline entries from that same family, and a
-// bucket with no baseline candidate pairs with nothing.
-func fallbackMatch[K comparable](baseline, current []BaselineEntry, baseMatch, currentMatch []int, key func(BaselineEntry) K, skipFamilies map[familyKey]struct{}) {
+// Baseline entries skip reports on are withheld from the pass. Only the
+// baseline side needs withholding: a current entry can only ever be matched by
+// a baseline candidate, so a bucket left without one pairs with nothing and
+// its current entry stays unmatched — which is the safe verdict.
+func fallbackMatch[K comparable](baseline, current []BaselineEntry, baseMatch, currentMatch []int, key func(BaselineEntry) K, skip func(BaselineEntry) bool) {
 	baseBuckets := make(map[K][]int)
 	currentBuckets := make(map[K][]int)
 	for i, entry := range baseline {
-		if _, skip := skipFamilies[familyOf(entry)]; skip {
+		if skip != nil && skip(entry) {
 			continue
 		}
 		if baseMatch[i] < 0 {
