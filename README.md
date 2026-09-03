@@ -88,6 +88,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: editing a 
   - [All Flags](#all-flags)
 - [How It Works](#how-it-works)
 - [Self-efficacy (gomutants on itself)](#self-efficacy-gomutants-on-itself)
+  - [Why the remaining mutants survive](#why-the-remaining-mutants-survive)
 - [Security & Code Quality](#security--code-quality)
 - [Contributing](#contributing)
 - [License](#license)
@@ -1027,9 +1028,28 @@ Three behaviors worth knowing:
 
 ## Self-efficacy (gomutants on itself)
 
-gomutants kills **96.01%** of mutants in its `./internal/...` library code (2478 killed, 103 survivors out of 2845 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. See [docs/MUTATION_COVERAGE.md](docs/MUTATION_COVERAGE.md) for the per-package breakdown and an analysis of why the remaining mutants survive.
+gomutants kills **96.25%** of mutants in its `./internal/...` library code (3311 killed, 129 survivors out of 3793 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. The accepted survivor set is committed as [`.gomutants-baseline.json`](.gomutants-baseline.json), so a new survivor fails the run rather than moving an aggregate score.
 
 The `main` package is excluded from mutation testing. Its mutants exercise the integration test suite (which forks gomutants subprocesses to test mutated overlays), each taking minutes; running them in CI under the same gate isn't tractable, and most surviving mutants are output-formatting drift the integration tests intentionally don't pin.
+
+### Why the remaining mutants survive
+
+The baseline records which mutants are accepted, not why. Most of the accepted
+set is equivalent by construction rather than a fixture gap, and the two
+categories call for opposite responses — so the classes are worth keeping
+straight when deciding where to push the score:
+
+| Class | Verdict |
+|---|---|
+| **Numeric literals whose value is not observable** — file modes on report/cache writes, buffer sizes, `strconv` bit sizes. Nothing reads the value back, so `0o644` → `0o645` is invisible; `ParseFloat` branches only at 32 vs ≠32, so 63/64/65 select the same parser. | Addressable. Asserting `os.Stat().Mode()` after a write is the largest single win. |
+| **`ast.Inspect` visitors pruned to `return false`** — the pruned subtree provably holds nothing mutable: a `BasicLit` has no children, a `BranchStmt`'s only child is its label, a constraint-union subtree is entirely type syntax. | Equivalent. Nesting fixtures would be theatre; the constructs cannot contain a mutable instance of themselves. |
+| **Sort comparators forced to a constant** — `SliceStable` with a constant comparator leaves input order untouched, and assertions downstream check membership and counts rather than order. | Addressable where the order is user-visible, as in the TCE report path. |
+| **`(bool, error)` guards flipped to `true`** — the non-nil error is still returned and every caller checks it first, so the bool is never read on that path. | Equivalent given the call sites. The fix would be flattening signatures the `(bool, error)` shape exists to avoid. |
+| **`RETURN_ZERO` on identifiers already holding the zero value** — `*new(T)` is exactly equivalent, but the mutator cannot see this without type and flow information. | Documented limitation. Resolving it needs `go/types`, which the mutator deliberately does not use. |
+
+Full per-position detail for any of these lives in the baseline entries and in
+`git log` — `git show 3be3c30:docs/MUTATION_COVERAGE.md` has the last
+position-by-position survey, valid as of 2845 mutants.
 
 ## Security & Code Quality
 
