@@ -5,17 +5,9 @@ permissions:
 
 on:
   pull_request:
-  # The full-tree run moved off `push: [main]`. It never fit in a
-  # post-merge budget: measured on the 3793-mutant internal/... set,
-  # internal/runner and internal/coverage alone account for 74% of all
-  # worker time (42.3s and 21.9s per mutant against a 2-3s median
-  # elsewhere), because their suites fork Go toolchain subprocesses.
-  # Every post-merge run from 2026-08-26 onward was killed at exactly
-  # 30m16s by the old timeout-minutes, so main's full-tree gate — and
-  # the Stryker badge it feeds — had been dead for over a month. The
-  # per-PR changed-since job below is the real per-change gate; this
-  # one is for drift detection and the dashboard, neither of which
-  # needs to be synchronous with a merge.
+  # The full-tree run is deliberately not on `push: [main]` — it takes
+  # hours and never fit a post-merge budget. The per-PR changed-since
+  # job is the real per-change gate.
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -70,10 +62,8 @@ jobs:
   full-tree:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # 6h is the GitHub-hosted ceiling. The measured 34,266 worker-seconds
-    # project to roughly 4h at -workers=4 on a 4-vCPU runner; that is
-    # inside the ceiling but not comfortably, so treat a timeout here as
-    # a signal to shard by package rather than to raise the number.
+    # 6h is the GitHub-hosted ceiling and the run projects to ~4h, so a
+    # timeout here means shard by package — the number cannot go higher.
     timeout-minutes: 360
     concurrency:
       group: ${{ github.workflow }}-full-tree
@@ -89,30 +79,18 @@ jobs:
       - name: Install in-tree gomutants
         run: go install ./...
 
-      # baseline= replaces the action's default threshold-efficacy=100,
-      # which could never pass here: the tree carries 129 accepted
-      # survivors, so the absolute gate failed the run independently of
-      # the timeout. Ratchet mode exits 10 only for survivors absent from
-      # the committed file. --baseline-update is deliberately not used —
-      # it writes a file CI cannot commit; shrinking the baseline stays a
-      # local, deliberate act.
+      # Calls the in-tree binary rather than the pinned action: the
+      # action's `baseline` input does not exist at v0.6.0 (12850da8),
+      # where it is an unexpected input that GitHub warns about and
+      # ignores — the gate would silently fall back to the action's
+      # threshold-efficacy=100 and fail on the accepted debt. Switch back
+      # once a release carries the input.
       #
-      # timeout-coefficient=5 halves the default per-mutant ceiling. The
-      # 11 known timeouts are only 7.2% of total work, but their cost
-      # scales with the runner's slower baseline measurement, so bounding
-      # it protects the budget. The risk is the opposite error: a mutant
-      # slow enough to be cut short is recorded TIMED OUT, which the
-      # ratchet then retains as unresolved debt rather than reading as
-      # fixed. 5 leaves headroom over the 42s runner average; lower it
-      # further only with a measured reason.
-      #
-      # This step calls the in-tree binary directly rather than the pinned
-      # action. The action's `baseline` input was added in this branch and
-      # does not exist at v0.6.0 (12850da8); passing it there is an
-      # unexpected input, which GitHub warns about but ignores — the gate
-      # would silently fall back to threshold-efficacy=100 and fail on the
-      # accepted debt. Switch this back to the action once a release
-      # carrying the input exists.
+      # --baseline-update is deliberately absent: it writes a file CI
+      # cannot commit, so shrinking the baseline stays a local act.
+      # Lower --timeout-coefficient only with a measured reason; cutting a
+      # slow mutant short records TIMED OUT, which the ratchet retains as
+      # debt rather than reading as fixed.
       - name: Run mutation testing (full tree, ratchet)
         run: |
           gomutants --annotations=github \
