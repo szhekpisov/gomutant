@@ -46,10 +46,22 @@ type Report struct {
 	// MutantsSuppressedByCalls is the --exclude-calls share of
 	// MutantsSuppressed, not an additional bucket. Set by the caller after
 	// Generate, since only it knows the split.
-	MutantsSuppressedByCalls int            `json:"mutants_suppressed_by_calls,omitempty"`
-	MutantsEquivalent        int            `json:"mutants_equivalent,omitempty"`
-	ElapsedTime              float64        `json:"elapsed_time"`
-	MutatorStatistics        map[string]int `json:"mutator_statistics"`
+	MutantsSuppressedByCalls int             `json:"mutants_suppressed_by_calls,omitempty"`
+	MutantsEquivalent        int             `json:"mutants_equivalent,omitempty"`
+	Baseline                 *BaselineReport `json:"baseline,omitempty"`
+	ElapsedTime              float64         `json:"elapsed_time"`
+	MutatorStatistics        map[string]int  `json:"mutator_statistics"`
+}
+
+// BaselineReport summarizes the ratchet comparison when --baseline is active.
+// It is additive to the gremlins-compatible report surface and omitted for
+// ordinary runs.
+type BaselineReport struct {
+	KnownSurvivors      int `json:"known_survivors"`
+	NewSurvivors        int `json:"new_survivors"`
+	ResolvedSurvivors   int `json:"resolved_survivors"`
+	UnresolvedSurvivors int `json:"unresolved_survivors,omitempty"`
+	FallbackMatches     int `json:"fallback_matches,omitempty"`
 }
 
 // FileReport groups mutations by file.
@@ -74,6 +86,9 @@ type MutationReport struct {
 	Column      int    `json:"column"`
 	Original    string `json:"original,omitempty"`
 	Replacement string `json:"replacement,omitempty"`
+	// BaselineStatus is KNOWN or NEW for a LIVED mutant when --baseline is
+	// active. Non-survivors and ordinary runs omit it.
+	BaselineStatus string `json:"baseline_status,omitempty"`
 }
 
 // Generate builds a Report from the list of mutants. suppressedCount

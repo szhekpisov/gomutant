@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -32,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/szhekpisov/gomutants/internal/atomicfile"
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
 
@@ -64,37 +64,10 @@ import (
 //	    framing change rides on v7 rather than a bump of its own.
 const SchemaVersion = 7
 
-// I/O syscalls used by Save are exposed as package-level function
-// variables so tests can inject failures into each error path
-// independently. Production code calls them through these vars; tests
-// swap them out for stubs that return controlled errors. Mirrors the
-// `var preReadFilesFunc = ...` pattern in main.go.
-var (
-	osMkdirAll = os.MkdirAll
-	osChmod    = os.Chmod
-	osRename   = os.Rename
-	osRemove   = os.Remove
-
-	// newSaveSink wraps the os.CreateTemp call so Save's flow runs
-	// against an interface (saveSink) rather than *os.File directly.
-	// This is what lets a test simulate "Encode fails / Close
-	// succeeds" or "Encode succeeds / Close fails" — a contrast that
-	// can't be produced from a real *os.File without filesystem-
-	// specific tricks.
-	newSaveSink = func(dir, pattern string) (saveSink, error) {
-		return os.CreateTemp(dir, pattern)
-	}
-)
-
-// saveSink is the minimal surface Save needs from a temp-file handle:
-// write the encoded JSON, close the descriptor, and report the on-disk
-// path so Chmod/Rename/Remove can target it. *os.File satisfies this
-// directly; tests substitute a fake to inject controlled errors.
-type saveSink interface {
-	io.Writer
-	io.Closer
-	Name() string
-}
+// tmpPattern names the temp file Save renames into place. It is matched by
+// .gitignore, so an interrupted run cannot leave a file `git add -A` would
+// commit.
+const tmpPattern = ".gomutants-cache-*.tmp"
 
 // Cache is the on-disk artifact. Entries are keyed by mutant identity
 // (rel_file, line, col, type, start_offset, original, replacement).
@@ -610,51 +583,7 @@ func Save(c *Cache, path string) error {
 	if path == "" {
 		return nil
 	}
-	dir := filepath.Dir(path)
-	if err := osMkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	// Temp file must live in the same directory as the target so
-	// os.Rename stays atomic — cross-filesystem renames degrade to
-	// copy+unlink on some platforms.
-	tmp, err := newSaveSink(dir, ".gomutants-cache-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	// committed flips to true once the rename has placed the file at
-	// `path`; the deferred cleanup removes the *original* tmp path
-	// only on the failure path. (Once committed, tmpName no longer
-	// exists on disk, so calling Remove on it would be wrong.)
-	committed := false
-	defer func() {
-		if !committed {
-			_ = osRemove(tmpName)
-		}
-	}()
-
-	// Encode + Close happen unconditionally (we always want to release
-	// the file descriptor) and the first non-nil error wins. Wiring it
-	// this way means an Encode failure that was followed by a
-	// successful Close still surfaces — without this, a mutant that
-	// drops the encode-error return would silently produce a bogus
-	// cache file.
-	encodeErr := json.NewEncoder(tmp).Encode(c)
-	closeErr := tmp.Close()
-	if encodeErr != nil {
-		return encodeErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err := osChmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	if err := osRename(tmpName, path); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+	return atomicfile.WriteJSON(path, tmpPattern, "", c)
 }
 
 // TestFilesForFn resolves a mutant to the set of absolute test-file

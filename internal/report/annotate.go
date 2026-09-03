@@ -21,6 +21,12 @@ func WriteGitHubAnnotations(w io.Writer, r *Report) error {
 			if m.Status != livedStatus {
 				continue
 			}
+			// In ratchet mode known survivors are accepted debt. Keep them in
+			// the report, but annotate only regressions so every PR does not
+			// repeat the entire backlog.
+			if r.Baseline != nil && m.BaselineStatus != BaselineStatusNew {
+				continue
+			}
 			fmt.Fprintf(
 				bw,
 				"::warning file=%s,line=%d,col=%d::%s\n",

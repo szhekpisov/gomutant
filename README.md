@@ -88,6 +88,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: editing a 
   - [All Flags](#all-flags)
 - [How It Works](#how-it-works)
 - [Self-efficacy (gomutants on itself)](#self-efficacy-gomutants-on-itself)
+  - [Why the remaining mutants survive](#why-the-remaining-mutants-survive)
 - [Security & Code Quality](#security--code-quality)
 - [Contributing](#contributing)
 - [License](#license)
@@ -121,7 +122,7 @@ gomutants is published as a composite action:
     args: --changed-since origin/${{ github.base_ref }} ./...
 ```
 
-Each LIVED mutant on a changed line is emitted as a `::warning file=...,line=...::` workflow command, which GitHub renders inline on the "Files changed" view. The action fails on any LIVED mutant by default (`threshold-efficacy: 100`); set `threshold-efficacy: ""` to surface annotations without failing the job.
+Each LIVED mutant on a changed line is emitted as a `::warning file=...,line=...::` workflow command, which GitHub renders inline on the "Files changed" view. The action fails on any LIVED mutant by default (`threshold-efficacy: 100`); set `threshold-efficacy: ""` to surface annotations without failing the job. When the `baseline` input is set, only NEW survivors are annotated and the baseline gate replaces that default absolute threshold.
 
 | Input | Default | Description |
 |---|---|---|
@@ -131,6 +132,7 @@ Each LIVED mutant on a changed line is emitted as a `::warning file=...,line=...
 | `threshold-mcover` | _empty_ | Minimum mutant coverage `%` (`(KILLED+LIVED)/(KILLED+LIVED+NOT_COVERED)`). Below threshold → exit 11. Empty disables. |
 | `working-directory` | `.` | Directory containing `go.mod`. |
 | `cache` | `.gomutants-cache.json` | Path to the incremental-analysis cache file. Set to `off` to disable. Pair with [`actions/cache`](https://github.com/actions/cache) to persist across CI runs. |
+| `baseline` | _empty_ | Path to a committed known-survivor baseline. When set, the action omits its default absolute efficacy threshold and fails only on new survivors. |
 
 See [`action.yml`](action.yml) for the full composite definition.
 
@@ -298,6 +300,7 @@ reproduction commands.
 ## Features
 
 - **`--changed-since <ref>`** — scope mutation testing to lines changed vs a git ref. Fast enough to gate every PR.
+- **Baseline ratchet** — commit known surviving mutant IDs and fail only when a run introduces a survivor that is not already accepted; successful updates can only shrink the debt.
 - **Per-test coverage routing** — each mutant runs only the tests whose coverage touches the mutated line, not the whole suite.
 - **Incremental cache** — content-addressed; warm reruns skip mutants whose package sources and covering tests are byte-identical to the previous run (120–150× speedup on warm reruns).
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
@@ -333,6 +336,101 @@ gomutants --changed-since HEAD~1 ./...
 ```
 
 The flag runs `git diff --unified=0 --merge-base <ref>` and keeps only mutants on added/modified lines. Diffing from the **merge base** — the commit your branch forked from — rather than from the ref's tip is what makes the scope match the set of lines the pull request shows: on a branch that is behind its base, diffing against the tip also reports every line that landed on the base after you forked, failing your gate on someone else's work. Uncommitted working-tree edits are included, so a local pre-push run sees them. If no common ancestor is reachable — almost always a shallow clone — the run fails with a hint rather than silently widening the scope; `fetch-depth: 0` on `actions/checkout` fixes it. Combine with `--threshold-efficacy 100` to fail on any LIVED mutant on changed lines. A typical setup runs `--changed-since` per PR and the full tree post-merge; see [`.github/workflows/mutation.yml`](.github/workflows/mutation.yml) for an example.
+
+### Baseline / Ratchet Mode
+
+`--baseline <file>` turns the gate from an absolute score into a committed
+allowlist of existing survivor debt. A current LIVED mutant whose stable ID is
+in the file is `KNOWN`; one absent from it is `NEW` and exits with code 10.
+
+```bash
+# Adopt ratchet mode: record the current survivor set.
+gomutants --baseline .gomutants-baseline.json --baseline-update ./...
+
+# Commit the file, then use this in CI.
+gomutants --baseline .gomutants-baseline.json ./...
+
+# After killing known survivors, remove them from the committed baseline.
+gomutants --baseline .gomutants-baseline.json --baseline-update ./...
+```
+
+Updates are shrink-only. If a run contains any new survivor, it exits 10 and
+leaves the previous baseline untouched. Any other gate is independent of that
+verdict: a run that introduces no new debt writes the shrunk file even when
+`--threshold-mcover` then fails it. `KILLED`, `EQUIVALENT`, and
+`NOT VIABLE` entries are removed by a successful update; `NOT COVERED`,
+`TIMED OUT`, and `INFRA ERROR` entries are retained because those outcomes do
+not prove the old survivor was fixed. A run that is interrupted — Ctrl-C, or a
+CI step hitting its time limit — fails with exit 1 instead of reporting its
+truncated result: the mutants it never reached are not survivors, and a gate
+that read them as an absence of new debt would pass a run that measured almost
+nothing. Either mode is refused outright when the run discovers no mutants at
+all — a typo in `--only` or an over-broad `--exclude-files` would otherwise
+rewrite the committed file as empty, or pass a gate that measured nothing. The
+file is schema-versioned, sorted, and replaced atomically, so it is suitable
+for version control.
+
+Stable IDs normally survive line shifts and edits to other functions. For the
+documented churn cases—such as a renamed function or an inserted `init()`—the
+ratchet attempts a unique source-descriptor match and prints the old and new
+IDs as a warning. Both fallbacks stay anchored to the enclosing declaration, so
+a mutant that loses its position *and* its function is left unmatched: that is
+indistinguishable from deleting one function and adding another that happens to
+contain the same kind of mutation. Repeated declaration names — several
+`init()`s in one file — are disambiguated by source order, so each entry also
+records how many declarations shared its name. While that count is unchanged
+the IDs mean what they meant and are trusted as usual, a pure line shift
+included. Adding such a declaration reassigns the suffixes, so the ratchet
+falls back to matching by position or by a unique descriptor; removing one
+additionally stops debt migrating between the remaining namesakes, so a
+namesake that regresses is reported as `NEW` rather than inheriting the deleted
+declaration's accepted status. An ID's trailing `#N` is disambiguated the same
+way, one level down — mutation points are numbered in source order within a
+declaration — so each entry also records how many mutants shared its exact
+descriptor. Adding or removing an identical mutation point renumbers the rest,
+and there the descriptor check cannot tell the accepted debt from its twin, so
+that count is what keeps a renumbered survivor from inheriting a deleted one's
+accepted status. A differently shaped mutation leaves it alone: a wrong pairing
+would have to defeat the descriptor check too. The ratchet never guesses among
+ambiguous candidates; an unmatched current survivor remains `NEW` and fails
+safely.
+
+The file records the settings that define the mutant universe — packages,
+`--only`/`--disable`, build tags, test flags, `--coverpkg`, `--detect-equivalent`
+and the exclusion patterns. A run whose settings differ from the committed ones
+is rejected until you rerun with `--baseline-update` to migrate the file
+deliberately. What it records is what you wrote, not what that resolves to: the
+gomutants version is not part of the fingerprint, and neither is the mutator set
+`--only`/`--disable` select nor the built-in call-exclusion set your
+`exclude-calls` entries extend. Upgrading to a release that ships a new mutator
+or a new built-in exclusion is therefore not a policy change — it surfaces as
+ordinary new survivor debt rather than as a rejected run. Switching the built-in
+exclusions off is your decision, so that is recorded.
+
+Every comparison is scoped to the packages the run actually resolved, so
+narrowing the selection is safe: survivors in packages the run never examined
+are retained verbatim, with a warning, instead of being read as fixed. Deleting
+the code is the one thing that still shrinks them — an entry whose source file
+no longer exists is resolved whether or not the run looked at its package.
+`--exclude-files` shrinks them too: it is in the fingerprint, so excluding a
+path takes a deliberate `--baseline-update`, and the debt under it is dropped
+rather than pinned as unexamined.
+
+Ratchet mode requires a full comparable run, so it cannot be combined with
+`--changed-since`, `--run-mutant-id`, or `--dry-run`. It also conflicts with
+`--threshold-efficacy`, whose absolute score would reject the known debt;
+`--threshold-mcover` remains available. A baseline configured in
+`.gomutants.yml` can be disabled for one invocation with `--baseline=off`.
+
+For the GitHub Action, pass the dedicated input so its default 100% efficacy
+gate is omitted:
+
+```yaml
+# On the pinned gomutants action step:
+with:
+  args: ./...
+  baseline: .gomutants-baseline.json
+```
 
 ### Cross-Package Mode
 
@@ -398,7 +496,7 @@ If you already publish to the [Stryker Dashboard](https://stryker-mutator.io/doc
 | `0` | Success |
 | `1` | Runtime, build, or target error |
 | `2` | Usage or configuration error (unknown/invalid flags, conflicting options, invalid config) |
-| `10` | Below `--threshold-efficacy` (gremlins-compat) |
+| `10` | New survivor under `--baseline`, or below `--threshold-efficacy` (gremlins-compat) |
 | `11` | Below `--threshold-mcover` (gremlins-compat) |
 
 ```bash
@@ -555,6 +653,7 @@ output: mutation-report.json
 changed-since: ""       # set to e.g. "main" to scope runs by default
 integration: false      # cross-package routing; manages -coverpkg itself (don't also set coverpkg)
 cache: ""               # path to incremental-analysis cache; "" = .gomutants-cache.json, "off" = disabled
+baseline: ""            # committed known-survivor file; empty disables, "off" overrides a configured path
 checkpoint-interval: 10s # how often to flush the cache mid-run; 0s disables (final flush still runs)
 disable: []
 only: []
@@ -668,10 +767,12 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
 | `--run-mutant-id` | | | Run only the mutant with this stable `id` (the `id` field of a report entry); a unique prefix is accepted. Skips the incremental cache for that mutant. See [Re-running a single mutant](#re-running-a-single-mutant) |
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source package and covering tests are byte-identical to the cached run — invalidation is package-scoped, so editing one file re-runs its package. Pass `--cache=off` to disable. |
+| `--baseline` | | | Path to a committed known-survivor baseline. Fails with exit 10 only for LIVED mutants absent from the file. Pass `--baseline=off` to disable a configured baseline. |
+| `--baseline-update` | | false | Create or shrink `--baseline` after a successful full run. Refuses to rewrite the file when new survivors exist. CLI-only. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
 | `--integration` | | false | Route each mutant to covering tests in *any* package that imports it, not just its own. Widens coverage and the per-test build to the reverse-dependency closure of the target packages and manages `-coverpkg` itself (passing `--coverpkg` too is an error). Lets a mutant be killed by a cross-package/E2E test. See [Cross-Package Mode](#cross-package-mode). |
-| `--annotations` | | | Emit annotations for LIVED mutants. Supported: `github` (workflow-command warnings on stdout). |
+| `--annotations` | | | Emit annotations for LIVED mutants. Under `--baseline`, known survivors stay in reports but only NEW survivors are annotated. Supported: `github` (workflow-command warnings on stdout). |
 | `--stryker-output` | | | Also write a [Stryker mutation-testing-elements](https://github.com/stryker-mutator/mutation-testing-elements) report at this path (for the HTML viewer and Stryker Dashboard). |
 | `--html-output` | | | Also write a self-contained interactive HTML mutation report at this path (Stryker mutation-testing-elements viewer bundled inline; no network access required to open). |
 | `--threshold-efficacy` | | 0 | Minimum test efficacy (KILLED/(KILLED+LIVED)). Below threshold → exit 10 (gremlins-compat). 0 disables. |
@@ -832,6 +933,7 @@ so `--test-flags '-race -args -x'` works either way.
      - Otherwise the phase decides which wordings count. Before the test binary runs, `[build failed]`/`[setup failed]` output is entirely toolchain-authored, so generic phrasings are unambiguous there (`go: fork/exec …/compile: resource temporarily unavailable`, `ld: out of memory allocating …`). Once tests are running, `go test` merges their output into the same stream, so only phrasings a test is unlikely to print itself count — `fatal error: out of memory`, never a bare `out of memory`.
      - A `signal: killed` gomutants did not send is `INFRA ERROR`: the RSS monitor's own kill and the per-mutant deadline are both classified as `TIMED OUT` before this is reached, so what is left is an outside hand — typically a cgroup limit below the monitor's 2 GiB ceiling, which the kernel enforces before the monitor's 1s poll ever sees it. It is read both from the process exit error (the `go` process was signalled) and from a `signal: killed` line on stdout (only the test binary was, so `go test` survived to report it and exited 1). The stdout reading counts at the start of a line only, where `go test` writes it.
 7. **Detect equivalent mutants** (only with `--detect-equivalent`). Each surviving mutant is recompiled with package-scoped `-gcflags=-S` under the same overlay mechanism; the reference (original) package is compiled once per package. When the normalized assembly matches the original, the mutation was folded away by the compiler and is reclassified `EQUIVALENT` — provably unkillable, so it leaves the efficacy denominator rather than failing the gate. The comparison is one-sided: any real difference in generated code diverges the hash, so a killable mutant is never marked equivalent.
+8. **Apply the baseline ratchet** (only with `--baseline`). Completed outcomes are matched against the committed survivor set after equivalence detection. Exact stable IDs win when their source descriptor still agrees; unique location/structural matches recover conservatively from ID churn. Reports are written before a new survivor returns exit 10, and `--baseline-update` writes only after all gates pass.
 
 Performance optimizations layered on top:
 
@@ -874,6 +976,12 @@ Each entry under `files[].mutations[]` looks like this:
   "replacement": "<="
 }
 ```
+
+Under `--baseline`, LIVED entries also carry `"baseline_status": "KNOWN"`
+or `"NEW"`, and the top-level report includes a `baseline` object with
+`known_survivors`, `new_survivors`, `resolved_survivors`, and—when non-zero—
+`unresolved_survivors` and `fallback_matches`. These fields are additive and
+are omitted entirely from ordinary gremlins-compatible runs.
 
 `id` is a stable handle for one mutant, formatted `file:function:TYPE#n`. The file segment is the path relative to the module root. Unlike the enclosing entry's `file_name`, which stays gremlins-compatible by dropping the import-path prefix shared by the packages in the run, it does not depend on which packages you asked for — so the same mutant carries the same `id` under `gomutants ./...` and under `gomutants ./internal/runner/`. The function segment is the enclosing declaration — `(*T).Method` for methods, empty for package-level declarations, and the enclosing function (not the literal) for mutants inside a closure. `n` counts mutants sharing those three fields, in source order.
 
@@ -928,9 +1036,28 @@ Three behaviors worth knowing:
 
 ## Self-efficacy (gomutants on itself)
 
-gomutants kills **96.01%** of mutants in its `./internal/...` library code (2478 killed, 103 survivors out of 2845 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. See [docs/MUTATION_COVERAGE.md](docs/MUTATION_COVERAGE.md) for the per-package breakdown and an analysis of why the remaining mutants survive.
+gomutants kills **96.25%** of mutants in its `./internal/...` library code (3311 killed, 129 survivors out of 3793 discovered). Statement coverage is 100%. The CI gate fails on any surviving mutant on changed lines per PR, so drift surfaces on the PR that introduces it. The accepted survivor set is committed as [`.gomutants-baseline.json`](.gomutants-baseline.json), so a new survivor fails the run rather than moving an aggregate score.
 
 The `main` package is excluded from mutation testing. Its mutants exercise the integration test suite (which forks gomutants subprocesses to test mutated overlays), each taking minutes; running them in CI under the same gate isn't tractable, and most surviving mutants are output-formatting drift the integration tests intentionally don't pin.
+
+### Why the remaining mutants survive
+
+The baseline records which mutants are accepted, not why. Most of the accepted
+set is equivalent by construction rather than a fixture gap, and the two
+categories call for opposite responses — so the classes are worth keeping
+straight when deciding where to push the score:
+
+| Class | Verdict |
+|---|---|
+| **Numeric literals whose value is not observable** — file modes on report/cache writes, buffer sizes, `strconv` bit sizes. Nothing reads the value back, so `0o644` → `0o645` is invisible; `ParseFloat` branches only at 32 vs ≠32, so 63/64/65 select the same parser. | Addressable. Asserting `os.Stat().Mode()` after a write is the largest single win. |
+| **`ast.Inspect` visitors pruned to `return false`** — the pruned subtree provably holds nothing mutable: a `BasicLit` has no children, a `BranchStmt`'s only child is its label, a constraint-union subtree is entirely type syntax. | Equivalent. Nesting fixtures would be theatre; the constructs cannot contain a mutable instance of themselves. |
+| **Sort comparators forced to a constant** — `SliceStable` with a constant comparator leaves input order untouched, and assertions downstream check membership and counts rather than order. | Addressable where the order is user-visible, as in the TCE report path. |
+| **`(bool, error)` guards flipped to `true`** — the non-nil error is still returned and every caller checks it first, so the bool is never read on that path. | Equivalent given the call sites. The fix would be flattening signatures the `(bool, error)` shape exists to avoid. |
+| **`RETURN_ZERO` on identifiers already holding the zero value** — `*new(T)` is exactly equivalent, but the mutator cannot see this without type and flow information. | Documented limitation. Resolving it needs `go/types`, which the mutator deliberately does not use. |
+
+Full per-position detail for any of these lives in the baseline entries and in
+`git log` — `git show 3be3c30:docs/MUTATION_COVERAGE.md` has the last
+position-by-position survey, valid as of 2845 mutants.
 
 ## Security & Code Quality
 

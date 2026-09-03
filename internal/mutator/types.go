@@ -88,6 +88,13 @@ type Position struct {
 	Offset   int
 }
 
+// AnchorRepeatSep joins a repeated declaration name to its occurrence number
+// in a stable ID's anchor: two `func init()` in one file anchor to "init" and
+// "init~2". It is deliberately a character Go identifiers cannot contain, so a
+// disambiguated anchor can never collide with another declaration's plain
+// name, and the base name is recoverable by cutting at the first separator.
+const AnchorRepeatSep = "~"
+
 type Mutant struct {
 	// ID is a sequential 1..N index over this run's sorted candidate
 	// list. It is run-local: adding or removing a single mutation point
@@ -98,7 +105,13 @@ type Mutant struct {
 	// (empty for package-level declarations) and n counts mutants sharing
 	// those three fields. It survives line shifts and edits to other
 	// functions, so consumers can refer to the same mutant across runs.
-	StableID     string
+	StableID string
+	// Anchor is the enclosing function's name as rendered for StableID:
+	// empty for package-level declarations, and suffixed with
+	// AnchorRepeatSep plus an occurrence number when a file repeats a
+	// declaration name. Carried separately so consumers can reason about
+	// the anchor without parsing StableID back apart.
+	Anchor       string
 	Type         MutationType
 	File         string // Absolute path.
 	RelFile      string // Relative to module root (for report).

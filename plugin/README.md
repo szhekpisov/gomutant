@@ -51,7 +51,7 @@ The wrap-up line points at the HTML report: `open /tmp/gomutants-report.html` (m
 ## What it doesn't do
 
 - It never edits source files. Test proposals are printed for the user to apply.
-- It doesn't alter `gomutants` defaults beyond `-quiet`, `-output`, and `-html-output`. The incremental cache (`.gomutants-cache.json`, on by default) is left enabled, so repeat runs in a session are fast.
+- It doesn't alter `gomutants` defaults beyond `-quiet`, `-output`, `-html-output`, and `-baseline=off`. The baseline override keeps the plugin's changed/ad-hoc scopes separate from a project-wide ratchet; the incremental cache (`.gomutants-cache.json`, on by default) stays enabled, so repeat runs in a session are fast.
 - It doesn't bundle a `gomutants` binary; it expects the Go toolchain to be available.
 
 ## Links

@@ -195,6 +195,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 		mutants[i] = mutator.Mutant{
 			ID:           i + 1,
 			StableID:     stableID(key, ordinals[key]),
+			Anchor:       key.anchor,
 			Type:         c.Type,
 			File:         absPath,
 			RelFile:      relPath,

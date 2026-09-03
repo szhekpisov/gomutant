@@ -1156,6 +1156,382 @@ func TestRunThresholdEfficacySilentWhenClean(t *testing.T) {
 	}
 }
 
+func TestRunBaselineRejectsIncompatibleModes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"update needs path", []string{"--baseline-update"}},
+		{"changed scope", []string{"--baseline", "baseline.json", "--changed-since", "main"}},
+		{"single mutant", []string{"--baseline", "baseline.json", "--run-mutant-id", "x"}},
+		{"dry run", []string{"--baseline", "baseline.json", "--dry-run"}},
+		{"absolute efficacy", []string{"--baseline", "baseline.json", "--threshold-efficacy", "100"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := captureStderr(t, func() error {
+				return run(context.Background(), tc.args)
+			})
+			requireExitCode(t, err, exitCodeUsageError)
+		})
+	}
+}
+
+// mustWriteFile writes a file, failing the test on error.
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// baselineFixture is the shared setup for the ratchet's end-to-end tests: a
+// throwaway module, the run's working directory pointed at it, and the flags
+// every case needs. Each test then writes its own sources and drives run().
+type baselineFixture struct {
+	dir      string
+	path     string
+	baseArgs []string
+}
+
+// newBaselineFixture writes files into a temp module, chdirs into it for the
+// duration of the test, and returns the fixture. files is keyed by
+// module-relative slash path; any parent directories are created.
+func newBaselineFixture(t *testing.T, files map[string]string) *baselineFixture {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping subprocess-spawning test in short mode (self-mutation guard)")
+	}
+	dir := t.TempDir()
+	for name, content := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+
+	baselinePath := filepath.Join(dir, ".gomutants-baseline.json")
+	return &baselineFixture{
+		dir:  dir,
+		path: baselinePath,
+		baseArgs: []string{
+			"--baseline", baselinePath,
+			"--cache=off",
+			"--only", "ARITHMETIC_BASE",
+			"-w", "1",
+		},
+	}
+}
+
+// args builds a command line: the fixture's shared flags, a report path named
+// after reportName, then extra — any per-case flags followed by the packages,
+// which must stay last.
+func (f *baselineFixture) args(reportName string, extra ...string) []string {
+	args := append(slices.Clone(f.baseArgs), "-o", filepath.Join(f.dir, reportName+".json"))
+	return append(args, extra...)
+}
+
+// mustRun drives run() and fails the test if it does not succeed.
+func (f *baselineFixture) mustRun(t *testing.T, what string, args []string) {
+	t.Helper()
+	if _, err := captureOutput(t, func() error { return run(context.Background(), args) }); err != nil {
+		t.Fatalf("%s: %v", what, err)
+	}
+}
+
+// survivors reads the committed baseline back and asserts its size.
+func (f *baselineFixture) survivors(t *testing.T, want int, what string) []report.BaselineEntry {
+	t.Helper()
+	b, err := report.ReadBaseline(f.path)
+	if err != nil {
+		t.Fatalf("ReadBaseline: %v", err)
+	}
+	if len(b.Survivors) != want {
+		t.Fatalf("%s: survivors=%d, want %d", what, len(b.Survivors), want)
+	}
+	return b.Survivors
+}
+
+// readReport parses one of the JSON reports the fixture's args() named.
+func (f *baselineFixture) readReport(t *testing.T, reportName string) report.Report {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(f.dir, reportName+".json"))
+	if err != nil {
+		t.Fatalf("report must be written: %v", err)
+	}
+	var got report.Report
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse report: %v", err)
+	}
+	return got
+}
+
+// simpleModule is a one-package module whose single ARITHMETIC_BASE mutant
+// survives: the test calls Add but never checks its result.
+func simpleModule() map[string]string {
+	return map[string]string{
+		"go.mod":      "module testmod\n\ngo 1.26\n",
+		"add.go":      "package testmod\n\nfunc Add(a, b int) int { return a + b }\n",
+		"add_test.go": "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { _ = Add(1, 2) }\n",
+	}
+}
+
+// twoPackageModule adds a subpackage with its own surviving mutant, so a case
+// can exclude one package's only production file and leave the other alone.
+func twoPackageModule() map[string]string {
+	m := simpleModule()
+	m["gen/gen.go"] = "package gen\n\nfunc Mul(a, b int) int { return a * b }\n"
+	m["gen/gen_test.go"] = "package gen\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(2, 3) }\n"
+	return m
+}
+
+func TestRunBaselineBootstrapKnownAndNewSurvivor(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	f.mustRun(t, "known survivor should pass the ratchet", f.args("known", "testmod"))
+	if got := f.readReport(t, "known").Baseline; got == nil || got.KnownSurvivors != 1 || got.NewSurvivors != 0 {
+		t.Fatalf("known-run baseline report=%+v", got)
+	}
+
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("mismatch", "--test-flags=-short", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "baseline policy differs in test-flags") {
+		t.Fatalf("policy mismatch error=%v", err)
+	}
+
+	// A second same-type mutation point inside Add leaves the accepted
+	// survivor known and introduces one ID that the ratchet must reject. The
+	// existing test calls Add without checking it, so both survive.
+	mustWriteFile(t, filepath.Join(f.dir, "add.go"), "package testmod\n\nfunc Add(a, b int) int { return a + b + 1 }\n")
+	_, err = captureOutput(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeEfficacy)
+	if !strings.Contains(err.Error(), "new surviving mutant") {
+		t.Fatalf("gate error=%v, want new-survivor diagnostic", err)
+	}
+	if got := f.readReport(t, "second").Baseline; got == nil || got.KnownSurvivors != 1 || got.NewSurvivors != 1 {
+		t.Fatalf("baseline report=%+v, want one known and one new", got)
+	}
+	f.survivors(t, 1, "failed gate must not rewrite the baseline")
+
+	// Assert the result and both mutants die, so the update shrinks to nothing.
+	mustWriteFile(t, filepath.Join(f.dir, "add_test.go"), "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 4 { t.Fatal(\"wrong\") } }\n")
+	f.mustRun(t, "shrink baseline after killing survivors", f.args("third", "--baseline-update", "testmod"))
+	f.survivors(t, 0, "shrink")
+}
+
+// TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope pins the data-loss
+// guard: an update that asks for fewer packages than the committed baseline
+// covers must retain the debt it never examined instead of reading "no current
+// mutant" as "fixed".
+func TestRunBaselineUpdateKeepsSurvivorsOutsideNarrowedScope(t *testing.T) {
+	files := simpleModule()
+	files["sub/sub.go"] = "package sub\n\nfunc Mul(a, b int) int { return a + b }\n"
+	files["sub/sub_test.go"] = "package sub\nimport \"testing\"\nfunc TestMul(t *testing.T) { _ = Mul(1, 2) }\n"
+	f := newBaselineFixture(t, files)
+
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "./..."))
+	f.survivors(t, 2, "bootstrap must record one survivor per package")
+
+	// Narrow the update to the root package. The sub package is never
+	// examined, so its accepted survivor must survive the rewrite.
+	stderr, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "testmod"))
+	})
+	if err != nil {
+		t.Fatalf("narrowed update: %v", err)
+	}
+	if !strings.Contains(stderr, "outside this run's packages") {
+		t.Fatalf("stderr=%q, want a retained-out-of-scope warning", stderr)
+	}
+	var kept bool
+	for _, entry := range f.survivors(t, 2, "narrowed update erased unexamined debt") {
+		kept = kept || strings.HasPrefix(entry.File, "sub/")
+	}
+	if !kept {
+		t.Fatal("the sub package entry was not the one retained")
+	}
+
+	// The update rewrote the policy to the narrowed package set, so the next
+	// narrowed run no longer sees a policy change. Scoping must still hold.
+	f.mustRun(t, "repeat narrowed update", f.args("third", "--baseline-update", "testmod"))
+	f.survivors(t, 2, "repeat narrowed update")
+
+	// Deleting the package the narrowed run never examines is the one thing
+	// that may shrink it: the accepted debt is genuinely gone.
+	if err := os.RemoveAll(filepath.Join(f.dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	f.mustRun(t, "update after deleting the sub package", f.args("fourth", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "deleting a package must still shrink the baseline")
+}
+
+// TestRunBaselineUpdateWritesDespiteMcoverFailure pins the gate ordering: the
+// ratchet's own verdict is independent of the mutant-coverage score, so a run
+// that killed known survivors must still shrink the committed file even when
+// --threshold-mcover fails it.
+func TestRunBaselineUpdateWritesDespiteMcoverFailure(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Kill the known survivor, then add an untested function so mutant
+	// coverage drops below the threshold and the run fails on it.
+	mustWriteFile(t, filepath.Join(f.dir, "add_test.go"), "package testmod\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"wrong\") } }\n")
+	mustWriteFile(t, filepath.Join(f.dir, "sub.go"), "package testmod\n\nfunc Sub(a, b int) int { return a - b }\n")
+
+	_, err := captureOutput(t, func() error {
+		return run(context.Background(), f.args("second", "--baseline-update", "--threshold-mcover", "100", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeMutantCoverage)
+	f.survivors(t, 0, "the mcover failure skipped the update")
+}
+
+// TestRunBaselineUpdateRefusesAnEmptyDiscovery pins that a run which found no
+// mutants cannot empty the committed baseline. A typo in --only leaves no
+// mutator enabled at all, so nothing is discovered, nothing is tested, and
+// every accepted survivor would otherwise be classified as resolved and
+// dropped — a silent, exit-0 erasure of the project's accepted debt.
+func TestRunBaselineUpdateRefusesAnEmptyDiscovery(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// The later --only wins, so this run enables no mutators.
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("empty", "--baseline-update", "--only", "ARITHMETC_BASE", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "discovered no mutants") {
+		t.Fatalf("error=%v, want it to name the empty discovery", err)
+	}
+	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
+}
+
+// TestRunBaselineRefusesAnEmptyDiscovery is the read-only half of the same
+// guard, and the one that matters in CI: a plain --baseline run is the gate
+// that replaces --threshold-efficacy, so a misconfiguration that discovers
+// nothing would report no new survivors and exit 0 having measured nothing.
+// The committed debt is untouched either way, which is exactly what makes the
+// false pass silent.
+func TestRunBaselineRefusesAnEmptyDiscovery(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Discovery has to empty out without touching the fingerprint, or the
+	// policy check would reject the run first and prove nothing about this
+	// guard: rewriting the only mutable expression away does exactly that.
+	mustWriteFile(t, filepath.Join(f.dir, "add.go"), "package testmod\n\nfunc Add(a, b int) int { return a }\n")
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("empty", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "discovered no mutants") {
+		t.Fatalf("error=%v, want it to name the empty discovery", err)
+	}
+	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
+}
+
+// TestRunBaselineFailsWhenTheRunWasCancelled pins that a truncated run cannot
+// report a passing ratchet. Mutants the pool never reached stay PENDING rather
+// than LIVED, so the new-survivor gate sees an empty set and would exit 0 — a
+// CI step killed at its time limit after testing a fraction of the mutants
+// would go green claiming no new debt.
+func TestRunBaselineFailsWhenTheRunWasCancelled(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Cancel the way a step timeout does: after the setup phases, so the run
+	// reaches the pool and returns from it with every mutant untested.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origBuildTestMap := buildTestMapFunc
+	t.Cleanup(func() { buildTestMapFunc = origBuildTestMap })
+	buildTestMapFunc = func(ctx context.Context, projectDir string, packages []string, coverPkg, tags, tmpDir string, workers int) (*coverage.TestMap, error) {
+		m, err := origBuildTestMap(ctx, projectDir, packages, coverPkg, tags, tmpDir, workers)
+		cancel()
+		return m, err
+	}
+
+	_, err := captureStderr(t, func() error {
+		return run(ctx, f.args("cancelled", "--baseline-update", "testmod"))
+	})
+	if err == nil {
+		t.Fatal("cancelled run returned nil: a run that measured nothing must not pass the ratchet")
+	}
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "run cancelled") {
+		t.Fatalf("error=%v, want it to name the cancellation", err)
+	}
+	if got := f.readReport(t, "cancelled"); got.Baseline == nil {
+		t.Fatal("the partial report must still be written: it is the record of what the run did measure")
+	}
+}
+
+// TestRunBaselineUpdateResolvesDebtUnderNewlyExcludedFiles pins that
+// --exclude-files is policy, not blindness. ApplyExcludes drops a package it
+// empties of production files, so scoping the ratchet to what it returns would
+// leave that package's accepted debt unmatchable: retained forever, warned
+// about on every run, and unremovable even by an update.
+func TestRunBaselineUpdateResolvesDebtUnderNewlyExcludedFiles(t *testing.T) {
+	f := newBaselineFixture(t, twoPackageModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "./..."))
+	f.survivors(t, 2, "bootstrap")
+
+	out, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("excluded", "--baseline-update", "--exclude-files", "gen/", "./..."))
+	})
+	if err != nil {
+		t.Fatalf("excluded run: %v", err)
+	}
+	if strings.Contains(out, "outside this run's packages") {
+		t.Fatalf("stderr=%q, want no out-of-scope warning for a deliberate exclusion", out)
+	}
+	got := f.survivors(t, 1, "the excluded package's debt was pinned")
+	if got[0].File != "add.go" {
+		t.Fatalf("survivor=%+v, want only the unexcluded package's debt", got[0])
+	}
+}
+
+// TestRunBaselineUnreadableFileIsNotBootstrapped pins that a corrupt baseline
+// fails with actionable advice rather than being silently rebuilt: rebuilding
+// would accept every current survivor as debt, which is what the ratchet
+// exists to prevent.
+func TestRunBaselineUnreadableFileIsNotBootstrapped(t *testing.T) {
+	baselinePath := filepath.Join(t.TempDir(), "baseline.json")
+	mustWriteFile(t, baselinePath, "<<<<<<< HEAD\n{}\n")
+	for _, name := range []string{"read", "update"} {
+		t.Run(name, func(t *testing.T) {
+			args := []string{"--baseline", baselinePath, "--cache=off", "testmod"}
+			if name == "update" {
+				args = append(args, "--baseline-update")
+			}
+			_, err := captureStderr(t, func() error { return run(context.Background(), args) })
+			requireExitCode(t, err, exitCodeUsageError)
+			if !strings.Contains(err.Error(), "restore") || !strings.Contains(err.Error(), "--baseline-update") {
+				t.Fatalf("error=%v, want the recovery path spelled out", err)
+			}
+		})
+	}
+}
+
 // TestRunThresholdMcover pins the second gate: a function whose mutants
 // are all NOT_COVERED (no test exercises it) drops mutant coverage to 0%,
 // which must surface as exit code 11.
@@ -2522,5 +2898,58 @@ func TestEmbedFilesByDir(t *testing.T) {
 	}
 	if !slices.Equal(got["/m/a"], []string{"data/schema.json", "tmpl/x.tmpl"}) {
 		t.Errorf("got[\"/m/a\"] = %v, want both embed inputs", got["/m/a"])
+	}
+}
+
+// TestBaselinePolicyForRecordsUserMutatorSelection pins that the fingerprint
+// carries the mutator flags as written, not the set they resolve to: a release
+// that ships a new mutator must not read as a policy change and reject every
+// run with exit 2.
+func TestBaselinePolicyForRecordsUserMutatorSelection(t *testing.T) {
+	cfg := config.Config{Disable: []string{"INVERT_NEGATIVES", "ARITHMETIC_BASE"}}
+	policy := baselinePolicyFor([]string{"./..."}, &cfg)
+	if !slices.Equal(policy.Disable, []string{"ARITHMETIC_BASE", "INVERT_NEGATIVES"}) || len(policy.Only) != 0 {
+		t.Fatalf("policy=%+v, want the --disable list only", policy)
+	}
+	if diff := policy.Differences(baselinePolicyFor([]string{"./..."}, &cfg)); len(diff) != 0 {
+		t.Fatalf("identical config differs in %v", diff)
+	}
+
+	// --only wins over --disable in EnabledMutators, so a --disable that
+	// changes nothing must not be fingerprinted either.
+	only := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"ARITHMETIC_BASE"}}
+	onlyPolicy := baselinePolicyFor([]string{"./..."}, &only)
+	if !slices.Equal(onlyPolicy.Only, []string{"CONDITIONALS_BOUNDARY"}) || len(onlyPolicy.Disable) != 0 {
+		t.Fatalf("policy=%+v, want --only recorded and the inert --disable dropped", onlyPolicy)
+	}
+	changed := config.Config{Only: []string{"CONDITIONALS_BOUNDARY"}, Disable: []string{"INVERT_NEGATIVES"}}
+	if diff := onlyPolicy.Differences(baselinePolicyFor([]string{"./..."}, &changed)); len(diff) != 0 {
+		t.Fatalf("inert --disable change differs in %v", diff)
+	}
+}
+
+// TestBaselinePolicyForRecordsUserExcludeCalls pins the same property for call
+// exclusion: the built-in stdlib-logging set grows between releases, so
+// fingerprinting the resolved list would reject every committed baseline with
+// exit 2 on upgrade, with no user-authored config change anywhere.
+func TestBaselinePolicyForRecordsUserExcludeCalls(t *testing.T) {
+	cfg := config.Config{ExcludeCalls: []string{"mypkg.Trace"}}
+	policy := baselinePolicyFor([]string{"./..."}, &cfg)
+	if !slices.Equal(policy.ExcludeCalls, []string{"mypkg.Trace"}) {
+		t.Fatalf("ExcludeCalls=%v, want the user's pattern alone", policy.ExcludeCalls)
+	}
+	if got := cfg.ResolvedExcludeCalls(); len(got) <= len(policy.ExcludeCalls) {
+		t.Fatalf("resolved list=%v, want it to carry built-in defaults this test can drift against", got)
+	}
+	if policy.ExcludeCallsNoDefaults {
+		t.Fatal("ExcludeCallsNoDefaults=true, want the built-ins recorded as on")
+	}
+
+	// Switching the built-ins off is the user's own decision, so it is policy.
+	off := false
+	without := config.Config{ExcludeCalls: []string{"mypkg.Trace"}, ExcludeCallsDefaults: &off}
+	diff := policy.Differences(baselinePolicyFor([]string{"./..."}, &without))
+	if !slices.Equal(diff, []string{"exclude-calls-defaults"}) {
+		t.Fatalf("differences=%v, want exactly the defaults toggle", diff)
 	}
 }
