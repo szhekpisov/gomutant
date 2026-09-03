@@ -833,17 +833,28 @@ func run(ctx context.Context, args []string) error {
 	if cfg.RunMutantID != "" && len(mutants) == 0 {
 		return usageError(runMutantDroppedError(cfg.RunMutantID, cfg.ChangedSince, suppressed))
 	}
-	// A run that discovered nothing proves nothing, but every accepted
-	// survivor in a resolved package would still be classified as resolved:
-	// the update would replace the committed file with an empty baseline and
-	// exit 0, erasing the project's accepted debt. Empty discovery is a
-	// configuration problem — an --only that names no known mutator, a
-	// selection whose packages hold no mutable code, an --exclude-files that
-	// swallowed everything — so refuse the write while the file is still
-	// intact. The package-scope guard makes the same refusal along the
-	// package dimension; this is the discovery one.
-	if baselineUpdate && len(mutants) == 0 {
-		return usageErrorf("--baseline-update refused: this run discovered no mutants, so it cannot prove any survivor in %s was fixed", cfg.Baseline)
+	// A run that discovered nothing proves nothing, in either baseline mode.
+	// Under --baseline-update every accepted survivor in a resolved package
+	// is classified as resolved: the update would replace the committed file
+	// with an empty baseline and exit 0, erasing the project's accepted debt.
+	// Under a plain --baseline — the CI gate that replaces
+	// --threshold-efficacy — there is no mutant left to survive, so the
+	// ratchet reports no new debt and exits 0 having measured nothing, which
+	// is the same false pass the cancellation guard refuses below. Empty
+	// discovery is a configuration problem — an --only that names no known
+	// mutator, a selection whose packages hold no mutable code, an
+	// --exclude-files that swallowed everything — so refuse the verdict
+	// while the committed file is still intact. --baseline forbids every
+	// partial mode (--changed-since, --run-mutant-id, --dry-run), so an
+	// empty discovery here is never a legitimately narrowed run. The
+	// package-scope guard makes the same refusal along the package
+	// dimension; this is the discovery one.
+	if cfg.Baseline != "" && len(mutants) == 0 {
+		flag := "--baseline"
+		if baselineUpdate {
+			flag = "--baseline-update"
+		}
+		return usageErrorf("%s refused: this run discovered no mutants, so it proves nothing about the survivors in %s", flag, cfg.Baseline)
 	}
 
 	pendingCount := 0

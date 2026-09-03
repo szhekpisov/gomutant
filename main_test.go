@@ -1424,6 +1424,31 @@ func TestRunBaselineUpdateRefusesAnEmptyDiscovery(t *testing.T) {
 	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
 }
 
+// TestRunBaselineRefusesAnEmptyDiscovery is the read-only half of the same
+// guard, and the one that matters in CI: a plain --baseline run is the gate
+// that replaces --threshold-efficacy, so a misconfiguration that discovers
+// nothing would report no new survivors and exit 0 having measured nothing.
+// The committed debt is untouched either way, which is exactly what makes the
+// false pass silent.
+func TestRunBaselineRefusesAnEmptyDiscovery(t *testing.T) {
+	f := newBaselineFixture(t, simpleModule())
+	f.mustRun(t, "bootstrap baseline", f.args("first", "--baseline-update", "testmod"))
+	f.survivors(t, 1, "bootstrap")
+
+	// Discovery has to empty out without touching the fingerprint, or the
+	// policy check would reject the run first and prove nothing about this
+	// guard: rewriting the only mutable expression away does exactly that.
+	mustWriteFile(t, filepath.Join(f.dir, "add.go"), "package testmod\n\nfunc Add(a, b int) int { return a }\n")
+	_, err := captureStderr(t, func() error {
+		return run(context.Background(), f.args("empty", "testmod"))
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "discovered no mutants") {
+		t.Fatalf("error=%v, want it to name the empty discovery", err)
+	}
+	f.survivors(t, 1, "the empty run must leave the committed baseline alone")
+}
+
 // TestRunBaselineFailsWhenTheRunWasCancelled pins that a truncated run cannot
 // report a passing ratchet. Mutants the pool never reached stay PENDING rather
 // than LIVED, so the new-survivor gate sees an empty set and would exit 0 — a

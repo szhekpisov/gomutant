@@ -364,11 +364,11 @@ not prove the old survivor was fixed. A run that is interrupted — Ctrl-C, or a
 CI step hitting its time limit — fails with exit 1 instead of reporting its
 truncated result: the mutants it never reached are not survivors, and a gate
 that read them as an absence of new debt would pass a run that measured almost
-nothing. An update is refused outright when the
-run discovered no mutants at all — a typo in `--only` or an over-broad
-`--exclude-files` would otherwise rewrite the committed file as empty. The file
-is schema-versioned, sorted, and replaced atomically, so it is suitable for
-version control.
+nothing. Either mode is refused outright when the run discovers no mutants at
+all — a typo in `--only` or an over-broad `--exclude-files` would otherwise
+rewrite the committed file as empty, or pass a gate that measured nothing. The
+file is schema-versioned, sorted, and replaced atomically, so it is suitable
+for version control.
 
 Stable IDs normally survive line shifts and edits to other functions. For the
 documented churn cases—such as a renamed function or an inserted `init()`—the
