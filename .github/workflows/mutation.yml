@@ -3,23 +3,33 @@ name: Mutation Testing
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   pull_request:
-  push:
-    branches: [main]
+  # The full-tree run moved off `push: [main]`. It never fit in a
+  # post-merge budget: measured on the 3793-mutant internal/... set,
+  # internal/runner and internal/coverage alone account for 74% of all
+  # worker time (42.3s and 21.9s per mutant against a 2-3s median
+  # elsewhere), because their suites fork Go toolchain subprocesses.
+  # Every post-merge run from 2026-08-26 onward was killed at exactly
+  # 30m16s by the old timeout-minutes, so main's full-tree gate — and
+  # the Stryker badge it feeds — had been dead for over a month. The
+  # per-PR changed-since job below is the real per-change gate; this
+  # one is for drift detection and the dashboard, neither of which
+  # needs to be synchronous with a merge.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
-  mutation:
+  # PR gate: scope to the diff. threshold-efficacy=100 (action default)
+  # exits 10 on any LIVED mutant on changed lines.
+  pr-scope:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # 30 min covers internal/... at -workers=2 on a GitHub-hosted
-    # Linux runner. main is excluded (see "Run mutation testing"
-    # comment below), so we don't need the longer integration-test
-    # budget that ./... required.
     timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-pr-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,8 +50,6 @@ jobs:
       - name: Install in-tree gomutants
         run: go install ./...
 
-      # PR run: scope to the diff. threshold-efficacy=100 (action default)
-      # exits 10 on any LIVED mutant on changed lines.
       # Scope to ./internal/... so the gate applies to the library code
       # the project promises to keep mutation-clean. main is excluded:
       # its mutants run the integration test suite (which forks
@@ -50,31 +58,78 @@ jobs:
       # are output-formatting drift that the integration tests
       # intentionally don't pin.
       - name: Run mutation testing (PR, changed-since)
-        if: github.event_name == 'pull_request'
         uses: szhekpisov/gomutants@12850da8ef6d5c45a99c0a45bb2ff69fd08cdca5 # v0.6.0
         with:
           # No quotes around the ref: $ARGS in the action is unquoted so
           # it word-splits, and a literal `"` would land in the
           # --changed-since value (`fatal: ambiguous argument '"origin/main"'`).
-          args: -workers=2 -verbose --changed-since origin/${{ github.base_ref }} ./internal/...
+          args: -workers=4 -verbose --changed-since origin/${{ github.base_ref }} ./internal/...
 
-      # Post-merge full-tree run on the same internal/... scope. Same
-      # threshold-efficacy=100 gate (action default). --stryker-output
-      # writes the dashboard report consumed by the upload step below.
-      - name: Run mutation testing (full tree, post-merge)
-        if: github.event_name == 'push'
-        uses: szhekpisov/gomutants@12850da8ef6d5c45a99c0a45bb2ff69fd08cdca5 # v0.6.0
+  # Nightly full-tree run in ratchet mode. Not cancel-in-progress: a
+  # manual dispatch must not kill a nightly that is hours in.
+  full-tree:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # 6h is the GitHub-hosted ceiling. The measured 34,266 worker-seconds
+    # project to roughly 4h at -workers=4 on a 4-vCPU runner; that is
+    # inside the ceiling but not comfortably, so treat a timeout here as
+    # a signal to shard by package rather than to raise the number.
+    timeout-minutes: 360
+    concurrency:
+      group: ${{ github.workflow }}-full-tree
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          args: -workers=2 -verbose --stryker-output stryker-report.json ./internal/...
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install in-tree gomutants
+        run: go install ./...
+
+      # baseline= replaces the action's default threshold-efficacy=100,
+      # which could never pass here: the tree carries 129 accepted
+      # survivors, so the absolute gate failed the run independently of
+      # the timeout. Ratchet mode exits 10 only for survivors absent from
+      # the committed file. --baseline-update is deliberately not used —
+      # it writes a file CI cannot commit; shrinking the baseline stays a
+      # local, deliberate act.
+      #
+      # timeout-coefficient=5 halves the default per-mutant ceiling. The
+      # 11 known timeouts are only 7.2% of total work, but their cost
+      # scales with the runner's slower baseline measurement, so bounding
+      # it protects the budget. The risk is the opposite error: a mutant
+      # slow enough to be cut short is recorded TIMED OUT, which the
+      # ratchet then retains as unresolved debt rather than reading as
+      # fixed. 5 leaves headroom over the 42s runner average; lower it
+      # further only with a measured reason.
+      #
+      # This step calls the in-tree binary directly rather than the pinned
+      # action. The action's `baseline` input was added in this branch and
+      # does not exist at v0.6.0 (12850da8); passing it there is an
+      # unexpected input, which GitHub warns about but ignores — the gate
+      # would silently fall back to threshold-efficacy=100 and fail on the
+      # accepted debt. Switch this back to the action once a release
+      # carrying the input exists.
+      - name: Run mutation testing (full tree, ratchet)
+        run: |
+          gomutants --annotations=github \
+            --baseline=.gomutants-baseline.json \
+            -workers=4 -verbose \
+            --timeout-coefficient=5 \
+            --stryker-output stryker-report.json \
+            ./internal/...
 
       # Push the Stryker-format report to the public dashboard so the
-      # mutation-score badge in the README reflects the latest main. Only
-      # runs on push to main: the dashboard keys reports by branch/SHA,
-      # and PR-branch uploads from --changed-since runs are partial.
+      # mutation-score badge in the README reflects the latest main. The
+      # dashboard keys reports by branch/SHA, and PR-branch uploads from
+      # --changed-since runs are partial, so only this job uploads.
       # `if: always()` is intentionally NOT used — a failed mutation run
       # should not push a misleading score.
       - name: Upload to Stryker Dashboard
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         env:
           STRYKER_DASHBOARD_KEY: ${{ secrets.STRYKER_DASHBOARD_KEY }}
         run: |
